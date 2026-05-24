@@ -7,8 +7,7 @@ SwarmIO sustains real-time performance of up to 40 MIOPS (million IOPS) on a sin
 
 For more details, please refer to our [paper](https://arxiv.org/abs/2604.06668).
 
-⚠️ **(Stay tuned!)** We will soon provide end-to-end support for building and running GPU-centric storage I/O benchmarks with [BaM](https://github.com/ZaidQureshi/bam).
-This support is intended to resolve build incompatibilities between the original BaM and the kernel versions recommended for SwarmIO.
+(Updated 2026-05-24) SwarmIO also includes [BaM](https://github.com/ZaidQureshi/bam) as a submodule for GPU-centric storage I/O benchmarks, with local patches for compatibility with the kernel versions recommended for SwarmIO. The BaM build uses CUDA CCCL atomic support and no longer depends on the [freestanding](https://github.com/ogiroux/freestanding) build path; this setup has been tested with CUDA 13.1.
 
 ## Requirements
 ### Hardware requirements
@@ -265,7 +264,46 @@ $ scripts/run_fio.sh \
 However, host-side CPU IOPS can become a bottleneck when evaluating SwarmIO at high target IOPS.
 
 ### Benchmarking GPU-centric storage systems
-🚧 Support for emulating GPU-centric storage systems using BaM will be *released soon*.
+You can use [BaM](https://github.com/ZaidQureshi/bam) to run a simple
+GPU-centric storage benchmark on SwarmIO.
+
+Initialize the BaM submodule from the top-level SwarmIO repository:
+
+```bash
+$ git submodule update --init bam
+```
+
+Apply the SwarmIO compatibility patch and build BaM from the submodule directory:
+
+```bash
+$ git -C bam apply ../bam_rev.patch
+$ scripts/build_bam.sh --clean
+```
+
+Run the BaM block benchmark with SwarmIO:
+
+```bash
+$ scripts/run_bam.sh \
+  --input-config configs/swarmio.conf \
+  --target-miops 5 \
+  --num-service-units 16 \
+  --num-threads 262144 \
+  --num-queues 256 \
+  --block-size 512 \
+  --build
+```
+
+Run without rebuilding SwarmIO/BaM:
+
+```bash
+$ scripts/run_bam.sh \
+  --input-config configs/swarmio.conf \
+  --target-miops 5 \
+  --num-service-units 16 \
+  --num-threads 262144 \
+  --num-queues 256 \
+  --block-size 512
+```
 
 ## Acknowledgment
 This research is funded by the generous support from the following organizations:

@@ -182,3 +182,5 @@ Makefile.local
 *.txt
 *.log
 *.csv
+
+!bam*.patch

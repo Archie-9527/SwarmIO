@@ -1,0 +1,2555 @@
+diff --git a/.gitignore b/.gitignore
+index bf59c69..1279b24 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -37,3 +37,11 @@ build/*
+ cscope.out
+ cscope.in.out
+ cscope.po.out
++
++# Ignore install directory
++Release/
++RelWithDebInfo/
++Debug/
++
++# Ignore etc
++.vscode/
+diff --git a/.gitmodules b/.gitmodules
+index c1a51c2..e69de29 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -1,3 +0,0 @@
+-[submodule "include/freestanding"]
+-	path = include/freestanding
+-	url = https://github.com/ogiroux/freestanding
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d6a9d69..0ba15db 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1,8 +1,10 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
++set(CMAKE_CUDA_ARCHITECTURES native)
+ project (libnvm LANGUAGES CUDA C CXX)
+ 
+ set (CMAKE_C_STANDARD 99)
+-set (CMAKE_CXX_STANDARD 11)
++set (CMAKE_CXX_STANDARD 17)
++set (CMAKE_CUDA_STANDARD 17)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+ find_package (Threads REQUIRED)
+@@ -30,11 +32,8 @@ if (no_smartio)
+     set (no_smartio_benchmarks true)
+ endif ()
+ 
+-# Set global compiler flags
+-set (GPU_ARCHS "" CACHE INTERNAL "" FORCE)
+-foreach (arch ${nvidia_archs})
+-    string (CONCAT GPU_ARCHS ${GPU_ARCHS} " -gencode arch=compute_${arch},code=sm_${arch}")
+-endforeach ()
++set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
++set (module_name "libnvm")
+ 
+ set (convert_warnings implicit-function-declaration incompatible-pointer-types int-conversion return-type unused-function unused-variable)
+ set (flags "")
+@@ -44,11 +43,11 @@ endforeach()
+ set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra ${flags}" CACHE INTERNAL "" FORCE)
+ set (CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS} ${CMAKE_C_FLAGS_DEBUG} -g -DDEBUG" CACHE INTERNAL "" FORCE)
+ set (CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -O2" CACHE INTERNAL "" FORCE)
+-set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -std=c++11" CACHE INTERNAL "" FORCE)
++set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -std=gnu++17" CACHE INTERNAL "" FORCE)
+ set (CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_DEBUG} -g -DDEBUG " CACHE INTERNAL "" FORCE)
+-set (CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2 -std=c++11" CACHE INTERNAL "" FORCE)
+-set (CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -lineinfo -D__CUDA__ -D__CUDACC__ -O3;-std=c++11;${GPU_ARCHS}")
+-set (CUDA_NVCC_FLAGS_RELEASE "${CMAKE_NVCC_FLAGS_RELEASE} -O2" CACHE INTERNAL "" FORCE)
++set (CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O2 -std=gnu++17" CACHE INTERNAL "" FORCE)
++# set (CUDA_NVCC_FLAGS "${CUDA_NVCC_FLAGS} -lineinfo -D__CUDA__ -D__CUDACC__ -O3;-std=c++11;${GPU_ARCHS}")
++# set (CUDA_NVCC_FLAGS_RELEASE "${CMAKE_NVCC_FLAGS_RELEASE} -O2" CACHE INTERNAL "" FORCE)
+ 
+ if (no_cc)
+     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D__NO_COHERENCE__")
+@@ -130,6 +129,14 @@ set (fio_output "${CMAKE_BINARY_DIR}/fio")
+ 
+ # Set include directories
+ include_directories ("${PROJECT_BINARY_DIR}/include" "${PROJECT_SOURCE_DIR}/include" "${PROJECT_SOURCE_DIR}/include/freestanding/include")
++find_path (cuda_cccl_include NAMES cuda/atomic
++    PATHS
++        "${CUDA_TOOLKIT_ROOT_DIR}/include/cccl"
++        "${CUDA_TOOLKIT_ROOT_DIR}/targets/${CMAKE_SYSTEM_PROCESSOR}-linux/include/cccl")
++if (cuda_cccl_include)
++    include_directories ("${cuda_cccl_include}")
++    message (STATUS "Using CUDA CCCL headers ${cuda_cccl_include}")
++endif ()
+ if (sisci_include)
+     include_directories ("${PROJECT_BINARY_DIR}/include" "${PROJECT_SOURCE_DIR}/include" "${sisci_include}" "${sisci_include}/dis")
+ endif ()
+@@ -139,6 +146,7 @@ endif ()
+ CUDA_ADD_LIBRARY (libnvm ${libnvm_source} ${libnvm_linux_source}) # TODO: add check for OS
+ target_include_directories (libnvm PRIVATE "${libnvm_root}")
+ target_link_libraries(libnvm ${CUDA_LIBRARIES})
++target_compile_definitions(libnvm PRIVATE _CUDA __CUDA__)
+ 
+ if (sisci_include AND sisci_lib AND NOT no_smartio)
+     target_sources (libnvm PRIVATE ${libnvm_dis_source})
+@@ -163,7 +171,7 @@ endif ()
+ set_target_properties (libnvm PROPERTIES OUTPUT_NAME "nvm")
+ 
+ # Set install locations
+-install (FILES ${libnvm_include} DESTINATION "include")
++# install (FILES ${libnvm_include} DESTINATION "include")
+ install (TARGETS libnvm DESTINATION "lib")
+ 
+ 
+@@ -179,9 +187,19 @@ if (NOT no_module)
+         message(STATUS "Configuring kernel module without CUDA")
+     endif ()
+ 
++    file (GLOB module_files "${module_root}/*.c" "${module_root}/*.h")
++    foreach (module_file ${module_files})
++        get_filename_component (module_file_name "${module_file}" NAME)
++        configure_file ("${module_file}" "${module_output}/${module_file_name}" COPYONLY)
++    endforeach ()
+     configure_file ("${module_root}/Makefile.in" "${module_output}/Makefile" @ONLY)
+ 
+-    add_custom_target (kernel_module "${CMAKE_MAKE_PROGRAM}" WORKING_DIRECTORY "${module_output}")
++    find_program(MAKE_EXECUTABLE make REQUIRED)
++    set(module_ko "${module_output}/${module_name}.ko")
++    add_custom_command(OUTPUT ${module_ko} COMMAND ${MAKE_EXECUTABLE} WORKING_DIRECTORY "${module_output}")
++    add_custom_target(kernel_module ALL DEPENDS ${module_ko})
++
++    install(FILES ${module_ko} DESTINATION "module")
+ endif ()
+ 
+ 
+@@ -252,16 +270,30 @@ endmacro ()
+ # We assume all benchmarks are CUDA programs
+ macro (make_benchmark target binary_name files)
+     if (CUDA_FOUND AND NOT no_cuda)
+-        cuda_add_executable (${target} EXCLUDE_FROM_ALL ${files} OPTIONS ${GPU_ARCHS} -D__CUDA__) # Ugly bugly
+-        target_compile_definitions (${target} PRIVATE __CUDA__)
+-
+-        add_dependencies (${target} libnvm)
++        add_executable (${target} ${files})
++        
+         target_link_libraries (${target} libnvm)
+         target_link_libraries (${target} ${CUDA_LIBRARIES})
+         set_target_properties (${target} PROPERTIES OUTPUT_NAME "nvm-${binary_name}")
+ 
++        set_target_properties(${target} PROPERTIES 
++            BUILD_RPATH "\$ORIGIN"
++            INSTALL_RPATH "\$ORIGIN/../lib"
++            CUDA_STANDARD 17
++            CUDA_STANDARD_REQUIRED ON
++            CXX_STANDARD 17
++            CXX_STANDARD_REQUIRED ON
++            CUDA_SEPARABLE_COMPILATION ON)
++
++        target_compile_options(${target} PRIVATE
++            $<$<COMPILE_LANGUAGE:CXX>:-O3>
++            $<$<COMPILE_LANGUAGE:CUDA>:-O3>
++        )
++        
+         list (APPEND benchmark_targets "${target}")
+         set (benchmark_targets "${benchmark_targets}" PARENT_SCOPE)
++
++        install(TARGETS ${target} DESTINATION "bin")
+     endif ()
+ endmacro ()
+ 
+@@ -333,4 +365,3 @@ if (CUDA_FOUND AND NOT no_cuda)
+   #add_subdirectory ("${benchmarks_root}/scan")
+   add_custom_target (benchmarks DEPENDS ${benchmark_targets})
+ endif ()
+-
+diff --git a/benchmarks/array/CMakeLists.txt b/benchmarks/array/CMakeLists.txt
+index 4ee0895..7f8c8c0 100644
+--- a/benchmarks/array/CMakeLists.txt
++++ b/benchmarks/array/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/bfs/CMakeLists.txt b/benchmarks/bfs/CMakeLists.txt
+index 7ee4ae7..397a61e 100644
+--- a/benchmarks/bfs/CMakeLists.txt
++++ b/benchmarks/bfs/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/bfs/main.cu b/benchmarks/bfs/main.cu
+index 55904ac..fa929b5 100644
+--- a/benchmarks/bfs/main.cu
++++ b/benchmarks/bfs/main.cu
+@@ -1313,7 +1313,7 @@ int main(int argc, char *argv[]) {
+              case UVM_READONLY:
+                  cuda_err_chk(cudaMallocManaged((void**)&edgeList_d, edge_size));
+                  file.read((char*)edgeList_d, edge_size);
+-                 cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                 cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+      
+                  cuda_err_chk(cudaMemGetInfo(&freebyte, &totalbyte));
+                  if (totalbyte < 16*1024*1024*1024ULL)
+@@ -1335,7 +1335,7 @@ int main(int argc, char *argv[]) {
+                  high_resolution_clock::time_point ft2 = high_resolution_clock::now();
+                  duration<double> time_span = duration_cast<duration<double>>(ft2 -ft1);
+                  std::cout<< "edge file read time: "<< time_span.count() <<std::endl;
+-                 cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                 cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                  break;
+              */
+ 
+@@ -1352,7 +1352,7 @@ int main(int argc, char *argv[]) {
+                  uint64_t edge_count_4k_aligned = ((edge_count + 2 + 4096 / sizeof(uint64_t)) / (4096 / sizeof(uint64_t))) * (4096 / sizeof(uint64_t));
+                  uint64_t edge_size_4k_aligned = edge_count_4k_aligned * sizeof(uint64_t);
+                  cuda_err_chk(cudaMallocManaged((void**)&edgeList_d, edge_size_4k_aligned));
+-                 cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                 cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                  high_resolution_clock::time_point ft1 = high_resolution_clock::now();
+                        
+                  if (fread(edgeList_d, sizeof(uint64_t), edge_count_4k_aligned, file_temp) != edge_count + 2) {
+diff --git a/benchmarks/block/CMakeLists.txt b/benchmarks/block/CMakeLists.txt
+index c70c90a..7bfa7b9 100644
+--- a/benchmarks/block/CMakeLists.txt
++++ b/benchmarks/block/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/block/main.cu b/benchmarks/block/main.cu
+index 1ec1431..da4b983 100644
+--- a/benchmarks/block/main.cu
++++ b/benchmarks/block/main.cu
+@@ -32,6 +32,10 @@
+ #ifdef __DIS_CLUSTER__
+ #include <sisci_api.h>
+ #endif
++#include <nvml.h>
++#include <algorithm>
++#include <numeric>
++#include <curand_kernel.h>
+ 
+ using error = std::runtime_error;
+ using std::string;
+@@ -46,6 +50,40 @@ const char* const intel_ctrls_paths[] = {"/dev/libnvm0", "/dev/libnvm1", "/dev/l
+ 
+ #define SIZE (8*4096)
+ 
++#ifdef LATENCY_BREAKDOWN
++int get_sm_clock(int cudaDevice) {
++    nvmlReturn_t result;
++    nvmlDevice_t device;
++    unsigned int smClock = 0;
++
++    result = nvmlInit();
++    if (result != NVML_SUCCESS) {
++        std::cerr << "NVML init failed: " << nvmlErrorString(result)
++                  << std::endl;
++        return -1;
++    }
++
++    result = nvmlDeviceGetHandleByIndex(cudaDevice, &device);
++    if (result != NVML_SUCCESS) {
++        std::cerr << "Failed to get handle for GPU: " << nvmlErrorString(result)
++                  << std::endl;
++        nvmlShutdown();
++        return -1;
++    }
++
++    result = nvmlDeviceGetClockInfo(device, NVML_CLOCK_SM, &smClock);
++    if (result != NVML_SUCCESS) {
++        std::cerr << "Failed to get SM clock: " << nvmlErrorString(result)
++                  << std::endl;
++        nvmlShutdown();
++        return -1;
++    }
++
++    nvmlShutdown();
++    return static_cast<int>(smClock);
++}
++#endif
++
+ __global__
+ void print_cache_kernel(page_cache_d_t* pc) {
+     uint64_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+@@ -107,9 +145,9 @@ void sequential_access_kernel(Controller** ctrls, page_cache_d_t* pc,  uint32_t
+     uint32_t ctrl;
+     uint32_t queue;
+     if (laneid == 0) {
+-        ctrl = pc->ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (pc->n_ctrls);
+-        //queue = ctrls[ctrl]->queue_counter.fetch_add(1, simt::memory_order_relaxed) %  (ctrls[ctrl]->n_qps);
+-        queue = smid % (ctrls[ctrl]->n_qps);
++        ctrl = pc->ctrl_counter->fetch_add(1, cuda::std::memory_order_relaxed) % (pc->n_ctrls);
++        queue = ctrls[ctrl]->queue_counter.fetch_add(1, cuda::std::memory_order_relaxed) %  (ctrls[ctrl]->n_qps);
++        // queue = smid % (ctrls[ctrl]->n_qps);
+     }
+     ctrl =  __shfl_sync(0xFFFFFFFF, ctrl, 0);
+     queue =  __shfl_sync(0xFFFFFFFF, queue, 0);
+@@ -117,10 +155,10 @@ void sequential_access_kernel(Controller** ctrls, page_cache_d_t* pc,  uint32_t
+ 
+ 
+     if (tid < n_reqs) {
+-        uint64_t start_block = (tid*req_size) >> ctrls[ctrl]->d_qps[queue].block_size_log;
++        uint64_t start_block = tid*req_size;
+         //uint64_t start_block = (tid*req_size) >> ctrls[ctrl]->d_qps[queue].block_size_log;
+         //start_block = tid;
+-        uint64_t n_blocks = req_size >> ctrls[ctrl]->d_qps[queue].block_size_log; /// ctrls[ctrl].ns.lba_data_size;;
++        uint64_t n_blocks = req_size; /// ctrls[ctrl].ns.lba_data_size;;
+         //printf("tid: %llu\tstart_block: %llu\tn_blocks: %llu\n", (unsigned long long) tid, (unsigned long long) start_block, (unsigned long long) n_blocks);
+         uint8_t opcode;
+         for (size_t i = 0; i < reqs_per_thread; i++) {
+@@ -147,8 +185,14 @@ void sequential_access_kernel(Controller** ctrls, page_cache_d_t* pc,  uint32_t
+ 
+ }
+ 
++#ifdef LATENCY_BREAKDOWN
++__global__ //__launch_bounds__(64,32)
++void random_access_kernel(Controller** ctrls, page_cache_d_t* pc,  uint32_t n_blocks, uint32_t n_reqs, unsigned long long* req_count, uint32_t num_ctrls, uint64_t max_lba, uint64_t reqs_per_thread, uint32_t access_type, uint8_t* access_type_assignment, ulonglong4* d_clks) {
++#else
+ __global__ //__launch_bounds__(64,32)
+-void random_access_kernel(Controller** ctrls, page_cache_d_t* pc,  uint32_t req_size, uint32_t n_reqs, unsigned long long* req_count, uint32_t num_ctrls, uint64_t* assignment, uint64_t reqs_per_thread, uint32_t access_type, uint8_t* access_type_assignment) {
++void random_access_kernel(Controller** ctrls, page_cache_d_t* pc,  uint32_t n_blocks, uint32_t n_reqs, unsigned long long* req_count, uint32_t num_ctrls, uint64_t max_lba, uint64_t reqs_per_thread, uint32_t access_type, uint8_t* access_type_assignment) {
++#endif
++
+     //printf("in threads\n");
+     uint64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+     uint32_t laneid = lane_id();
+@@ -159,19 +203,23 @@ void random_access_kernel(Controller** ctrls, page_cache_d_t* pc,  uint32_t req_
+     uint32_t queue;
+     if (laneid == 0) {
+ 	//ctrl = smid % (pc->n_ctrls);
+-        ctrl = pc->ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (pc->n_ctrls);
+-        queue = ctrls[ctrl]->queue_counter.fetch_add(1, simt::memory_order_relaxed) %  (ctrls[ctrl]->n_qps);
++        ctrl = pc->ctrl_counter->fetch_add(1, cuda::std::memory_order_relaxed) % (pc->n_ctrls);
++        queue = ctrls[ctrl]->queue_counter.fetch_add(1, cuda::std::memory_order_relaxed) %  (ctrls[ctrl]->n_qps);
+         //queue = smid % (ctrls[ctrl]->n_qps);
+     }
+     ctrl =  __shfl_sync(0xFFFFFFFF, ctrl, 0);
+     queue =  __shfl_sync(0xFFFFFFFF, queue, 0);
+ 
++#ifdef LATENCY_BREAKDOWN
++    ulonglong4 clks;
++#endif
++    curandState state;
++    curand_init(1234, tid, 0, &state);
+ 
+     if (tid < n_reqs) {
+-        uint64_t start_block = (assignment[tid]*req_size) >> ctrls[ctrl]->d_qps[queue].block_size_log;
++        uint64_t start_block = (uint64_t)(curand_uniform_double(&state) * max_lba);
+         //uint64_t start_block = (tid*req_size) >> ctrls[ctrl]->d_qps[queue].block_size_log;
+         //start_block = tid;
+-        uint64_t n_blocks = req_size >> ctrls[ctrl]->d_qps[queue].block_size_log; /// ctrls[ctrl].ns.lba_data_size;;
+         //printf("tid: %llu\tstart_block: %llu\tn_blocks: %llu\n", (unsigned long long) tid, (unsigned long long) start_block, (unsigned long long) n_blocks);
+ 
+         uint8_t opcode;
+@@ -181,7 +229,12 @@ void random_access_kernel(Controller** ctrls, page_cache_d_t* pc,  uint32_t req_
+                 access_data(pc, (ctrls[ctrl]->d_qps)+(queue),start_block, n_blocks, tid, opcode);
+             }
+             else if (access_type == READ) {
++#ifdef LATENCY_BREAKDOWN
++                uint64_t idx = i * n_reqs + tid;
++                read_data(pc, (ctrls[ctrl]->d_qps)+(queue),start_block, n_blocks, tid, &d_clks[idx]);
++#else
+                 read_data(pc, (ctrls[ctrl]->d_qps)+(queue),start_block, n_blocks, tid);
++#endif
+ 
+             }
+             else {
+@@ -307,8 +360,8 @@ int main(int argc, char** argv) {
+ 
+         //std::cout << "finished creating range\n";
+ 
+-
+-
++        uint32_t nlb = page_size >> ctrls[0]->blk_size_log;
++        uint64_t max_lba = ((n_blocks * page_size) >> ctrls[0]->blk_size_log) - 1;
+ 
+         unsigned long long* d_req_count;
+         cuda_err_chk(cudaMalloc(&d_req_count, sizeof(unsigned long long)));
+@@ -317,18 +370,6 @@ int main(int argc, char** argv) {
+         char st[15];
+         cuda_err_chk(cudaDeviceGetPCIBusId(st, 15, settings.cudaDevice));
+         std::cout << st << std::endl;
+-        uint64_t* assignment;
+-        uint64_t* d_assignment;
+-        if (settings.random) {
+-            assignment = (uint64_t*) malloc(n_threads*sizeof(uint64_t));
+-            for (size_t i = 0; i< n_threads; i++)
+-                assignment[i] = rand() % (n_blocks);
+-
+-
+-            cuda_err_chk(cudaMalloc(&d_assignment, n_threads*sizeof(uint64_t)));
+-            cuda_err_chk(cudaMemcpy(d_assignment, assignment,  n_threads*sizeof(uint64_t), cudaMemcpyHostToDevice));
+-        }
+-        Event before;
+ 
+         uint8_t* access_assignment;
+         uint8_t* d_access_assignment = NULL;
+@@ -340,11 +381,26 @@ int main(int argc, char** argv) {
+             cuda_err_chk(cudaMalloc(&d_access_assignment, n_threads*sizeof(uint8_t)));
+             cuda_err_chk(cudaMemcpy(d_access_assignment, access_assignment, n_threads*sizeof(uint8_t), cudaMemcpyHostToDevice));
+         }
++
++#ifdef LATENCY_BREAKDOWN
++        uint64_t n_total_reqs = n_threads * settings.numReqs;
++        ulonglong4* clks;
++        ulonglong4* d_clks;
++        if (settings.random) {
++            clks = (ulonglong4*)malloc(n_total_reqs * sizeof(ulonglong4));
++            cuda_err_chk(cudaMalloc(&d_clks, n_total_reqs * sizeof(ulonglong4)));
++        }
++#endif
++        Event before;
+         std::cout << "atlaunch kernel\n";
+         if (settings.random)
+-            random_access_kernel<<<g_size, b_size>>>(h_pc.pdt.d_ctrls, d_pc, page_size, n_threads, d_req_count, settings.n_ctrls, d_assignment, settings.numReqs, settings.accessType, d_access_assignment);
++#ifdef LATENCY_BREAKDOWN
++            random_access_kernel<<<g_size, b_size>>>(h_pc.pdt.d_ctrls, d_pc, nlb, n_threads, d_req_count, settings.n_ctrls, max_lba, settings.numReqs, settings.accessType, d_access_assignment, d_clks);
++#else
++            random_access_kernel<<<g_size, b_size>>>(h_pc.pdt.d_ctrls, d_pc, nlb, n_threads, d_req_count, settings.n_ctrls, max_lba, settings.numReqs, settings.accessType, d_access_assignment);
++#endif
+         else
+-            sequential_access_kernel<<<g_size, b_size>>>(h_pc.pdt.d_ctrls, d_pc, page_size, n_threads, d_req_count, settings.n_ctrls, settings.numReqs, settings.accessType, d_access_assignment);
++            sequential_access_kernel<<<g_size, b_size>>>(h_pc.pdt.d_ctrls, d_pc, nlb, n_threads, d_req_count, settings.n_ctrls, settings.numReqs, settings.accessType, d_access_assignment);
+         Event after;
+ 
+         //print_cache_kernel<<<1,1>>>(d_pc);
+@@ -386,6 +442,68 @@ int main(int argc, char** argv) {
+ 
+         //std::cout << RAND_MAX << std::endl;
+ 
++#ifdef LATENCY_BREAKDOWN
++        if (settings.random) {
++            int smClock = get_sm_clock(settings.cudaDevice);
++
++            if (smClock >= 0) {
++                cuda_err_chk(cudaMemcpy(clks, d_clks,
++                                        n_total_reqs * sizeof(ulonglong4),
++                                        cudaMemcpyDeviceToHost));
++                cuda_err_chk(cudaDeviceSynchronize());
++
++                std::vector<double> slats(n_total_reqs);
++                std::vector<double> clats(n_total_reqs);
++                for (size_t i = 0; i < n_total_reqs; i++) {
++                    slats[i] = (double)(clks[i].y - clks[i].x)/1000.0;
++                    clats[i] = (double)(clks[i].z - clks[i].y)/1000.0;
++                }
++                std::sort(slats.begin(), slats.end());
++                std::sort(clats.begin(), clats.end());
++
++                auto percentile = [](const std::vector<double>& v,
++                                    double p) -> double {
++                    size_t idx = static_cast<size_t>(p * v.size() / 100.0);
++                    if (idx >= v.size())
++                        idx = v.size() - 1;
++                    return v[idx];
++                };
++
++                double avg_slat = std::accumulate(slats.begin(), slats.end(), 0.0) / slats.size();
++                double avg_clat = std::accumulate(clats.begin(), clats.end(), 0.0) / clats.size();
++
++                // std::cout << "SM clock (MHz): " << smClock << std::endl;
++                std::cout << "slat (usec): avg=" << avg_slat << std::endl;
++                std::cout << "p10,p20,p30,p40,p50,p60,p70,p80,p90,p95,p99,p99.5" << std::endl;
++                std::cout << percentile(slats, 10) << ","
++                          << percentile(slats, 20) << ","
++                          << percentile(slats, 30) << ","
++                          << percentile(slats, 40) << ","
++                          << percentile(slats, 50) << ","
++                          << percentile(slats, 60) << ","
++                          << percentile(slats, 70) << ","
++                          << percentile(slats, 80) << ","
++                          << percentile(slats, 90) << ","
++                          << percentile(slats, 95) << ","
++                          << percentile(slats, 99) << ","
++                          << percentile(slats, 99.9) << std::endl;
++                std::cout << "clat (usec): avg=" << avg_clat << std::endl;
++                std::cout << "p10,p20,p30,p40,p50,p60,p70,p80,p90,p95,p99,p99.5" << std::endl;
++                std::cout << percentile(clats, 10) << ","
++                          << percentile(clats, 20) << ","
++                          << percentile(clats, 30) << ","
++                          << percentile(clats, 40) << ","
++                          << percentile(clats, 50) << ","
++                          << percentile(clats, 60) << ","
++                          << percentile(clats, 70) << ","
++                          << percentile(clats, 80) << ","
++                          << percentile(clats, 90) << ","
++                          << percentile(clats, 95) << ","
++                          << percentile(clats, 99) << ","
++                          << percentile(clats, 99.9) << std::endl;
++            }
++        }
++#endif
+     }
+     catch (const error& e) {
+         fprintf(stderr, "Unexpected error: %s\n", e.what());
+diff --git a/benchmarks/cache/CMakeLists.txt b/benchmarks/cache/CMakeLists.txt
+index f911f5b..2c4fd7c 100644
+--- a/benchmarks/cache/CMakeLists.txt
++++ b/benchmarks/cache/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/cc/CMakeLists.txt b/benchmarks/cc/CMakeLists.txt
+index 2642ca6..f2c72aa 100644
+--- a/benchmarks/cc/CMakeLists.txt
++++ b/benchmarks/cc/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/cc/main.cu b/benchmarks/cc/main.cu
+index 638976a..f731062 100644
+--- a/benchmarks/cc/main.cu
++++ b/benchmarks/cc/main.cu
+@@ -1160,7 +1160,7 @@ int main(int argc, char *argv[]) {
+             case UVM_READONLY:
+                 cuda_err_chk(cudaMallocManaged((void**)&edgeList_d, edge_size));
+                 file.read((char*)edgeList_d, edge_size);
+-                cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+ 
+                 cuda_err_chk(cudaMemGetInfo(&freebyte, &totalbyte));
+                 if (totalbyte < 16*1024*1024*1024ULL)
+@@ -1176,7 +1176,7 @@ int main(int argc, char *argv[]) {
+                 high_resolution_clock::time_point ft1 = high_resolution_clock::now();
+                 cuda_err_chk(cudaMallocManaged((void**)&edgeList_d, edge_size));
+                 file.read((char*)edgeList_d, edge_size);
+-                cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                 high_resolution_clock::time_point ft2 = high_resolution_clock::now();
+                 duration<double> time_span = duration_cast<duration<double>>(ft2 -ft1);
+                 std::cout<< "edge file read time: "<< time_span.count() <<std::endl;
+@@ -1195,7 +1195,7 @@ int main(int argc, char *argv[]) {
+                 uint64_t edge_count_4k_aligned = ((edge_count + 2 + 4096 / sizeof(uint64_t)) / (4096 / sizeof(uint64_t))) * (4096 / sizeof(uint64_t));
+                 uint64_t edge_size_4k_aligned = edge_count_4k_aligned * sizeof(uint64_t);
+                 cuda_err_chk(cudaMallocManaged((void**)&edgeList_d, edge_size_4k_aligned));
+-                cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy,settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy,settings.cudaDevice));
+                 high_resolution_clock::time_point ft1 = high_resolution_clock::now();
+                       
+                 if (fread(edgeList_d, sizeof(uint64_t), edge_count_4k_aligned, file_temp) != edge_count + 2) {
+diff --git a/benchmarks/cc/scan.cu b/benchmarks/cc/scan.cu
+index 8f8af48..99d189f 100644
+--- a/benchmarks/cc/scan.cu
++++ b/benchmarks/cc/scan.cu
+@@ -471,7 +471,7 @@ int main(int argc, char *argv[]) {
+         case UVM_READONLY:
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
+ 
+             //checkCudaErrors(cudaMemGetInfo(&freebyte, &totalbyte));
+             //if (totalbyte < 16*1024*1024*1024ULL)
+@@ -486,7 +486,7 @@ int main(int argc, char *argv[]) {
+             {/*
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
+             break;
+             */
+             file.close();
+@@ -502,7 +502,7 @@ int main(int argc, char *argv[]) {
+             uint64_t edge_count_4k_aligned = ((edge_count + 2 + 4096 / sizeof(uint64_t)) / (4096 / sizeof(uint64_t))) * (4096 / sizeof(uint64_t));
+             uint64_t edge_size_4k_aligned = edge_count_4k_aligned * sizeof(uint64_t);
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size_4k_aligned));
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, 0));
+             high_resolution_clock::time_point ft1 = high_resolution_clock::now();
+                   
+             if (fread(edgeList_d, sizeof(uint64_t), edge_count_4k_aligned, file_temp) != edge_count + 2) {
+@@ -526,9 +526,9 @@ int main(int argc, char *argv[]) {
+             checkCudaErrors(cudaSetDevice(0));
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
+             checkCudaErrors(cudaSetDevice(2));
+-            checkCudaErrors(cudaMemPrefetchAsync(edgeList_d, edge_size, 2, 0));
++            checkCudaErrors(nvm_cuda_mem_prefetch_async(edgeList_d, edge_size, 2, 0));
+             checkCudaErrors(cudaDeviceSynchronize());
+             checkCudaErrors(cudaSetDevice(0));
+             break;
+@@ -536,10 +536,10 @@ int main(int argc, char *argv[]) {
+             checkCudaErrors(cudaSetDevice(2));
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemPrefetchAsync(edgeList_d, edge_size, 2, 0));
++            checkCudaErrors(nvm_cuda_mem_prefetch_async(edgeList_d, edge_size, 2, 0));
+             checkCudaErrors(cudaDeviceSynchronize());
+             checkCudaErrors(cudaSetDevice(0));
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
+             break;
+         //case DRAGON_MAP:
+         //    if((dragon_map(edge_file.c_str(), (edge_size+16), D_F_READ, (void**) &edgeList_dtmp)) != D_OK){
+diff --git a/benchmarks/iodepth-block/CMakeLists.txt b/benchmarks/iodepth-block/CMakeLists.txt
+index f486b95..1de236a 100644
+--- a/benchmarks/iodepth-block/CMakeLists.txt
++++ b/benchmarks/iodepth-block/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/iodepth-block/main.cu b/benchmarks/iodepth-block/main.cu
+index 9294ecd..49dabde 100644
+--- a/benchmarks/iodepth-block/main.cu
++++ b/benchmarks/iodepth-block/main.cu
+@@ -107,8 +107,8 @@ void random_access_kernel(Controller** ctrls, page_cache_d_t* pc,  uint32_t req_
+     uint32_t queue;
+     if (laneid == 0) {
+ 	ctrl = smid % (pc->n_ctrls);
+-        //ctrl = pc->ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (pc->n_ctrls);
+-        queue = ctrls[ctrl]->queue_counter.fetch_add(1, simt::memory_order_relaxed) %  (ctrls[ctrl]->n_qps);
++        //ctrl = pc->ctrl_counter->fetch_add(1, cuda::std::memory_order_relaxed) % (pc->n_ctrls);
++        queue = ctrls[ctrl]->queue_counter.fetch_add(1, cuda::std::memory_order_relaxed) %  (ctrls[ctrl]->n_qps);
+         //queue = smid % (ctrls[ctrl]->n_qps);
+     }
+     ctrl =  __shfl_sync(0xFFFFFFFF, ctrl, 0);
+@@ -159,8 +159,8 @@ void sequential_access_kernel(Controller** ctrls, page_cache_d_t* pc,  uint32_t
+     uint32_t queue;
+     if (laneid == 0) {
+ 	ctrl = smid % (pc->n_ctrls);
+-        //ctrl = pc->ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (pc->n_ctrls);
+-        queue = ctrls[ctrl]->queue_counter.fetch_add(1, simt::memory_order_relaxed) %  (ctrls[ctrl]->n_qps);
++        //ctrl = pc->ctrl_counter->fetch_add(1, cuda::std::memory_order_relaxed) % (pc->n_ctrls);
++        queue = ctrls[ctrl]->queue_counter.fetch_add(1, cuda::std::memory_order_relaxed) %  (ctrls[ctrl]->n_qps);
+         //queue = smid % (ctrls[ctrl]->n_qps);
+     }
+     ctrl =  __shfl_sync(0xFFFFFFFF, ctrl, 0);
+diff --git a/benchmarks/pagerank/CMakeLists.txt b/benchmarks/pagerank/CMakeLists.txt
+index 486c538..922a952 100644
+--- a/benchmarks/pagerank/CMakeLists.txt
++++ b/benchmarks/pagerank/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/pagerank/main.cu b/benchmarks/pagerank/main.cu
+index 08589d9..198cdf6 100644
+--- a/benchmarks/pagerank/main.cu
++++ b/benchmarks/pagerank/main.cu
+@@ -562,7 +562,7 @@ int main(int argc, char *argv[]) {
+             case UVM_READONLY:
+                 cuda_err_chk(cudaMallocManaged((void**)&edgeList_d, edge_size));
+                 file.read((char*)edgeList_d, edge_size);
+-                cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+ 
+                 cuda_err_chk(cudaMemGetInfo(&freebyte, &totalbyte));
+                 if (totalbyte < 16*1024*1024*1024ULL)
+@@ -577,7 +577,7 @@ int main(int argc, char *argv[]) {
+                 {/*
+                 cuda_err_chk(cudaMallocManaged((void**)&edgeList_d, edge_size));
+                 file.read((char*)edgeList_d, edge_size);
+-                cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                 break;
+                 */
+                 file.close();
+@@ -593,7 +593,7 @@ int main(int argc, char *argv[]) {
+                 uint64_t edge_count_4k_aligned = ((edge_count + 2 + 4096 / sizeof(uint64_t)) / (4096 / sizeof(uint64_t))) * (4096 / sizeof(uint64_t));
+                 uint64_t edge_size_4k_aligned = edge_count_4k_aligned * sizeof(uint64_t);
+                 cuda_err_chk(cudaMallocManaged((void**)&edgeList_d, edge_size_4k_aligned));
+-                cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                 high_resolution_clock::time_point ft1 = high_resolution_clock::now();
+                       
+                 if (fread(edgeList_d, sizeof(uint64_t), edge_count_4k_aligned, file_temp) != edge_count + 2) {
+diff --git a/benchmarks/pattern/CMakeLists.txt b/benchmarks/pattern/CMakeLists.txt
+index 8978831..a5b338a 100644
+--- a/benchmarks/pattern/CMakeLists.txt
++++ b/benchmarks/pattern/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/pattern/main.cu b/benchmarks/pattern/main.cu
+index da4c08b..13c426f 100644
+--- a/benchmarks/pattern/main.cu
++++ b/benchmarks/pattern/main.cu
+@@ -429,7 +429,7 @@ int main(int argc, char *argv[]) {
+                 {
+                 cuda_err_chk(cudaMallocManaged((void**)&a_d, n_elems_size));
+                 cuda_err_chk(cudaMemcpy(a_d, a_h, n_elems_size, cudaMemcpyHostToDevice));
+-                cuda_err_chk(cudaMemAdvise(a_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(a_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+                 break;
+                 }
+             case UVM_DIRECT:
+@@ -447,7 +447,7 @@ int main(int argc, char *argv[]) {
+                 uint64_t size_4k_aligned = count_4k_aligned * sizeof(uint64_t);
+ 
+                 cuda_err_chk(cudaMallocManaged((void**)&a_d, size_4k_aligned));
+-                cuda_err_chk(cudaMemAdvise(a_d, size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(a_d, size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                 high_resolution_clock::time_point ft1 = high_resolution_clock::now();
+                
+                 if (fread(a_d, sizeof(uint64_t), count_4k_aligned, fa_tmp)) {
+diff --git a/benchmarks/pattern/scan.cu b/benchmarks/pattern/scan.cu
+index 8f8af48..99d189f 100644
+--- a/benchmarks/pattern/scan.cu
++++ b/benchmarks/pattern/scan.cu
+@@ -471,7 +471,7 @@ int main(int argc, char *argv[]) {
+         case UVM_READONLY:
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
+ 
+             //checkCudaErrors(cudaMemGetInfo(&freebyte, &totalbyte));
+             //if (totalbyte < 16*1024*1024*1024ULL)
+@@ -486,7 +486,7 @@ int main(int argc, char *argv[]) {
+             {/*
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
+             break;
+             */
+             file.close();
+@@ -502,7 +502,7 @@ int main(int argc, char *argv[]) {
+             uint64_t edge_count_4k_aligned = ((edge_count + 2 + 4096 / sizeof(uint64_t)) / (4096 / sizeof(uint64_t))) * (4096 / sizeof(uint64_t));
+             uint64_t edge_size_4k_aligned = edge_count_4k_aligned * sizeof(uint64_t);
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size_4k_aligned));
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, 0));
+             high_resolution_clock::time_point ft1 = high_resolution_clock::now();
+                   
+             if (fread(edgeList_d, sizeof(uint64_t), edge_count_4k_aligned, file_temp) != edge_count + 2) {
+@@ -526,9 +526,9 @@ int main(int argc, char *argv[]) {
+             checkCudaErrors(cudaSetDevice(0));
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
+             checkCudaErrors(cudaSetDevice(2));
+-            checkCudaErrors(cudaMemPrefetchAsync(edgeList_d, edge_size, 2, 0));
++            checkCudaErrors(nvm_cuda_mem_prefetch_async(edgeList_d, edge_size, 2, 0));
+             checkCudaErrors(cudaDeviceSynchronize());
+             checkCudaErrors(cudaSetDevice(0));
+             break;
+@@ -536,10 +536,10 @@ int main(int argc, char *argv[]) {
+             checkCudaErrors(cudaSetDevice(2));
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemPrefetchAsync(edgeList_d, edge_size, 2, 0));
++            checkCudaErrors(nvm_cuda_mem_prefetch_async(edgeList_d, edge_size, 2, 0));
+             checkCudaErrors(cudaDeviceSynchronize());
+             checkCudaErrors(cudaSetDevice(0));
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
+             break;
+         //case DRAGON_MAP:
+         //    if((dragon_map(edge_file.c_str(), (edge_size+16), D_F_READ, (void**) &edgeList_dtmp)) != D_OK){
+diff --git a/benchmarks/readwrite/CMakeLists.txt b/benchmarks/readwrite/CMakeLists.txt
+index 9568fba..7de5586 100644
+--- a/benchmarks/readwrite/CMakeLists.txt
++++ b/benchmarks/readwrite/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.10)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/readwrite/main.cu b/benchmarks/readwrite/main.cu
+index 17c8fc9..1afab45 100644
+--- a/benchmarks/readwrite/main.cu
++++ b/benchmarks/readwrite/main.cu
+@@ -419,7 +419,7 @@ int main(int argc, char** argv) {
+                size_t orig_sz = sb_orig.st_size - settings.ifileoffset; 
+ 
+                cuda_err_chk(cudaMallocManaged((void**)&orig_h, orig_sz)); 
+-               cuda_err_chk(cudaMemAdvise(orig_h, orig_sz, cudaMemAdviseSetAccessedBy, 0));
++               cuda_err_chk(nvm_cuda_mem_advise(orig_h, orig_sz, cudaMemAdviseSetAccessedBy, 0));
+ //               cuda_err_chk(cudaMemset(orig_h, 0, orig_sz)); 
+                memcpy(orig_h, map_orig+settings.ifileoffset, orig_sz);
+ 
+@@ -448,7 +448,7 @@ int main(int argc, char** argv) {
+                    return 1;
+                }
+                cuda_err_chk(cudaMallocManaged((void**)&nvme_h, nvme_sz)); 
+-               cuda_err_chk(cudaMemAdvise(nvme_h, nvme_sz, cudaMemAdviseSetAccessedBy, 0));
++               cuda_err_chk(nvm_cuda_mem_advise(nvme_h, nvme_sz, cudaMemAdviseSetAccessedBy, 0));
+   //             cuda_err_chk(cudaMemset(nvme_h, 0, nvme_sz)); 
+                memcpy(nvme_h, map_nvme+settings.ifileoffset, nvme_sz);
+                printf("Launching verification kernel");
+diff --git a/benchmarks/reduction/CMakeLists.txt b/benchmarks/reduction/CMakeLists.txt
+index 23c0589..6785847 100644
+--- a/benchmarks/reduction/CMakeLists.txt
++++ b/benchmarks/reduction/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/reduction/main.cu b/benchmarks/reduction/main.cu
+index 0bb72fe..2ea71f3 100644
+--- a/benchmarks/reduction/main.cu
++++ b/benchmarks/reduction/main.cu
+@@ -334,7 +334,7 @@ int main(int argc, char *argv[]) {
+                 {
+                 cuda_err_chk(cudaMallocManaged((void**)&a_d, n_elems_size));
+                 cuda_err_chk(cudaMemcpy(a_d, a_h, n_elems_size, cudaMemcpyHostToDevice));
+-                cuda_err_chk(cudaMemAdvise(a_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(a_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+                 break;
+                 }
+             case UVM_DIRECT:
+@@ -353,7 +353,7 @@ int main(int argc, char *argv[]) {
+                 uint64_t size_4k_aligned = count_4k_aligned * sizeof(uint64_t);
+ 
+                 cuda_err_chk(cudaMallocManaged((void**)&a_d, size_4k_aligned));
+-                cuda_err_chk(cudaMemAdvise(a_d, size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(a_d, size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                 high_resolution_clock::time_point ft1 = high_resolution_clock::now();
+                
+                 if (fread(a_d, sizeof(uint64_t), count_4k_aligned, fa_tmp)) {
+diff --git a/benchmarks/scan/CMakeLists.txt b/benchmarks/scan/CMakeLists.txt
+index c6c8bd4..ef19884 100644
+--- a/benchmarks/scan/CMakeLists.txt
++++ b/benchmarks/scan/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/scan/main.cu b/benchmarks/scan/main.cu
+index be22d86..f503450 100644
+--- a/benchmarks/scan/main.cu
++++ b/benchmarks/scan/main.cu
+@@ -287,7 +287,7 @@ int main(int argc, char *argv[]) {
+                 {
+                 cuda_err_chk(cudaMallocManaged((void**)&a_d, n_elems_size));
+                 cuda_err_chk(cudaMemcpy(a_d, a_h, n_elems_size, cudaMemcpyHostToDevice));
+-                cuda_err_chk(cudaMemAdvise(a_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(a_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+                 break;
+                 }
+             case UVM_DIRECT:
+@@ -306,7 +306,7 @@ int main(int argc, char *argv[]) {
+                 uint64_t size_4k_aligned = count_4k_aligned * sizeof(uint64_t);
+ 
+                 cuda_err_chk(cudaMallocManaged((void**)&a_d, size_4k_aligned));
+-                cuda_err_chk(cudaMemAdvise(a_d, size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(a_d, size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                 high_resolution_clock::time_point ft1 = high_resolution_clock::now();
+                
+                 if (fread(a_d, sizeof(uint64_t), count_4k_aligned, fa_tmp)) {
+diff --git a/benchmarks/scan/scan.cu b/benchmarks/scan/scan.cu
+index 8f8af48..99d189f 100644
+--- a/benchmarks/scan/scan.cu
++++ b/benchmarks/scan/scan.cu
+@@ -471,7 +471,7 @@ int main(int argc, char *argv[]) {
+         case UVM_READONLY:
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
+ 
+             //checkCudaErrors(cudaMemGetInfo(&freebyte, &totalbyte));
+             //if (totalbyte < 16*1024*1024*1024ULL)
+@@ -486,7 +486,7 @@ int main(int argc, char *argv[]) {
+             {/*
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
+             break;
+             */
+             file.close();
+@@ -502,7 +502,7 @@ int main(int argc, char *argv[]) {
+             uint64_t edge_count_4k_aligned = ((edge_count + 2 + 4096 / sizeof(uint64_t)) / (4096 / sizeof(uint64_t))) * (4096 / sizeof(uint64_t));
+             uint64_t edge_size_4k_aligned = edge_count_4k_aligned * sizeof(uint64_t);
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size_4k_aligned));
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, 0));
+             high_resolution_clock::time_point ft1 = high_resolution_clock::now();
+                   
+             if (fread(edgeList_d, sizeof(uint64_t), edge_count_4k_aligned, file_temp) != edge_count + 2) {
+@@ -526,9 +526,9 @@ int main(int argc, char *argv[]) {
+             checkCudaErrors(cudaSetDevice(0));
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
+             checkCudaErrors(cudaSetDevice(2));
+-            checkCudaErrors(cudaMemPrefetchAsync(edgeList_d, edge_size, 2, 0));
++            checkCudaErrors(nvm_cuda_mem_prefetch_async(edgeList_d, edge_size, 2, 0));
+             checkCudaErrors(cudaDeviceSynchronize());
+             checkCudaErrors(cudaSetDevice(0));
+             break;
+@@ -536,10 +536,10 @@ int main(int argc, char *argv[]) {
+             checkCudaErrors(cudaSetDevice(2));
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemPrefetchAsync(edgeList_d, edge_size, 2, 0));
++            checkCudaErrors(nvm_cuda_mem_prefetch_async(edgeList_d, edge_size, 2, 0));
+             checkCudaErrors(cudaDeviceSynchronize());
+             checkCudaErrors(cudaSetDevice(0));
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
+             break;
+         //case DRAGON_MAP:
+         //    if((dragon_map(edge_file.c_str(), (edge_size+16), D_F_READ, (void**) &edgeList_dtmp)) != D_OK){
+diff --git a/benchmarks/sssp/CMakeLists.txt b/benchmarks/sssp/CMakeLists.txt
+index 907926c..5e94a5a 100644
+--- a/benchmarks/sssp/CMakeLists.txt
++++ b/benchmarks/sssp/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/sssp/main.cu b/benchmarks/sssp/main.cu
+index c7a70f9..fc12633 100644
+--- a/benchmarks/sssp/main.cu
++++ b/benchmarks/sssp/main.cu
+@@ -457,8 +457,8 @@ int main(int argc, char *argv[]) {
+                 for (uint64_t i = 0; i < weight_count; i++)
+                     weightList_d[i] += offset;
+ 
+-                cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+-                cuda_err_chk(cudaMemAdvise(weightList_d, weight_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(weightList_d, weight_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+ 
+                 cuda_err_chk(cudaMemGetInfo(&freebyte, &totalbyte));
+                 if (totalbyte < 16*1024*1024*1024ULL)
+@@ -484,8 +484,8 @@ int main(int argc, char *argv[]) {
+                 for (uint64_t i = 0; i < weight_count; i++)
+                     weightList_d[i] += offset;
+ 
+-                cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+-                cuda_err_chk(cudaMemAdvise(weightList_d, weight_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(weightList_d, weight_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                 break;
+   */          
+ 
+@@ -502,7 +502,7 @@ int main(int argc, char *argv[]) {
+                 uint64_t edge_count_4k_aligned = ((edge_count + 2 + 4096 / sizeof(uint64_t)) / (4096 / sizeof(uint64_t))) * (4096 / sizeof(uint64_t));
+                 uint64_t edge_size_4k_aligned = edge_count_4k_aligned * sizeof(uint64_t);
+                 cuda_err_chk(cudaMallocManaged((void**)&edgeList_d, edge_size_4k_aligned));
+-                cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                 high_resolution_clock::time_point ft1 = high_resolution_clock::now();
+                       
+                 if (fread(edgeList_d, sizeof(uint64_t), edge_count_4k_aligned, file_temp) != edge_count + 2) {
+@@ -546,7 +546,7 @@ int main(int argc, char *argv[]) {
+                  
+                 for (uint64_t i = 0; i < weight_count; i++)
+                     weightList_d[i] += offset;
+-                cuda_err_chk(cudaMemAdvise(edgeList_d, weight_size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, weight_size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                  
+                 file2.open(weight_file.c_str(), std::ios::in | std::ios::binary);
+                 if (!file2.is_open()) {
+@@ -757,8 +757,8 @@ int main(int argc, char *argv[]) {
+                         cuda_err_chk(cudaFree(weightList_d));
+                         edgeList_d = edgeList_temp;
+                         weightList_d = weightList_temp;
+-                        cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
+-                        cuda_err_chk(cudaMemAdvise(weightList_d, weight_size, cudaMemAdviseSetReadMostly, 0));
++                        cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
++                        cuda_err_chk(nvm_cuda_mem_advise(weightList_d, weight_size, cudaMemAdviseSetReadMostly, 0));
+                         break;
+                     case UVM_READONLY_NVLINK:
+                         cuda_err_chk(cudaSetDevice(2));
+@@ -770,10 +770,10 @@ int main(int argc, char *argv[]) {
+                         cuda_err_chk(cudaFree(weightList_d));
+                         edgeList_d = edgeList_temp;
+                         weightList_d = weightList_temp;
+-                        cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
+-                        cuda_err_chk(cudaMemAdvise(weightList_d, weight_size, cudaMemAdviseSetReadMostly, 0));
+-                        cuda_err_chk(cudaMemPrefetchAsync(edgeList_d, edge_size, 2, 0));
+-                        cuda_err_chk(cudaMemPrefetchAsync(weightList_d, weight_size, 2, 0));
++                        cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
++                        cuda_err_chk(nvm_cuda_mem_advise(weightList_d, weight_size, cudaMemAdviseSetReadMostly, 0));
++                        cuda_err_chk(nvm_cuda_mem_prefetch_async(edgeList_d, edge_size, 2, 0));
++                        cuda_err_chk(nvm_cuda_mem_prefetch_async(weightList_d, weight_size, 2, 0));
+                         cuda_err_chk(cudaDeviceSynchronize());
+                         cuda_err_chk(cudaSetDevice(0));
+                         break;
+diff --git a/benchmarks/sssp_float/CMakeLists.txt b/benchmarks/sssp_float/CMakeLists.txt
+index 16b89b5..2e38f47 100644
+--- a/benchmarks/sssp_float/CMakeLists.txt
++++ b/benchmarks/sssp_float/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/sssp_float/main.cu b/benchmarks/sssp_float/main.cu
+index 8df49b9..0f22bab 100644
+--- a/benchmarks/sssp_float/main.cu
++++ b/benchmarks/sssp_float/main.cu
+@@ -477,8 +477,8 @@ int main(int argc, char *argv[]) {
+                 for (uint64_t i = 0; i < weight_count; i++)
+                     weightList_d[i] += offset;
+ 
+-                cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+-                cuda_err_chk(cudaMemAdvise(weightList_d, weight_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(weightList_d, weight_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+ 
+                 cuda_err_chk(cudaMemGetInfo(&freebyte, &totalbyte));
+                 if (totalbyte < 16*1024*1024*1024ULL)
+@@ -503,8 +503,8 @@ int main(int argc, char *argv[]) {
+                 for (uint64_t i = 0; i < weight_count; i++)
+                     weightList_d[i] += offset;
+ 
+-                cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+-                cuda_err_chk(cudaMemAdvise(weightList_d, weight_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(weightList_d, weight_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                 break;
+             }
+             case BAFS_DIRECT:
+@@ -718,8 +718,8 @@ int main(int argc, char *argv[]) {
+                         cuda_err_chk(cudaFree(weightList_d));
+                         edgeList_d = edgeList_temp;
+                         weightList_d = weightList_temp;
+-                        cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
+-                        cuda_err_chk(cudaMemAdvise(weightList_d, weight_size, cudaMemAdviseSetReadMostly, 0));
++                        cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
++                        cuda_err_chk(nvm_cuda_mem_advise(weightList_d, weight_size, cudaMemAdviseSetReadMostly, 0));
+                         break;
+                     case UVM_READONLY_NVLINK:
+                         cuda_err_chk(cudaSetDevice(2));
+@@ -731,10 +731,10 @@ int main(int argc, char *argv[]) {
+                         cuda_err_chk(cudaFree(weightList_d));
+                         edgeList_d = edgeList_temp;
+                         weightList_d = weightList_temp;
+-                        cuda_err_chk(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
+-                        cuda_err_chk(cudaMemAdvise(weightList_d, weight_size, cudaMemAdviseSetReadMostly, 0));
+-                        cuda_err_chk(cudaMemPrefetchAsync(edgeList_d, edge_size, 2, 0));
+-                        cuda_err_chk(cudaMemPrefetchAsync(weightList_d, weight_size, 2, 0));
++                        cuda_err_chk(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
++                        cuda_err_chk(nvm_cuda_mem_advise(weightList_d, weight_size, cudaMemAdviseSetReadMostly, 0));
++                        cuda_err_chk(nvm_cuda_mem_prefetch_async(edgeList_d, edge_size, 2, 0));
++                        cuda_err_chk(nvm_cuda_mem_prefetch_async(weightList_d, weight_size, 2, 0));
+                         cuda_err_chk(cudaDeviceSynchronize());
+                         cuda_err_chk(cudaSetDevice(0));
+                         break;
+diff --git a/benchmarks/vectoradd/CMakeLists.txt b/benchmarks/vectoradd/CMakeLists.txt
+index 9b27a3f..402b2b8 100644
+--- a/benchmarks/vectoradd/CMakeLists.txt
++++ b/benchmarks/vectoradd/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required (VERSION 3.1)
++cmake_minimum_required (VERSION 3.24)
+ project (libnvm-benchmarks)
+ 
+ set (THREADS_PREFER_PTHREAD_FLAG ON)
+diff --git a/benchmarks/vectoradd/main.cu b/benchmarks/vectoradd/main.cu
+index 04c9e3b..947a683 100644
+--- a/benchmarks/vectoradd/main.cu
++++ b/benchmarks/vectoradd/main.cu
+@@ -319,8 +319,8 @@ int main(int argc, char *argv[]) {
+                 cuda_err_chk(cudaMemcpy(b_d, b_h, n_elems_size, cudaMemcpyHostToDevice));
+                 //TODO: we can move that read op here.
+                 //file.read((char*)edgeList_d, edge_size);
+-                cuda_err_chk(cudaMemAdvise(a_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+-                cuda_err_chk(cudaMemAdvise(b_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(a_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(b_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+                 cuda_err_chk(cudaMemGetInfo(&freebyte, &totalbyte));
+                 break;
+                 }
+@@ -347,8 +347,8 @@ int main(int argc, char *argv[]) {
+ 
+                 cuda_err_chk(cudaMallocManaged((void**)&a_d, size_4k_aligned));
+                 cuda_err_chk(cudaMallocManaged((void**)&b_d, size_4k_aligned));
+-                cuda_err_chk(cudaMemAdvise(a_d, size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+-                cuda_err_chk(cudaMemAdvise(b_d, size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(a_d, size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(b_d, size_4k_aligned, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                 high_resolution_clock::time_point ft1 = high_resolution_clock::now();
+                
+                 if (fread(a_d, sizeof(uint64_t), count_4k_aligned, fa_tmp) <0) {
+@@ -379,10 +379,10 @@ int main(int argc, char *argv[]) {
+                 cuda_err_chk(cudaMallocManaged((void**)&b_d, n_elems_size));
+                 filea.read((char*)a_d, n_elems_size);
+                 fileb.read((char*)b_d, n_elems_size);
+-                cuda_err_chk(cudaMemAdvise(a_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+-                cuda_err_chk(cudaMemAdvise(b_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
+-                //cuda_err_chk(cudaMemAdvise(a_d, n_elems_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+-                //cuda_err_chk(cudaMemAdvise(b_d, n_elems_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(a_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                cuda_err_chk(nvm_cuda_mem_advise(b_d, n_elems_size, cudaMemAdviseSetReadMostly, settings.cudaDevice));
++                //cuda_err_chk(nvm_cuda_mem_advise(a_d, n_elems_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
++                //cuda_err_chk(nvm_cuda_mem_advise(b_d, n_elems_size, cudaMemAdviseSetAccessedBy, settings.cudaDevice));
+                 high_resolution_clock::time_point ft2 = high_resolution_clock::now();
+                 duration<double> time_span = duration_cast<duration<double>>(ft2 -ft1);
+                 std::cout<< "file read time: "<< time_span.count() <<std::endl;
+diff --git a/benchmarks/vectoradd/scan.cu b/benchmarks/vectoradd/scan.cu
+index 8f8af48..99d189f 100644
+--- a/benchmarks/vectoradd/scan.cu
++++ b/benchmarks/vectoradd/scan.cu
+@@ -471,7 +471,7 @@ int main(int argc, char *argv[]) {
+         case UVM_READONLY:
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
+ 
+             //checkCudaErrors(cudaMemGetInfo(&freebyte, &totalbyte));
+             //if (totalbyte < 16*1024*1024*1024ULL)
+@@ -486,7 +486,7 @@ int main(int argc, char *argv[]) {
+             {/*
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
+             break;
+             */
+             file.close();
+@@ -502,7 +502,7 @@ int main(int argc, char *argv[]) {
+             uint64_t edge_count_4k_aligned = ((edge_count + 2 + 4096 / sizeof(uint64_t)) / (4096 / sizeof(uint64_t))) * (4096 / sizeof(uint64_t));
+             uint64_t edge_size_4k_aligned = edge_count_4k_aligned * sizeof(uint64_t);
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size_4k_aligned));
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size_4k_aligned, cudaMemAdviseSetAccessedBy, 0));
+             high_resolution_clock::time_point ft1 = high_resolution_clock::now();
+                   
+             if (fread(edgeList_d, sizeof(uint64_t), edge_count_4k_aligned, file_temp) != edge_count + 2) {
+@@ -526,9 +526,9 @@ int main(int argc, char *argv[]) {
+             checkCudaErrors(cudaSetDevice(0));
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetReadMostly, 0));
+             checkCudaErrors(cudaSetDevice(2));
+-            checkCudaErrors(cudaMemPrefetchAsync(edgeList_d, edge_size, 2, 0));
++            checkCudaErrors(nvm_cuda_mem_prefetch_async(edgeList_d, edge_size, 2, 0));
+             checkCudaErrors(cudaDeviceSynchronize());
+             checkCudaErrors(cudaSetDevice(0));
+             break;
+@@ -536,10 +536,10 @@ int main(int argc, char *argv[]) {
+             checkCudaErrors(cudaSetDevice(2));
+             checkCudaErrors(cudaMallocManaged((void**)&edgeList_d, edge_size));
+             file.read((char*)edgeList_d, edge_size);
+-            checkCudaErrors(cudaMemPrefetchAsync(edgeList_d, edge_size, 2, 0));
++            checkCudaErrors(nvm_cuda_mem_prefetch_async(edgeList_d, edge_size, 2, 0));
+             checkCudaErrors(cudaDeviceSynchronize());
+             checkCudaErrors(cudaSetDevice(0));
+-            checkCudaErrors(cudaMemAdvise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
++            checkCudaErrors(nvm_cuda_mem_advise(edgeList_d, edge_size, cudaMemAdviseSetAccessedBy, 0));
+             break;
+         //case DRAGON_MAP:
+         //    if((dragon_map(edge_file.c_str(), (edge_size+16), D_F_READ, (void**) &edgeList_dtmp)) != D_OK){
+diff --git a/include/ctrl.h b/include/ctrl.h
+index 1bb1fc2..5464f62 100644
+--- a/include/ctrl.h
++++ b/include/ctrl.h
+@@ -28,17 +28,18 @@
+ #include <fcntl.h>
+ #include <cstdlib>
+ #include <algorithm>
+-#include <simt/atomic>
++#include <cuda/atomic>
++#include <cuda/std/atomic>
+ 
+ #include "queue.h"
+ 
+ 
+-#define MAX_QUEUES 1024
++#define MAX_QUEUES 65535
+ 
+ 
+ struct Controller
+ {
+-    simt::atomic<uint64_t, simt::thread_scope_device> access_counter;
++    cuda::atomic<uint64_t, cuda::thread_scope_device> access_counter;
+     nvm_ctrl_t*             ctrl;
+     nvm_aq_ref              aq_ref;
+     DmaPtr                  aq_mem;
+@@ -51,7 +52,7 @@ struct Controller
+     QueuePair**             h_qps;
+     QueuePair*              d_qps;
+ 
+-    simt::atomic<uint64_t, simt::thread_scope_device> queue_counter;
++    cuda::atomic<uint64_t, cuda::thread_scope_device> queue_counter;
+ 
+     uint32_t page_size;
+     uint32_t blk_size;
+@@ -84,11 +85,11 @@ using std::string;
+ 
+ 
+ inline void Controller::print_reset_stats(void) {
+-    cuda_err_chk(cudaMemcpy(&access_counter, d_ctrl_ptr, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaMemcpyDeviceToHost));
++    cuda_err_chk(cudaMemcpy(&access_counter, d_ctrl_ptr, sizeof(cuda::atomic<uint64_t, cuda::thread_scope_device>), cudaMemcpyDeviceToHost));
+     std::cout << "------------------------------------" << std::endl;
+     std::cout << std::dec << "#SSDAccesses:\t" << access_counter << std::endl;
+ 
+-    cuda_err_chk(cudaMemset(d_ctrl_ptr, 0, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>)));
++    cuda_err_chk(cudaMemset(d_ctrl_ptr, 0, sizeof(cuda::atomic<uint64_t, cuda::thread_scope_device>)));
+ }
+ 
+ static void initializeController(struct Controller& ctrl, uint32_t ns_id)
+@@ -157,7 +158,9 @@ inline Controller::Controller(const char* path, uint32_t ns_id, uint32_t cudaDev
+     }
+ 
+     // Get controller reference
+-    int status = nvm_ctrl_init(&ctrl, fd);
++    size_t page_size = sysconf(_SC_PAGESIZE);
++    size_t mm_size = ((0x1000 + (numQueues + 1) * 8) + page_size - 1) & ~(page_size - 1);
++    int status = nvm_ctrl_init(&ctrl, fd, mm_size);
+     if (!nvm_ok(status))
+     {
+         throw error(string("Failed to get controller reference: ") + nvm_strerror(status));
+@@ -167,7 +170,7 @@ inline Controller::Controller(const char* path, uint32_t ns_id, uint32_t cudaDev
+     aq_mem = createDma(ctrl, ctrl->page_size * 3);
+ 
+     initializeController(*this, ns_id);
+-    cudaError_t err = cudaHostRegister((void*) ctrl->mm_ptr, NVM_CTRL_MEM_MINSIZE, cudaHostRegisterIoMemory);
++    cudaError_t err = cudaHostRegister((void*) ctrl->mm_ptr, mm_size, cudaHostRegisterIoMemory);
+     if (err != cudaSuccess)
+     {
+         throw error(string("Unexpected error while mapping IO memory (cudaHostRegister): ") + cudaGetErrorString(err));
+diff --git a/include/freestanding b/include/freestanding
+deleted file mode 160000
+index 6360203..0000000
+--- a/include/freestanding
++++ /dev/null
+@@ -1 +0,0 @@
+-Subproject commit 6360203797a3601fa61f3580dc97b2535b2c232d
+diff --git a/include/nvm_ctrl.h b/include/nvm_ctrl.h
+index f9a0807..26010f2 100644
+--- a/include/nvm_ctrl.h
++++ b/include/nvm_ctrl.h
+@@ -33,7 +33,7 @@
+  *
+  * Note: fd must be opened with O_RDWR and O_NONBLOCK
+  */
+-int nvm_ctrl_init(nvm_ctrl_t** ctrl, int fd);
++int nvm_ctrl_init(nvm_ctrl_t** ctrl, int fd, size_t mm_size);
+ #endif
+ 
+ 
+diff --git a/include/nvm_parallel_queue.h b/include/nvm_parallel_queue.h
+index 351535c..7b448c8 100644
+--- a/include/nvm_parallel_queue.h
++++ b/include/nvm_parallel_queue.h
+@@ -21,7 +21,8 @@
+ #include "host_util.h"
+ #include "nvm_types.h"
+ #include "nvm_util.h"
+-#include <simt/atomic>
++#include <cuda/atomic>
++#include <cuda/std/atomic>
+ #define LOCKED   1
+ #define UNLOCKED 0
+ 
+@@ -38,9 +39,9 @@ uint16_t get_cid(nvm_queue_t* sq) {
+     uint16_t id;
+ 
+     do {
+-        id = sq->cid_ticket.fetch_add(1, simt::memory_order_relaxed) & (65535);
++        id = sq->cid_ticket.fetch_add(1, cuda::std::memory_order_relaxed) & (65535);
+         //printf("in thread: %p\n", (void*) ((sq->cid)+id));
+-        uint64_t old = sq->cid[id].val.fetch_or(LOCKED, simt::memory_order_acquire);
++        uint64_t old = sq->cid[id].val.fetch_or(LOCKED, cuda::std::memory_order_acquire);
+         not_found = old == LOCKED;
+         //if (not_found)
+         //       printf("still looking\n");
+@@ -53,7 +54,7 @@ uint16_t get_cid(nvm_queue_t* sq) {
+ 
+ inline __device__
+ void put_cid(nvm_queue_t* sq, uint16_t id) {
+-    sq->cid[id].val.store(UNLOCKED, simt::memory_order_release);
++    sq->cid[id].val.store(UNLOCKED, cuda::std::memory_order_release);
+ }
+ 
+ inline __device__
+@@ -66,16 +67,16 @@ uint32_t move_tail(nvm_queue_t* q, uint32_t cur_tail) {
+     bool pass = true;
+     while (pass ) {
+         //uint32_t count_copy = count;
+-        pass = (((cur_tail+count+1) & q->qs_minus_1) != (q->head.load(simt::memory_order_relaxed) & q->qs_minus_1 ));
++        pass = (((cur_tail+count+1) & q->qs_minus_1) != (q->head.load(cuda::std::memory_order_relaxed) & q->qs_minus_1 ));
+         if (pass) {
+-            pass = ((q->tail_mark[(cur_tail+count)&q->qs_minus_1].val.exchange(UNLOCKED, simt::memory_order_relaxed)) == LOCKED);
++            pass = ((q->tail_mark[(cur_tail+count)&q->qs_minus_1].val.exchange(UNLOCKED, cuda::std::memory_order_relaxed)) == LOCKED);
+             if (pass)
+                 count++;
+         }
+ 
+     }
+ 
+-    q->head_lock.fetch_add(1, simt::memory_order_acq_rel);
++    q->head_lock.fetch_add(1, cuda::std::memory_order_acq_rel);
+     return (count);
+ }
+ 
+@@ -88,7 +89,7 @@ uint32_t move_head_cq(nvm_queue_t* q, uint32_t cur_head, nvm_queue_t* sq) {
+     //uint32_t old_head;
+     while (pass) {
+         uint32_t loc = (cur_head+count++)&q->qs_minus_1;
+-        pass = (q->head_mark[loc].val.exchange(UNLOCKED, simt::memory_order_relaxed)) == LOCKED;
++        pass = (q->head_mark[loc].val.exchange(UNLOCKED, cuda::std::memory_order_relaxed)) == LOCKED;
+ 	//uint32_t cpl_entry = ((nvm_cpl_t*)q->vaddr)[loc].dword[3];
+         //uint32_t cid = (cpl_entry & 0x0000ffff);
+         //put_cid(sq, cid);
+@@ -105,17 +106,17 @@ uint32_t move_head_cq(nvm_queue_t* q, uint32_t cur_head, nvm_queue_t* sq) {
+         uint32_t cpl_entry = ((nvm_cpl_t*)q->vaddr)[loc_].dword[2];
+         uint16_t new_sq_head =  (cpl_entry & 0x0000ffff);
+         uint32_t sq_move_count = 0;
+-        uint32_t cur_sq_head = sq->head.load(simt::memory_order_relaxed);
++        uint32_t cur_sq_head = sq->head.load(cuda::std::memory_order_relaxed);
+         uint32_t loc = cur_sq_head & sq->qs_minus_1;
+         //printf("+++new_sq_head: %llu\tcur_sq_head: %llu\tloc: %llu\tcpl_entry: %llx\n", (unsigned long long) new_sq_head, (unsigned long long) cur_sq_head, (unsigned long long) loc, (unsigned long long) cpl_entry);
+ 
+         if (loc != new_sq_head) {
+             for (; loc != new_sq_head; sq_move_count++, loc= ((loc+1)  & sq->qs_minus_1)) {
+-                sq->tickets[loc].val.fetch_add(1, simt::memory_order_relaxed);
++                sq->tickets[loc].val.fetch_add(1, cuda::std::memory_order_relaxed);
+             }
+             //printf("---new_sq_head: %llu\tcur_sq_head: %llu\tloc: %llu\tsq_move_count: %llu\n", (unsigned long long) new_sq_head, (unsigned long long) cur_sq_head, (unsigned long long) loc, (unsigned long long) sq_move_count);
+ 
+-            sq->head.fetch_add(sq_move_count, simt::memory_order_acq_rel);
++            sq->head.fetch_add(sq_move_count, cuda::std::memory_order_acq_rel);
+         }
+     }
+     return (count);
+@@ -132,7 +133,7 @@ void clean_cids(nvm_queue_t* cq, nvm_queue_t* sq, uint32_t count) {
+ inline __device__
+ uint32_t move_head_sq(nvm_queue_t* q, uint32_t cur_head) {
+     uint32_t count = 0;
+-//    uint32_t cur_head = q->head.load(simt::memory_order_acquire);
++//    uint32_t cur_head = q->head.load(cuda::std::memory_order_acquire);
+ 
+     bool pass = true;
+     //uint32_t old_head;
+@@ -140,11 +141,11 @@ uint32_t move_head_sq(nvm_queue_t* q, uint32_t cur_head) {
+ //        count++;
+ 
+         uint64_t loc = (cur_head + count)&q->qs_minus_1;
+-        pass = (q->head_mark[loc].val.exchange(UNLOCKED, simt::memory_order_relaxed)) == LOCKED;
++        pass = (q->head_mark[loc].val.exchange(UNLOCKED, cuda::std::memory_order_relaxed)) == LOCKED;
+         if (pass) {
+             //uint32_t old_cur_head = cur_head;
+-            //cur_head = q->head.fetch_add(1, simt::memory_order_acq_rel);
+-            q->tickets[loc].val.fetch_add(1, simt::memory_order_relaxed);
++            //cur_head = q->head.fetch_add(1, cuda::std::memory_order_acq_rel);
++            q->tickets[loc].val.fetch_add(1, cuda::std::memory_order_relaxed);
+ 
+             //cur_head++;
+             count++;
+@@ -155,9 +156,9 @@ uint32_t move_head_sq(nvm_queue_t* q, uint32_t cur_head) {
+ 
+     }
+ //    if (count)
+-//	q->head.fetch_add(count, simt::memory_order_release);
++//	q->head.fetch_add(count, cuda::std::memory_order_release);
+     /* for (uint32_t i = 0; i < count; i++) */
+-    /*     q->tickets[(cur_head + i) & q->qs_minus_1].val.fetch_add(1, simt::memory_order_release); */
++    /*     q->tickets[(cur_head + i) & q->qs_minus_1].val.fetch_add(1, cuda::std::memory_order_release); */
+     return (count);
+ 
+ }
+@@ -165,16 +166,16 @@ uint32_t move_head_sq(nvm_queue_t* q, uint32_t cur_head) {
+ typedef ulonglong4 copy_type;
+ 
+ inline __device__
+-uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt::thread_scope_device>* pc_tail =NULL, uint64_t * cur_pc_tail=NULL) {
++uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, cuda::atomic<uint64_t, cuda::thread_scope_device>* pc_tail =NULL, uint64_t * cur_pc_tail=NULL) {
+ 
+     //uint32_t mask = __activemask();
+     //uint32_t active_count = __popc(mask);
+     //uint32_t leader = __ffs(mask) - 1;
+     //uint32_t lane = lane_id();
+     uint32_t ticket;
+-    ticket = sq->in_ticket.fetch_add(1, simt::memory_order_relaxed);
++    ticket = sq->in_ticket.fetch_add(1, cuda::std::memory_order_relaxed);
+     /* if (lane == leader) { */
+-    /*     ticket = sq->in_ticket.fetch_add(active_count, simt::memory_order_acquire); */
++    /*     ticket = sq->in_ticket.fetch_add(active_count, cuda::std::memory_order_acquire); */
+     /* } */
+ 
+     /* ticket = __shfl_sync(mask, ticket, leader); */
+@@ -185,12 +186,12 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
+ 
+     //uint64_t k = 0;
+     unsigned int ns = 8;
+-    while ((sq->tickets[pos].val.load(simt::memory_order_relaxed) != id) ) {
++    while ((sq->tickets[pos].val.load(cuda::std::memory_order_relaxed) != id) ) {
+         /*if (k++ % 100 == 0)   {
+             printf("tid: %llu\tpos: %llu\tticket: %llu\tid: %llu\ttickets_pos: %llu\tqueue_head: %llu\tqueue_tail: %llu\n",
+                    (unsigned long long) threadIdx.x, (unsigned long long) pos,
+-                   (unsigned long long)ticket, (unsigned long long)id, (unsigned long long) (sq->tickets[pos].val.load(simt::memory_order_acquire)),
+-                   (unsigned long long)(sq->head.load(simt::memory_order_acquire) & (sq->qs_minus_1)), (unsigned long long)(sq->tail.load(simt::memory_order_acquire) & (sq->qs_minus_1)));
++                   (unsigned long long)ticket, (unsigned long long)id, (unsigned long long) (sq->tickets[pos].val.load(cuda::std::memory_order_acquire)),
++                   (unsigned long long)(sq->head.load(cuda::std::memory_order_acquire) & (sq->qs_minus_1)), (unsigned long long)(sq->tail.load(cuda::std::memory_order_acquire) & (sq->qs_minus_1)));
+                    }*/
+ #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
+         __nanosleep(ns);
+@@ -201,12 +202,12 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
+     }
+ 
+     ns = 8;
+-    while ((sq->tickets[pos].val.load(simt::memory_order_acquire) != id) ) {
++    while ((sq->tickets[pos].val.load(cuda::std::memory_order_acquire) != id) ) {
+         /*if (k++ % 100 == 0)   {
+             printf("tid: %llu\tpos: %llu\tticket: %llu\tid: %llu\ttickets_pos: %llu\tqueue_head: %llu\tqueue_tail: %llu\n",
+                    (unsigned long long) threadIdx.x, (unsigned long long) pos,
+-                   (unsigned long long)ticket, (unsigned long long)id, (unsigned long long) (sq->tickets[pos].val.load(simt::memory_order_acquire)),
+-                   (unsigned long long)(sq->head.load(simt::memory_order_acquire) & (sq->qs_minus_1)), (unsigned long long)(sq->tail.load(simt::memory_order_acquire) & (sq->qs_minus_1)));
++                   (unsigned long long)ticket, (unsigned long long)id, (unsigned long long) (sq->tickets[pos].val.load(cuda::std::memory_order_acquire)),
++                   (unsigned long long)(sq->head.load(cuda::std::memory_order_acquire) & (sq->qs_minus_1)), (unsigned long long)(sq->tail.load(cuda::std::memory_order_acquire) & (sq->qs_minus_1)));
+                    }*/
+ #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
+         __nanosleep(ns);
+@@ -224,7 +225,7 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
+ //    }
+ 
+ 
+-/*     while (((pos+1) & sq->qs_minus_1) == (sq->head.load(simt::memory_order_acquire) & (sq->qs_minus_1))) { */
++/*     while (((pos+1) & sq->qs_minus_1) == (sq->head.load(cuda::std::memory_order_acquire) & (sq->qs_minus_1))) { */
+ /* #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__)) */
+ /*         __nanosleep(100); */
+ /* #endif */
+@@ -262,7 +263,7 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
+     bool proceed = false;
+     do {
+ 
+-        uint32_t cur_head = sq->head.load(simt::memory_order_acquire) & (sq->qs_minus_1);
++        uint32_t cur_head = sq->head.load(cuda::std::memory_order_acquire) & (sq->qs_minus_1);
+ 
+         uint32_t check = (cur_head - 1)  & (sq->qs_minus_1);
+         //uint32_t cur_head_mod = cur_head & (sq->qs_minus_1);
+@@ -271,25 +272,25 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
+         printf("here pos: %llu\n", (unsigned long long) pos);
+     } while(!proceed);
+     */
+-    //sq->tickets[pos].val.store(id + 1, simt::memory_order_release);
++    //sq->tickets[pos].val.store(id + 1, cuda::std::memory_order_release);
+     if (pc_tail) {
+-        *cur_pc_tail = pc_tail->load(simt::memory_order_relaxed);
++        *cur_pc_tail = pc_tail->load(cuda::std::memory_order_relaxed);
+     }
+-    sq->tail_mark[pos].val.store(LOCKED, simt::memory_order_release);
+-    /*     while (((pos+1) & sq->qs_minus_1) == (sq->head.load(simt::memory_order_acquire) & (sq->qs_minus_1))) { */
++    sq->tail_mark[pos].val.store(LOCKED, cuda::std::memory_order_release);
++    /*     while (((pos+1) & sq->qs_minus_1) == (sq->head.load(cuda::std::memory_order_acquire) & (sq->qs_minus_1))) { */
+ /* #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__)) */
+ /*         __nanosleep(100); */
+ /* #endif */
+ /*     } */
+     bool cont = true;
+     ns = 8;
+-    cont = sq->tail_mark[pos].val.load(simt::memory_order_relaxed) == LOCKED;
++    cont = sq->tail_mark[pos].val.load(cuda::std::memory_order_relaxed) == LOCKED;
+     while(cont) {
+-        bool new_cont = sq->tail_lock.load(simt::memory_order_relaxed) == LOCKED;
++        bool new_cont = sq->tail_lock.load(cuda::std::memory_order_relaxed) == LOCKED;
+         if (!new_cont) {
+-            new_cont = sq->tail_lock.fetch_or(LOCKED, simt::memory_order_acquire) == LOCKED;
++            new_cont = sq->tail_lock.fetch_or(LOCKED, cuda::std::memory_order_acquire) == LOCKED;
+             if(!new_cont) {
+-                uint32_t cur_tail = sq->tail.load(simt::memory_order_relaxed);
++                uint32_t cur_tail = sq->tail.load(cuda::std::memory_order_relaxed);
+ 
+                 uint32_t tail_move_count = move_tail(sq, cur_tail);
+ 
+@@ -297,20 +298,20 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
+                     uint32_t new_tail = cur_tail + tail_move_count;
+                     uint32_t new_db = (new_tail) & (sq->qs_minus_1);
+                     if (pc_tail) {
+-                        *cur_pc_tail = pc_tail->load(simt::memory_order_acquire);
++                        *cur_pc_tail = pc_tail->load(cuda::std::memory_order_acquire);
+                     }
+ //                    *(sq->db) = new_db;
+ 		    asm volatile ("st.mmio.relaxed.sys.global.u32 [%0], %1;" :: "l"(sq->db),"r"(new_db) : "memory");
+ 
+-                    //sq->tail_copy.store(new_tail, simt::memory_order_release);
+-//	            printf("wrote SQ_db: %llu\tcur_tail: %llu\tmove_count: %llu\tsq_tail: %llu\tsq_head: %llu\n", (unsigned long long) new_db, (unsigned long long) cur_tail, (unsigned long long) tail_move_count, (unsigned long long) (new_tail),  (unsigned long long)(sq->head.load(simt::memory_order_acquire)));
+-                    sq->tail.store(new_tail, simt::memory_order_release);
++                    //sq->tail_copy.store(new_tail, cuda::std::memory_order_release);
++//	            printf("wrote SQ_db: %llu\tcur_tail: %llu\tmove_count: %llu\tsq_tail: %llu\tsq_head: %llu\n", (unsigned long long) new_db, (unsigned long long) cur_tail, (unsigned long long) tail_move_count, (unsigned long long) (new_tail),  (unsigned long long)(sq->head.load(cuda::std::memory_order_acquire)));
++                    sq->tail.store(new_tail, cuda::std::memory_order_release);
+                     //cont = false;
+                 }
+-                sq->tail_lock.store(UNLOCKED, simt::memory_order_release);
++                sq->tail_lock.store(UNLOCKED, cuda::std::memory_order_release);
+             }
+         }
+-        cont = sq->tail_mark[pos].val.load(simt::memory_order_relaxed) == LOCKED;
++        cont = sq->tail_mark[pos].val.load(cuda::std::memory_order_relaxed) == LOCKED;
+         if (cont) {
+ #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
+             __nanosleep(ns);
+@@ -324,7 +325,7 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
+ 
+ 
+ 
+-    sq->tickets[pos].val.fetch_add(1, simt::memory_order_acq_rel);
++    sq->tickets[pos].val.fetch_add(1, cuda::std::memory_order_acq_rel);
+     return pos;
+ 
+ }
+@@ -332,21 +333,21 @@ uint16_t sq_enqueue(nvm_queue_t* sq, nvm_cmd_t* cmd, simt::atomic<uint64_t, simt
+ inline __device__
+ void sq_dequeue(nvm_queue_t* sq, uint16_t pos) {
+ 
+-    sq->head_mark[pos].val.store(LOCKED, simt::memory_order_relaxed);
++    sq->head_mark[pos].val.store(LOCKED, cuda::std::memory_order_relaxed);
+     bool cont = true;
+     unsigned int ns = 8;
+-    cont = sq->head_mark[pos].val.load(simt::memory_order_relaxed) == LOCKED;
++    cont = sq->head_mark[pos].val.load(cuda::std::memory_order_relaxed) == LOCKED;
+     while (cont) {
+-            bool new_cont = sq->head_lock.exchange(LOCKED, simt::memory_order_acquire) == LOCKED;
++            bool new_cont = sq->head_lock.exchange(LOCKED, cuda::std::memory_order_acquire) == LOCKED;
+             if (!new_cont){
+-                uint32_t cur_head = sq->head.load(simt::memory_order_relaxed);;
++                uint32_t cur_head = sq->head.load(cuda::std::memory_order_relaxed);;
+ 
+                 uint32_t head_move_count = move_head_sq(sq, cur_head);
+                 //(void) head_move_count;
+                 if (head_move_count) {
+-                    sq->head.store(cur_head + head_move_count, simt::memory_order_relaxed);
++                    sq->head.store(cur_head + head_move_count, cuda::std::memory_order_relaxed);
+                     //for (uint16_t i = 0; i < head_move_count; i++)
+-                    //   sq->tickets[(cur_head+i) & sq->qs_minus_1].val.fetch_add(1, simt::memory_order_release);
++                    //   sq->tickets[(cur_head+i) & sq->qs_minus_1].val.fetch_add(1, cuda::std::memory_order_release);
+                     //cont = false;
+   //              printf("sq cur_head: %llu\thead_move_count: %llu\tnew_head: %llu\n", (unsigned long long) cur_head, (unsigned long long) head_move_count, (unsigned long long) (cur_head+head_move_count));
+ 
+@@ -355,11 +356,11 @@ void sq_dequeue(nvm_queue_t* sq, uint16_t pos) {
+                 /* if (head_move_count) { */
+                 /*     uint32_t new_head = cur_head + head_move_count; */
+                 /*     //printf("sq new_head: %llu\n", (unsigned long long) new_head); */
+-                /*     sq->head.store(new_head, simt::memory_order_release); */
++                /*     sq->head.store(new_head, cuda::std::memory_order_release); */
+                 /* } */
+-                sq->head_lock.store(UNLOCKED, simt::memory_order_release);
++                sq->head_lock.store(UNLOCKED, cuda::std::memory_order_release);
+             }
+-            cont = sq->head_mark[pos].val.load(simt::memory_order_relaxed) == LOCKED;
++            cont = sq->head_mark[pos].val.load(cuda::std::memory_order_relaxed) == LOCKED;
+             if (cont) {
+ #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
+                 __nanosleep(ns);
+@@ -382,7 +383,7 @@ uint32_t cq_poll(nvm_queue_t* cq, uint16_t search_cid, uint32_t* loc_ = NULL, ui
+     //uint64_t tid = threadIdx.x + blockIdx.x * blockDim.x;
+     //printf("---tid: %llu\tcid: %llu\tcq_start: %llx\n", (unsigned long long) (threadIdx.x+blockIdx.x*blockDim.x), (unsigned long long) (search_cid), (uint64_t) cq->vaddr);
+     while (true) {
+-        uint32_t head = cq->head.load(simt::memory_order_relaxed);
++        uint32_t head = cq->head.load(cuda::std::memory_order_relaxed);
+ 
+         for (size_t i = 0; i < cq->qs_minus_1; i++) {
+             uint32_t cur_head = head + i;
+@@ -397,9 +398,9 @@ uint32_t cq_poll(nvm_queue_t* cq, uint16_t search_cid, uint32_t* loc_ = NULL, ui
+                         (unsigned long long) cq->qs_log2,
+                         (unsigned long long)head, (unsigned long long) cur_head, (unsigned long long) search_cid, (unsigned long long) search_phase, ((volatile nvm_cpl_t*)cq->vaddr)+loc,
+                         (unsigned long long) cq->qs, (unsigned long long) i, (unsigned long long) j, (unsigned long long) cid, (unsigned long long) phase,
+-                        (unsigned long long) cq->head_mark[loc].val.load(simt::memory_order_acquire));
++                        (unsigned long long) cq->head_mark[loc].val.load(cuda::std::memory_order_acquire));
+ */
+-//            if ((cid == search_cid) && (phase == search_phase) && (cq->head_mark[loc].load(simt::memory_order_acquire) == UNLOCKED)){
++//            if ((cid == search_cid) && (phase == search_phase) && (cq->head_mark[loc].load(cuda::std::memory_order_acquire) == UNLOCKED)){
+             if ((cid == search_cid) && (phase == search_phase)){
+                  //if ((cpl_entry >> 17) != 0)
+                  //     printf("NVM Error: %llx\tcid: %llu\n", (unsigned long long) (cpl_entry >> 17), (unsigned long long) search_cid);
+@@ -423,15 +424,15 @@ uint32_t cq_poll(nvm_queue_t* cq, uint16_t search_cid, uint32_t* loc_ = NULL, ui
+ 
+ inline __device__
+ void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ = 0, uint32_t cur_head_ = 0) {
+-    cq->tail.fetch_add(1, simt::memory_order_acq_rel);
++    cq->tail.fetch_add(1, cuda::std::memory_order_acq_rel);
+ 
+     unsigned int ns = 8;
+-    while ((cq->pos_locks[pos].val.load(simt::memory_order_relaxed) != 0) ) {
++    while ((cq->pos_locks[pos].val.load(cuda::std::memory_order_relaxed) != 0) ) {
+         /*if (k++ % 100 == 0)   {
+             printf("tid: %llu\tpos: %llu\tticket: %llu\tid: %llu\ttickets_pos: %llu\tqueue_head: %llu\tqueue_tail: %llu\n",
+                    (unsigned long long) threadIdx.x, (unsigned long long) pos,
+-                   (unsigned long long)ticket, (unsigned long long)id, (unsigned long long) (sq->tickets[pos].val.load(simt::memory_order_acquire)),
+-                   (unsigned long long)(sq->head.load(simt::memory_order_acquire) & (sq->qs_minus_1)), (unsigned long long)(sq->tail.load(simt::memory_order_acquire) & (sq->qs_minus_1)));
++                   (unsigned long long)ticket, (unsigned long long)id, (unsigned long long) (sq->tickets[pos].val.load(cuda::std::memory_order_acquire)),
++                   (unsigned long long)(sq->head.load(cuda::std::memory_order_acquire) & (sq->qs_minus_1)), (unsigned long long)(sq->tail.load(cuda::std::memory_order_acquire) & (sq->qs_minus_1)));
+                    }*/
+ #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
+         __nanosleep(ns);
+@@ -442,12 +443,12 @@ void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ =
+     }
+ 
+     ns = 8;
+-    while ((cq->pos_locks[pos].val.fetch_or(1, simt::memory_order_acquire) != 0) ) {
++    while ((cq->pos_locks[pos].val.fetch_or(1, cuda::std::memory_order_acquire) != 0) ) {
+         /*if (k++ % 100 == 0)   {
+             printf("tid: %llu\tpos: %llu\tticket: %llu\tid: %llu\ttickets_pos: %llu\tqueue_head: %llu\tqueue_tail: %llu\n",
+                    (unsigned long long) threadIdx.x, (unsigned long long) pos,
+-                   (unsigned long long)ticket, (unsigned long long)id, (unsigned long long) (sq->tickets[pos].val.load(simt::memory_order_acquire)),
+-                   (unsigned long long)(sq->head.load(simt::memory_order_acquire) & (sq->qs_minus_1)), (unsigned long long)(sq->tail.load(simt::memory_order_acquire) & (sq->qs_minus_1)));
++                   (unsigned long long)ticket, (unsigned long long)id, (unsigned long long) (sq->tickets[pos].val.load(cuda::std::memory_order_acquire)),
++                   (unsigned long long)(sq->head.load(cuda::std::memory_order_acquire) & (sq->qs_minus_1)), (unsigned long long)(sq->tail.load(cuda::std::memory_order_acquire) & (sq->qs_minus_1)));
+                    }*/
+ #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
+         __nanosleep(ns);
+@@ -458,16 +459,16 @@ void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ =
+     }
+ 
+     //uint32_t pos = cq_poll(cq, cid);
+-    cq->head_mark[pos].val.store(LOCKED, simt::memory_order_release);
++    cq->head_mark[pos].val.store(LOCKED, cuda::std::memory_order_release);
+ 
+ 
+     bool cont = true;
+     ns = 8;
+-    cont = cq->head_mark[pos].val.load(simt::memory_order_relaxed) == LOCKED;
++    cont = cq->head_mark[pos].val.load(cuda::std::memory_order_relaxed) == LOCKED;
+     while (cont) {
+-            bool new_cont = cq->head_lock.fetch_or(LOCKED, simt::memory_order_acquire) == LOCKED;
++            bool new_cont = cq->head_lock.fetch_or(LOCKED, cuda::std::memory_order_acquire) == LOCKED;
+             if (!new_cont) {
+-                uint32_t cur_head = cq->head.load(simt::memory_order_relaxed);;
++                uint32_t cur_head = cq->head.load(cuda::std::memory_order_relaxed);;
+ 
+                 uint32_t head_move_count = move_head_cq(cq, cur_head, sq);
+                 //printf("cq head_move_count: %llu\n", (unsigned long long) head_move_count);
+@@ -480,16 +481,16 @@ void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ =
+                     //*(cq->db) = new_db;
+                     asm volatile ("st.mmio.relaxed.sys.global.u32 [%0], %1;" :: "l"(cq->db),"r"(new_db) : "memory");
+ 
+-		    //cq->head_copy.store(new_head, simt::memory_order_release);
+-//                    printf("wrote CQ_db: %llu\tcur_head: %llu\tmove_count: %llu\tcq_head: %llu\tcq_tail: %llu\n", (unsigned long long) new_db, (unsigned long long) cur_head, (unsigned long long) head_move_count, (unsigned long long) (new_head),  (unsigned long long)(cq->tail.load(simt::memory_order_acquire)));
+-                    cq->head.store(new_head, simt::memory_order_release);//axed);
++		    //cq->head_copy.store(new_head, cuda::std::memory_order_release);
++//                    printf("wrote CQ_db: %llu\tcur_head: %llu\tmove_count: %llu\tcq_head: %llu\tcq_tail: %llu\n", (unsigned long long) new_db, (unsigned long long) cur_head, (unsigned long long) head_move_count, (unsigned long long) (new_head),  (unsigned long long)(cq->tail.load(cuda::std::memory_order_acquire)));
++                    cq->head.store(new_head, cuda::std::memory_order_release);//axed);
+ 
+                     //clean_cids(cq, sq, head_move_count);
+                     //cont = false;
+                 }
+-                cq->head_lock.store(UNLOCKED, simt::memory_order_release);
++                cq->head_lock.store(UNLOCKED, cuda::std::memory_order_release);
+             }
+-            cont = cq->head_mark[pos].val.load(simt::memory_order_relaxed) == LOCKED;
++            cont = cq->head_mark[pos].val.load(cuda::std::memory_order_relaxed) == LOCKED;
+             if (cont) {
+ #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
+                 __nanosleep(ns);
+@@ -502,7 +503,7 @@ void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ =
+ 
+ 
+ 	uint64_t j = 0;
+-    uint32_t new_head = cq->head.load(simt::memory_order_relaxed);
++    uint32_t new_head = cq->head.load(cuda::std::memory_order_relaxed);
+     ns = 8;
+ //    uint32_t cur_head_mod = cur_head_ & (cq->qs_minus_1);
+     do {
+@@ -522,7 +523,7 @@ void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ =
+         }
+ 
+         j++;
+-        new_head = cq->head.load(simt::memory_order_relaxed);
++        new_head = cq->head.load(cuda::std::memory_order_relaxed);
+ #if defined(__CUDACC__) && (__CUDA_ARCH__ >= 700 || !defined(__CUDA_ARCH__))
+         __nanosleep(ns);
+         if (ns < 256) {
+@@ -531,7 +532,7 @@ void cq_dequeue(nvm_queue_t* cq, uint16_t pos, nvm_queue_t* sq, uint32_t loc_ =
+ #endif
+     } while(true);
+ 
+-    cq->pos_locks[pos].val.store(0, simt::memory_order_release);
++    cq->pos_locks[pos].val.store(0, cuda::std::memory_order_release);
+ }
+ 
+ //#ifndef __CUDACC__
+diff --git a/include/nvm_types.h b/include/nvm_types.h
+index ece7395..c1d5e40 100644
+--- a/include/nvm_types.h
++++ b/include/nvm_types.h
+@@ -7,7 +7,8 @@
+ 
+ #include <stddef.h>
+ #include <stdint.h>
+-#include <simt/atomic>
++#include <cuda/atomic>
++#include <cuda/std/atomic>
+ 
+ #ifndef __align__ 
+ #define __align__(x)
+@@ -79,34 +80,34 @@ typedef struct
+ 
+ 
+ 
+-typedef simt::atomic<uint32_t, simt::thread_scope_device> padded_struct_pc;
++typedef cuda::atomic<uint32_t, cuda::thread_scope_device> padded_struct_pc;
+ 
+ #define CACHELINE_SIZE (128)
+ 
+ #define STATES_PER_CACHELINE (CACHELINE_SIZE/sizeof(padded_struct_pc))
+ /* typedef struct __align__(32) */
+ /* { */
+-/*     simt::atomic<uint32_t, simt::thread_scope_device>  val; */
++/*     cuda::atomic<uint32_t, cuda::thread_scope_device>  val; */
+ /* //    uint8_t pad[32-4]; */
+ /* } __attribute__((aligned (32))) padded_struct_pc; */
+ 
+ 
+ typedef struct __align__(32)
+ {
+-    simt::atomic<uint32_t, simt::thread_scope_device>  val;
++    cuda::atomic<uint32_t, cuda::thread_scope_device>  val;
+     //uint8_t pad[32-8];
+ } __attribute__((aligned (32))) padded_struct;
+ 
+ /* typedef struct __align__(32) */
+ /* { */
+-/*     simt::atomic<uint32_t, simt::thread_scope_system>  val; */
++/*     cuda::atomic<uint32_t, cuda::thread_scope_system>  val; */
+ /*     //uint8_t pad[32-8]; */
+ /* } __attribute__((aligned (32))) padded_struct_pc; */
+ 
+ 
+ /* typedef struct __align__(32) */
+ /* { */
+-/*     simt::atomic<uint64_t, simt::thread_scope_system>  val; */
++/*     cuda::atomic<uint64_t, cuda::thread_scope_system>  val; */
+ /*     uint8_t pad[32-8]; */
+ /* } __attribute__((aligned (32))) padded_struct; */
+ 
+@@ -122,24 +123,24 @@ typedef struct __align__(32)
+  */
+ typedef struct
+ {
+-    simt::atomic<uint32_t, simt::thread_scope_device> head_lock;
++    cuda::atomic<uint32_t, cuda::thread_scope_device> head_lock;
+     uint8_t pad0[28];
+-    simt::atomic<uint32_t, simt::thread_scope_device> tail_lock;
++    cuda::atomic<uint32_t, cuda::thread_scope_device> tail_lock;
+     uint8_t pad1[28];
+-    simt::atomic<uint32_t, simt::thread_scope_device> head;
++    cuda::atomic<uint32_t, cuda::thread_scope_device> head;
+     uint8_t pad2[28];
+-    simt::atomic<uint32_t, simt::thread_scope_device> tail;
++    cuda::atomic<uint32_t, cuda::thread_scope_device> tail;
+     uint8_t pad3[28];
+-    simt::atomic<uint32_t, simt::thread_scope_system> tail_copy;
++    cuda::atomic<uint32_t, cuda::thread_scope_system> tail_copy;
+     uint8_t pad4[28];
+-    simt::atomic<uint32_t, simt::thread_scope_system> head_copy;
++    cuda::atomic<uint32_t, cuda::thread_scope_system> head_copy;
+     uint8_t pad5[28];
+ 
+-    /* padded_struct<simt::atomic<uint32_t, simt::thread_scope_system>> head; */
+-    /* padded_struct<simt::atomic<uint32_t, simt::thread_scope_system>> tail; */
+-    simt::atomic<uint32_t, simt::thread_scope_device> in_ticket;
++    /* padded_struct<cuda::atomic<uint32_t, cuda::thread_scope_system>> head; */
++    /* padded_struct<cuda::atomic<uint32_t, cuda::thread_scope_system>> tail; */
++    cuda::atomic<uint32_t, cuda::thread_scope_device> in_ticket;
+     uint8_t pad6[28];
+-    simt::atomic<uint32_t, simt::thread_scope_device> cid_ticket;
++    cuda::atomic<uint32_t, cuda::thread_scope_device> cid_ticket;
+     //uint8_t pad7[28];
+     padded_struct* tickets;
+ 
+diff --git a/include/nvm_util.h b/include/nvm_util.h
+index 6246716..3de2530 100644
+--- a/include/nvm_util.h
++++ b/include/nvm_util.h
+@@ -1,14 +1,19 @@
+ #ifndef __NVM_UTIL_H__
+ #define __NVM_UTIL_H__
+-//#ifndef __CUDACC__
+-//#define __device__
+-//#define __host__
+-//#endif
++#ifndef __CUDACC__
++#define __device__
++#define __host__
++#endif
++
++#ifndef __forceinline__  
++#define __forceinline__ inline
++#endif
+ 
+ #include <nvm_types.h>
+ #include <stddef.h>
+ #include <stdint.h>
+ #include <cuda.h>
++#include <cuda_runtime_api.h>
+ 
+ #ifdef __DIS_CLUSTER__
+ #include <sisci_types.h>
+@@ -24,6 +29,30 @@
+ #define _NVM_MASK_PART(hi, lo) \
+     (_NVM_MASK((hi) + 1) - _NVM_MASK(lo))
+ 
++static inline cudaError_t nvm_cuda_mem_advise(const void* ptr, size_t count, enum cudaMemoryAdvise advice, int device)
++{
++#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
++    struct cudaMemLocation location;
++    location.type = cudaMemLocationTypeDevice;
++    location.id = device;
++    return cudaMemAdvise(ptr, count, advice, location);
++#else
++    return cudaMemAdvise(ptr, count, advice, device);
++#endif
++}
++
++static inline cudaError_t nvm_cuda_mem_prefetch_async(const void* ptr, size_t count, int device, cudaStream_t stream)
++{
++#if defined(CUDART_VERSION) && CUDART_VERSION >= 13000
++    struct cudaMemLocation location;
++    location.type = cudaMemLocationTypeDevice;
++    location.id = device;
++    return cudaMemPrefetchAsync(ptr, count, location, 0, stream);
++#else
++    return cudaMemPrefetchAsync(ptr, count, device, stream);
++#endif
++}
++
+ 
+ #if defined( __NO_COHERENCE__ ) && defined( __DIS_CLUSTER__ )
+ #ifdef __CUDACC__
+diff --git a/include/page_cache.h b/include/page_cache.h
+index f1a2f31..f1e6050 100644
+--- a/include/page_cache.h
++++ b/include/page_cache.h
+@@ -87,14 +87,14 @@ template <typename T>
+ struct range_d_t;
+ 
+ /*struct data_page_t {
+-  simt::atomic<uint64_t, simt::thread_scope_device>  state; //state
++  cuda::atomic<uint64_t, cuda::thread_scope_device>  state; //state
+   //
+   uint32_t offset;
+ 
+   };
+ */
+ typedef struct __align__(32) {
+-    simt::atomic<uint32_t, simt::thread_scope_device>  state; //state
++    cuda::atomic<uint32_t, cuda::thread_scope_device>  state; //state
+                                                               //
+     uint32_t offset;
+     //uint8_t pad[32-4-4];
+@@ -155,10 +155,10 @@ struct returned_cache_page_t {
+ #define INVALID_MASK_ 0x7fffffff
+ #define DISABLE_BUSY_MASK_ 0xbfffffff
+ 
+-template<simt::thread_scope _scope = simt::thread_scope_device>
++template<cuda::thread_scope _scope = cuda::thread_scope_device>
+ struct tlb_entry {
+     uint64_t global_id;
+-    simt::atomic<uint32_t, _scope> state;
++    cuda::atomic<uint32_t, _scope> state;
+     data_page_t* page = nullptr;
+ 
+     __forceinline__
+@@ -169,7 +169,7 @@ struct tlb_entry {
+     __host__ __device__
+     void init() {
+         global_id = 0;
+-        state.store(0, simt::memory_order_relaxed);
++        state.store(0, cuda::std::memory_order_relaxed);
+         page = nullptr;
+     }
+ 
+@@ -177,17 +177,17 @@ struct tlb_entry {
+     __device__
+     void release(const uint32_t count) {
+ //		    if (global_id == 515920192)
+-//			printf("--(2)st: %llx\tcount: %llu\n", (unsigned long long) state.load(simt::memory_order_relaxed), (unsigned long long) count);
++//			printf("--(2)st: %llx\tcount: %llu\n", (unsigned long long) state.load(cuda::std::memory_order_relaxed), (unsigned long long) count);
+ 
+-        state.fetch_sub(count, simt::memory_order_release); }
++        state.fetch_sub(count, cuda::std::memory_order_release); }
+ 
+     __forceinline__
+     __device__
+     void release() { if (page != nullptr)  {
+ //		    if (global_id == 515920192)
+-//			printf("--(1)st: %llx\tcount: %llu\n", (unsigned long long) state.load(simt::memory_order_relaxed), (unsigned long long) 1);
++//			printf("--(1)st: %llx\tcount: %llu\n", (unsigned long long) state.load(cuda::std::memory_order_relaxed), (unsigned long long) 1);
+ 
+-            page->state.fetch_sub(1, simt::memory_order_release); }}
++            page->state.fetch_sub(1, cuda::std::memory_order_release); }}
+ 
+ 
+ 
+@@ -196,7 +196,7 @@ struct tlb_entry {
+ 
+ 
+ 
+-template<typename T, size_t n = 32, simt::thread_scope _scope = simt::thread_scope_device, size_t loc = GLOBAL_>
++template<typename T, size_t n = 32, cuda::thread_scope _scope = cuda::thread_scope_device, size_t loc = GLOBAL_>
+ struct tlb {
+     tlb_entry<_scope> entries[n];
+     array_d_t<T>* array = nullptr;
+@@ -269,7 +269,7 @@ struct tlb {
+ 
+                 //lock;
+                 do {
+-                    st = entry->state.fetch_or(VALID_, simt::memory_order_acquire);
++                    st = entry->state.fetch_or(VALID_, cuda::std::memory_order_acquire);
+                     if ((st & VALID_) == 0)
+                         break;
+                     __nanosleep(100);
+@@ -283,7 +283,7 @@ struct tlb {
+ 
+                     base_master = (uint64_t) range->get_cache_page_addr(entry->page->offset);
+ 
+-                    entry->state.store(st, simt::memory_order_release);
++                    entry->state.store(st, cuda::std::memory_order_release);
+                     break;
+                 }
+                 else if(((entry->page == nullptr)) || (((st & 0x3fffffff) == 0))) {
+@@ -291,7 +291,7 @@ struct tlb {
+ //			printf("++(2)st: %llx\tst&Val: %llx\tVal: %llx\tcount: %llu\n", (unsigned long long) st, (unsigned long long) (st & VALID_), (unsigned long long) VALID_, (unsigned long long) count);
+ //
+                     if (entry->page != nullptr)
+-                        entry->page->state.fetch_sub(1, simt::memory_order_release);
++                        entry->page->state.fetch_sub(1, cuda::std::memory_order_release);
+                     data_page_t* page = nullptr;// = (data_page_t*)0xffffffffffffffff;
+                     base_master = (uint64_t) array->acquire_page_(i, page, start, end, range, page_);
+                     if (((uint64_t) page == 0xffffffffffffffff) || (page == nullptr))
+@@ -299,14 +299,14 @@ struct tlb {
+                     entry->page = page;
+                     entry->global_id = gid;
+                     st += count;
+-                    entry->state.store(st, simt::memory_order_release);
++                    entry->state.store(st, cuda::std::memory_order_release);
+                     break;
+ 
+                 }
+                 else {
+                     if (++c % 100000 == 0)
+                         printf("c: %llu\ttid: %llu\twanted_gid: %llu\tgot_gid: %llu\tst: %llx\tst&0x7: %llx\n", (unsigned long long) c, (unsigned long long) (TID), (unsigned long long) gid, (unsigned long long) entry->global_id, (unsigned long long) st, (unsigned long long) (st & 0x7fffffff));
+-                    entry->state.store(st, simt::memory_order_relaxed);
++                    entry->state.store(st, cuda::std::memory_order_relaxed);
+                     __nanosleep(100);
+ 
+                 }
+@@ -343,7 +343,7 @@ struct tlb {
+ 
+ };
+ 
+-template<typename T, size_t n = 32, simt::thread_scope _scope = simt::thread_scope_device, size_t loc = GLOBAL_>
++template<typename T, size_t n = 32, cuda::thread_scope _scope = cuda::thread_scope_device, size_t loc = GLOBAL_>
+ struct bam_ptr_tlb {
+     tlb<T,n,_scope,loc>* tlb_ = nullptr;
+     array_d_t<T>* array = nullptr;
+@@ -472,20 +472,27 @@ struct bam_ptr {
+         return ret_;
+     }
+ 
++    __host__ __device__
++    T* operator+(size_t i) {
++        if ((i < start) || (i >= end)) {
++           update_page(i);
++        }
++        return addr + (i - start);
++    }
+ 
+     __forceinline__
+     __host__ __device__
+     T& operator[](const size_t i) {
+         if ((i < start) || (i >= end)) {
+             update_page(i);
+-            page->state.fetch_or(DIRTY, simt::memory_order_relaxed);
++            page->state.fetch_or(DIRTY, cuda::std::memory_order_relaxed);
+         }
+         return addr[i-start];
+     }
+ };
+ 
+ typedef struct __align__(32) {
+-    simt::atomic<uint32_t, simt::thread_scope_device>  page_take_lock; //state
++    cuda::atomic<uint32_t, cuda::thread_scope_device>  page_take_lock; //state
+     //
+     uint64_t page_translation;
+     uint8_t pad[32-8];
+@@ -493,7 +500,7 @@ typedef struct __align__(32) {
+ } __attribute__((aligned (32))) cache_page_t;
+ /*
+   struct cache_page_t {
+-  simt::atomic<uint32_t, simt::thread_scope_device>  page_take_lock;
++  cuda::atomic<uint32_t, cuda::thread_scope_device>  page_take_lock;
+   uint32_t  page_translation;
+   uint8_t   range_id;
+   };
+@@ -525,12 +532,12 @@ struct page_cache_d_t {
+ 
+     uint64_t* ranges_page_starts;
+     data_dist_t* ranges_dists;
+-    simt::atomic<uint64_t, simt::thread_scope_device>* ctrl_counter;
++    cuda::atomic<uint64_t, cuda::thread_scope_device>* ctrl_counter;
+ 
+-    simt::atomic<uint64_t, simt::thread_scope_device>* q_head;
+-    simt::atomic<uint64_t, simt::thread_scope_device>* q_tail;
+-    simt::atomic<uint64_t, simt::thread_scope_device>* q_lock;
+-    simt::atomic<uint64_t, simt::thread_scope_device>* extra_reads;
++    cuda::atomic<uint64_t, cuda::thread_scope_device>* q_head;
++    cuda::atomic<uint64_t, cuda::thread_scope_device>* q_tail;
++    cuda::atomic<uint64_t, cuda::thread_scope_device>* q_lock;
++    cuda::atomic<uint64_t, cuda::thread_scope_device>* extra_reads;
+ 
+     Controller** d_ctrls;
+     uint64_t n_ctrls;
+@@ -592,7 +599,7 @@ void __flush(page_cache_d_t* pc) {
+         uint64_t previous_address = previous_global_address >> pc->n_ranges_bits;
+         //uint32_t new_state = BUSY;
+ 
+-        uint32_t expected_state = pc->ranges[previous_range][previous_address].state.load(simt::memory_order_relaxed);
++        uint32_t expected_state = pc->ranges[previous_range][previous_address].state.load(cuda::std::memory_order_relaxed);
+ 
+         uint32_t d = expected_state & DIRTY;
+         uint32_t smid = get_smid();
+@@ -665,9 +672,9 @@ struct page_cache_t {
+ 
+     void print_reset_stats(void) {
+         uint64_t v = 0;
+-        cuda_err_chk(cudaMemcpy(&v, pdt.extra_reads, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaMemcpyDeviceToHost));
++        cuda_err_chk(cudaMemcpy(&v, pdt.extra_reads, sizeof(cuda::atomic<uint64_t, cuda::thread_scope_device>), cudaMemcpyDeviceToHost));
+ 
+-        cuda_err_chk(cudaMemset(pdt.extra_reads, 0, sizeof(simt::atomic<uint64_t, simt::thread_scope_device>)));
++        cuda_err_chk(cudaMemset(pdt.extra_reads, 0, sizeof(cuda::atomic<uint64_t, cuda::thread_scope_device>)));
+ 
+ //        printf("Cache Extra Reads: %llu\n", v);
+     }
+@@ -696,17 +703,17 @@ struct page_cache_t {
+ 
+     page_cache_t(const uint64_t ps, const uint64_t np, const uint32_t cudaDevice, const Controller& ctrl, const uint64_t max_range, const std::vector<Controller*>& ctrls) {
+ 
+-        ctrl_counter_buf = createBuffer(sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaDevice);
+-        q_head_buf = createBuffer(sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaDevice);
+-        q_tail_buf = createBuffer(sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaDevice);
+-        q_lock_buf = createBuffer(sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaDevice);
+-        extra_reads_buf = createBuffer(sizeof(simt::atomic<uint64_t, simt::thread_scope_device>), cudaDevice);
+-        pdt.ctrl_counter = (simt::atomic<uint64_t, simt::thread_scope_device>*)ctrl_counter_buf.get();
++        ctrl_counter_buf = createBuffer(sizeof(cuda::atomic<uint64_t, cuda::thread_scope_device>), cudaDevice);
++        q_head_buf = createBuffer(sizeof(cuda::atomic<uint64_t, cuda::thread_scope_device>), cudaDevice);
++        q_tail_buf = createBuffer(sizeof(cuda::atomic<uint64_t, cuda::thread_scope_device>), cudaDevice);
++        q_lock_buf = createBuffer(sizeof(cuda::atomic<uint64_t, cuda::thread_scope_device>), cudaDevice);
++        extra_reads_buf = createBuffer(sizeof(cuda::atomic<uint64_t, cuda::thread_scope_device>), cudaDevice);
++        pdt.ctrl_counter = (cuda::atomic<uint64_t, cuda::thread_scope_device>*)ctrl_counter_buf.get();
+         pdt.page_size = ps;
+-        pdt.q_head = (simt::atomic<uint64_t, simt::thread_scope_device>*)q_head_buf.get();
+-        pdt.q_tail = (simt::atomic<uint64_t, simt::thread_scope_device>*)q_tail_buf.get();
+-        pdt.q_lock = (simt::atomic<uint64_t, simt::thread_scope_device>*)q_lock_buf.get();
+-        pdt.extra_reads = (simt::atomic<uint64_t, simt::thread_scope_device>*)extra_reads_buf.get();
++        pdt.q_head = (cuda::atomic<uint64_t, cuda::thread_scope_device>*)q_head_buf.get();
++        pdt.q_tail = (cuda::atomic<uint64_t, cuda::thread_scope_device>*)q_tail_buf.get();
++        pdt.q_lock = (cuda::atomic<uint64_t, cuda::thread_scope_device>*)q_lock_buf.get();
++        pdt.extra_reads = (cuda::atomic<uint64_t, cuda::thread_scope_device>*)extra_reads_buf.get();
+         pdt.page_size_minus_1 = ps - 1;
+         pdt.n_pages = np;
+         pdt.ctrl_page_size = ctrl.ctrl->page_size;
+@@ -901,10 +908,10 @@ struct range_d_t {
+     data_dist_t dist;
+     uint8_t* src;
+ 
+-    simt::atomic<uint64_t, simt::thread_scope_device> access_cnt;
+-    simt::atomic<uint64_t, simt::thread_scope_device> miss_cnt;
+-    simt::atomic<uint64_t, simt::thread_scope_device> hit_cnt;
+-    simt::atomic<uint64_t, simt::thread_scope_device> read_io_cnt;
++    cuda::atomic<uint64_t, cuda::thread_scope_device> access_cnt;
++    cuda::atomic<uint64_t, cuda::thread_scope_device> miss_cnt;
++    cuda::atomic<uint64_t, cuda::thread_scope_device> hit_cnt;
++    cuda::atomic<uint64_t, cuda::thread_scope_device> read_io_cnt;
+ 
+ 
+     pages_t pages;
+@@ -1082,7 +1089,7 @@ __forceinline__
+ __device__
+ void range_d_t<T>::release_page(const size_t pg) const {
+     uint64_t index = pg;
+-    pages[index].state.fetch_sub(1, simt::memory_order_release);
++    pages[index].state.fetch_sub(1, cuda::std::memory_order_release);
+ }
+ 
+ template <typename T>
+@@ -1090,7 +1097,7 @@ __forceinline__
+ __device__
+ void range_d_t<T>::release_page(const size_t pg, const uint32_t count) const {
+     uint64_t index = pg;
+-    pages[index].state.fetch_sub(count, simt::memory_order_release);
++    pages[index].state.fetch_sub(count, cuda::std::memory_order_release);
+ }
+ 
+ template <typename T>
+@@ -1112,7 +1119,7 @@ template <typename T>
+ __forceinline__
+ __device__
+ void range_d_t<T>::mark_page_dirty(const size_t index) {
+-    pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
++    pages[index].state.fetch_or(DIRTY, cuda::std::memory_order_relaxed);
+ }
+ 
+ 
+@@ -1122,21 +1129,21 @@ __device__
+ uint64_t range_d_t<T>::acquire_page(const size_t pg, const uint32_t count, const bool write, const uint32_t ctrl_, const uint32_t queue) {
+     uint64_t index = pg;
+     //uint32_t global_address = (index << cache.n_ranges_bits) | range_id;
+-    //access_cnt.fetch_add(count, simt::memory_order_relaxed);
+-    access_cnt.fetch_add(count, simt::memory_order_relaxed);
++    //access_cnt.fetch_add(count, cuda::std::memory_order_relaxed);
++    access_cnt.fetch_add(1, cuda::std::memory_order_relaxed);
+     bool fail = true;
+     unsigned int ns = 8;
+     //bool miss = false;
+     //T ret;
+     uint64_t read_state,st,st_new;
+-    read_state = pages[index].state.fetch_add(count, simt::memory_order_acquire);
++    read_state = pages[index].state.fetch_add(count, cuda::std::memory_order_acquire);
+     do {
+         st = (read_state >> (CNT_SHIFT+1)) & 0x03;
+ 
+         switch (st) {
+             //invalid
+         case NV_NB:
+-            st_new = pages[index].state.fetch_or(BUSY, simt::memory_order_acquire);
++            st_new = pages[index].state.fetch_or(BUSY, cuda::std::memory_order_acquire);
+             if ((st_new & BUSY) == 0) {
+                 uint64_t st_new_st = (st_new >> (CNT_SHIFT+1)) & 0x03;
+                 if (st_new_st == NV_NB) { 
+@@ -1146,37 +1153,37 @@ uint64_t range_d_t<T>::acquire_page(const size_t pg, const uint32_t count, const
+                     //uint32_t sm_id = get_smid();
+                     //uint32_t ctrl = (tid/32) % (cache.n_ctrls);
+                     //uint32_t ctrl = sm_id % (cache.n_ctrls);
+-                    //uint32_t ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
++                    //uint32_t ctrl = cache.ctrl_counter->fetch_add(1, cuda::std::memory_order_relaxed) % (cache.n_ctrls);
+                     uint64_t ctrl = get_backing_ctrl(index);
+                     if (ctrl == ALL_CTRLS)
+-                        ctrl = cache.ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (cache.n_ctrls);
++                        ctrl = cache.ctrl_counter->fetch_add(1, cuda::std::memory_order_relaxed) % (cache.n_ctrls);
+                     //ctrl = ctrl_;
+                     uint64_t b_page = get_backing_page(index);
+                     Controller* c = cache.d_ctrls[ctrl];
+-                    c->access_counter.fetch_add(1, simt::memory_order_relaxed);
++                    c->access_counter.fetch_add(1, cuda::std::memory_order_relaxed);
+                     //uint32_t queue = (tid/32) % (c->n_qps);
+-                    //uint32_t queue = c->queue_counter.fetch_add(1, simt::memory_order_relaxed) % (c->n_qps);
++                    //uint32_t queue = c->queue_counter.fetch_add(1, cuda::std::memory_order_relaxed) % (c->n_qps);
+                     //uint32_t queue = ((sm_id * 64) + warp_id()) % (c->n_qps);
+-                    read_io_cnt.fetch_add(1, simt::memory_order_relaxed);
++                    // read_io_cnt.fetch_add(1, cuda::std::memory_order_relaxed);
+                     read_data(&cache, (c->d_qps)+queue, ((b_page)*cache.n_blocks_per_page), cache.n_blocks_per_page, page_trans);
+-                    //page_addresses[index].store(page_trans, simt::memory_order_release);
++                    //page_addresses[index].store(page_trans, cuda::std::memory_order_release);
+                     pages[index].offset = page_trans;
+-                    // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
++                    // while (cache.page_translation[global_page].load(cuda::std::memory_order_acquire) != page_trans)
+                     //     __nanosleep(100);
+-                    //miss_cnt.fetch_add(count, simt::memory_order_relaxed);
+-                    miss_cnt.fetch_add(count, simt::memory_order_relaxed);
++                    //miss_cnt.fetch_add(count, cuda::std::memory_order_relaxed);
++                    miss_cnt.fetch_add(1, cuda::std::memory_order_relaxed);
+                     //new_state = VALID;
+                     if (write)
+-                        pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
++                        pages[index].state.fetch_or(DIRTY, cuda::std::memory_order_relaxed);
+                     //new_state |= DIRTY;
+-                    //pages[index].state.fetch_or(new_state, simt::memory_order_relaxed);
+-                    pages[index].state.fetch_xor(DISABLE_BUSY_ENABLE_VALID, simt::memory_order_release);
++                    //pages[index].state.fetch_or(new_state, cuda::std::memory_order_relaxed);
++                    pages[index].state.fetch_xor(DISABLE_BUSY_ENABLE_VALID, cuda::std::memory_order_release);
+                     return page_trans;
+     
+                     fail = false;
+                 } else {
+                     // Another thread beat us to load the page in cache, clear the BUSY bit and retry.
+-                    pages[index].state.fetch_and(DISABLE_BUSY_MASK, simt::memory_order_release);
++                    pages[index].state.fetch_and(DISABLE_BUSY_MASK, cuda::std::memory_order_release);
+                     printf("Race loading page\n");
+                 }
+             }
+@@ -1185,16 +1192,16 @@ uint64_t range_d_t<T>::acquire_page(const size_t pg, const uint32_t count, const
+             //valid
+         case V_NB:
+             if (write && ((read_state & DIRTY) == 0))
+-                pages[index].state.fetch_or(DIRTY, simt::memory_order_relaxed);
+-            //uint32_t page_trans = pages[index].offset.load(simt::memory_order_acquire);
++                pages[index].state.fetch_or(DIRTY, cuda::std::memory_order_relaxed);
++            //uint32_t page_trans = pages[index].offset.load(cuda::std::memory_order_acquire);
+             uint32_t page_trans = pages[index].offset;
+-            // while (cache.page_translation[global_page].load(simt::memory_order_acquire) != page_trans)
++            // while (cache.page_translation[global_page].load(cuda::std::memory_order_acquire) != page_trans)
+             //     __nanosleep(100);
+-            //hit_cnt.fetch_add(count, simt::memory_order_relaxed);
+-            hit_cnt.fetch_add(count, simt::memory_order_relaxed);
++            //hit_cnt.fetch_add(count, cuda::std::memory_order_relaxed);
++            hit_cnt.fetch_add(1, cuda::std::memory_order_relaxed);
+             return page_trans;
+ 
+-            //pages[index].fetch_sub(1, simt::memory_order_release);
++            //pages[index].fetch_sub(1, cuda::std::memory_order_release);
+             fail = false;
+ 
+             break;
+@@ -1216,7 +1223,7 @@ uint64_t range_d_t<T>::acquire_page(const size_t pg, const uint32_t count, const
+                 ns *= 2;
+             }
+ #endif
+-            read_state = pages[index].state.load(simt::memory_order_acquire);
++            read_state = pages[index].state.load(cuda::std::memory_order_acquire);
+         }
+ 
+     } while (fail);
+@@ -1270,7 +1277,7 @@ struct array_d_t {
+             uint32_t leader = 0;
+             if (lane == leader) {
+                 page_cache_d_t* pc = &(r_->cache);
+-                ctrl = pc->ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (pc->n_ctrls);
++                ctrl = pc->ctrl_counter->fetch_add(1, cuda::std::memory_order_relaxed) % (pc->n_ctrls);
+                 queue = get_smid() % (pc->d_ctrls[ctrl]->n_qps);
+             }
+             ctrl = __shfl_sync(mask, ctrl, leader);
+@@ -1337,7 +1344,7 @@ struct array_d_t {
+         auto r_ = d_ranges+r;
+         if (lane == leader) {
+             page_cache_d_t* pc = &(r_->cache);
+-            ctrl = 0;//pc->ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (pc->n_ctrls);
++            ctrl = 0;//pc->ctrl_counter->fetch_add(1, cuda::std::memory_order_relaxed) % (pc->n_ctrls);
+             queue = get_smid() % (pc->d_ctrls[0]->n_qps);
+         }
+ 
+@@ -1452,7 +1459,7 @@ struct array_d_t {
+             uint64_t subindex = r_->get_subindex(i);
+             uint64_t gaddr = r_->get_global_address(page);
+             page_cache_d_t* pc = &(r_->cache);
+-            uint32_t ctrl = 0;//pc->ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (pc->n_ctrls);
++            uint32_t ctrl = 0;//pc->ctrl_counter->fetch_add(1, cuda::std::memory_order_relaxed) % (pc->n_ctrls);
+             uint32_t queue = get_smid() % (pc->d_ctrls[0]->n_qps);
+             uint64_t base_master = r_->acquire_page(page, 1, false, ctrl, queue);
+             //coalesce_page(lane, mask, r, page, gaddr, false, eq_mask, master, count, base_master);
+@@ -1664,7 +1671,7 @@ struct array_d_t {
+             uint32_t leader = __ffs(mask) - 1;
+             if (lane == leader) {
+                 page_cache_d_t* pc = &(r_->cache);
+-                ctrl = pc->ctrl_counter->fetch_add(1, simt::memory_order_relaxed) % (pc->n_ctrls);
++                ctrl = pc->ctrl_counter->fetch_add(1, cuda::std::memory_order_relaxed) % (pc->n_ctrls);
+                 queue = get_smid() % (pc->d_ctrls[ctrl]->n_qps);
+             }
+             ctrl = __shfl_sync(mask, ctrl, leader);
+@@ -1734,7 +1741,7 @@ struct array_t {
+         cuda_err_chk(cudaMemcpy(rdt.data(), adt.d_ranges, adt.n_ranges*sizeof(range_d_t<T>), cudaMemcpyDeviceToHost));
+         for (size_t i = 0; i < adt.n_ranges; i++) {
+ 
+-            std::cout << std::dec << "#READ IOs: "  << rdt[i].read_io_cnt 
++            std::cout << std::dec << "#READ IOs: "  << rdt[i].miss_cnt 
+                                   << "\t#Accesses:" << rdt[i].access_cnt
+                                   << "\t#Misses:"   << rdt[i].miss_cnt 
+                                   << "\tMiss Rate:" << ((float)rdt[i].miss_cnt/rdt[i].access_cnt)
+@@ -1799,8 +1806,8 @@ uint32_t page_cache_d_t::find_slot(uint64_t address, uint64_t range_id, const ui
+ //		printf("here\tc: %llu\n", (unsigned long long) count);
+ 
+         //if (count < this->n_pages)
+-        page = page_ticket->fetch_add(1, simt::memory_order_relaxed)  % (this->n_pages);
+-        //page = page_ticket->fetch_add(1, simt::memory_order_relaxed);
++        page = page_ticket->fetch_add(1, cuda::std::memory_order_relaxed)  % (this->n_pages);
++        //page = page_ticket->fetch_add(1, cuda::std::memory_order_relaxed);
+         //if (page < (n_cachelines_for_states*STATES_PER_CACHELINE)) {
+         //    page = (page/n_cachelines_for_states) + ((page%n_cachelines_for_states)*STATES_PER_CACHELINE);
+         //}
+@@ -1810,23 +1817,23 @@ uint32_t page_cache_d_t::find_slot(uint64_t address, uint64_t range_id, const ui
+         ////printf("tid: %llu page: %llu\n", tid, page);
+ 
+         bool lock = false;
+-        uint32_t v = this->cache_pages[page].page_take_lock.load(simt::memory_order_relaxed);
+-        //this->page_take_lock[page].compare_exchange_strong(unlocked, LOCKED, simt::memory_order_acquire, simt::memory_order_relaxed);
++        uint32_t v = this->cache_pages[page].page_take_lock.load(cuda::std::memory_order_relaxed);
++        //this->page_take_lock[page].compare_exchange_strong(unlocked, LOCKED, cuda::std::memory_order_acquire, cuda::std::memory_order_relaxed);
+         //not assigned to anyone yet
+         if ( v == FREE ) {
+-            lock = this->cache_pages[page].page_take_lock.compare_exchange_weak(v, LOCKED, simt::memory_order_acquire, simt::memory_order_relaxed);
++            lock = this->cache_pages[page].page_take_lock.compare_exchange_weak(v, LOCKED, cuda::std::memory_order_acquire, cuda::std::memory_order_relaxed);
+             if ( lock ) {
+                 this->cache_pages[page].page_translation = global_address;
+                 //this->cache_pages[page].range_id = range_id;
+-                //this->page_translation[page].store(global_address, simt::memory_order_release);
+-                this->cache_pages[page].page_take_lock.store(UNLOCKED, simt::memory_order_release);
++                //this->page_translation[page].store(global_address, cuda::std::memory_order_release);
++                this->cache_pages[page].page_take_lock.store(UNLOCKED, cuda::std::memory_order_release);
+                 fail = false;
+             }
+         }
+         //assigned to someone and was able to take lock
+         else if ( v == UNLOCKED ) {
+ 
+-            lock = this->cache_pages[page].page_take_lock.compare_exchange_weak(v, LOCKED, simt::memory_order_acquire, simt::memory_order_relaxed);
++            lock = this->cache_pages[page].page_take_lock.compare_exchange_weak(v, LOCKED, cuda::std::memory_order_acquire, cuda::std::memory_order_relaxed);
+             if (lock) {
+                 //uint32_t previous_address = this->cache_pages[page].page_translation;
+                 uint64_t previous_global_address = this->cache_pages[page].page_translation;
+@@ -1837,14 +1844,14 @@ uint32_t page_cache_d_t::find_slot(uint64_t address, uint64_t range_id, const ui
+                 //if ((previous_range >= range_cap) || (previous_address >= n_pages))
+                 //    //printf("prev_ga: %llu\tprev_range: %llu\tprev_add: %llu\trange_cap: %llu\tn_pages: %llu\n", (unsigned long long) previous_global_address, (unsigned long long) previous_range, (unsigned long long) previous_address,
+                 //           (unsigned long long) range_cap, (unsigned long long) n_pages);
+-                expected_state = this->ranges[previous_range][previous_address].state.load(simt::memory_order_relaxed);
++                expected_state = this->ranges[previous_range][previous_address].state.load(cuda::std::memory_order_relaxed);
+ 
+                 uint32_t cnt = expected_state & CNT_MASK;
+                 uint32_t b = expected_state & BUSY;
+                 if ((cnt == 0) && (b == 0) ) {
+-                    new_expected_state = this->ranges[previous_range][previous_address].state.fetch_or(BUSY, simt::memory_order_acquire);
++                    new_expected_state = this->ranges[previous_range][previous_address].state.fetch_or(BUSY, cuda::std::memory_order_acquire);
+                     if (((new_expected_state & BUSY ) == 0) ) {
+-                        //while ((new_expected_state & CNT_MASK ) != 0) new_expected_state = this->ranges[previous_range][previous_address].state.load(simt::memory_order_acquire);
++                        //while ((new_expected_state & CNT_MASK ) != 0) new_expected_state = this->ranges[previous_range][previous_address].state.load(cuda::std::memory_order_acquire);
+                         if (((new_expected_state & CNT_MASK ) == 0) ) {
+                             if ((new_expected_state & DIRTY)) {
+                                 uint64_t ctrl = get_backing_ctrl_(previous_address, n_ctrls, ranges_dists[previous_range]);
+@@ -1873,10 +1880,10 @@ uint32_t page_cache_d_t::find_slot(uint64_t address, uint64_t range_id, const ui
+                             }
+ 
+                             fail = false;
+-                            this->ranges[previous_range][previous_address].state.fetch_and(CNT_MASK, simt::memory_order_release);
++                            this->ranges[previous_range][previous_address].state.fetch_and(CNT_MASK, cuda::std::memory_order_release);
+                         }
+                         else { 
+-                            this->ranges[previous_range][previous_address].state.fetch_and(DISABLE_BUSY_MASK, simt::memory_order_release);
++                            this->ranges[previous_range][previous_address].state.fetch_and(DISABLE_BUSY_MASK, cuda::std::memory_order_release);
+ //if ((j % 1000000) == 0) {
+ //                printf("failed to find slot j: %llu\taddr: %llx\tpage: %llx\texpected_state: %llx\tnew_expected_date: %llx\n", (unsigned long long) j, (unsigned long long) address, (unsigned long long)page, (unsigned long long) expected_state, (unsigned long long) new_expected_state);
+ //}
+@@ -1884,7 +1891,7 @@ uint32_t page_cache_d_t::find_slot(uint64_t address, uint64_t range_id, const ui
+                     }
+                 }
+ 
+-                //this->ranges[previous_range][previous_address].compare_exchange_strong(expected_state, new_state, simt::memory_order_acquire, simt::memory_order_relaxed);
++                //this->ranges[previous_range][previous_address].compare_exchange_strong(expected_state, new_state, cuda::std::memory_order_acquire, cuda::std::memory_order_relaxed);
+ 
+                 if (!fail) {
+                     //this->cache_pages[page].page_translation = address;
+@@ -1892,8 +1899,8 @@ uint32_t page_cache_d_t::find_slot(uint64_t address, uint64_t range_id, const ui
+ //                    this->page_translation[page] = global_address;
+                     this->cache_pages[page].page_translation = global_address;
+                 }
+-                //this->page_translation[page].store(global_address, simt::memory_order_release);
+-                this->cache_pages[page].page_take_lock.store(UNLOCKED, simt::memory_order_release);
++                //this->page_translation[page].store(global_address, cuda::std::memory_order_release);
++                this->cache_pages[page].page_take_lock.store(UNLOCKED, cuda::std::memory_order_release);
+             }
+ 
+ 
+@@ -1966,7 +1973,7 @@ inline __device__ void enqueue_second(page_cache_d_t* pc, QueuePair* qp, const u
+         //cur_pc_head == new head
+         //prev_pc_head == old head
+         //pc_pos == position i wanna move the head past
+-        uint64_t cur_pc_head = pc->q_head->load(simt::memory_order_relaxed);
++        uint64_t cur_pc_head = pc->q_head->load(cuda::std::memory_order_relaxed);
+         //sec == true when cur_pc_head past pc_pos
+         bool sec = ((cur_pc_head < pc_prev_head) && (pc_prev_head <= pc_pos)) ||
+             ((pc_prev_head <= pc_pos) && (pc_pos < cur_pc_head)) ||
+@@ -1975,20 +1982,20 @@ inline __device__ void enqueue_second(page_cache_d_t* pc, QueuePair* qp, const u
+         if (sec) break;
+ 
+         //if not
+-        uint64_t qlv = pc->q_lock->load(simt::memory_order_relaxed);
++        uint64_t qlv = pc->q_lock->load(cuda::std::memory_order_relaxed);
+         //got lock
+         if (qlv == 0) {
+-            qlv = pc->q_lock->fetch_or(1, simt::memory_order_acquire);
++            qlv = pc->q_lock->fetch_or(1, cuda::std::memory_order_acquire);
+             if (qlv == 0) {
+-                uint64_t cur_pc_tail;// = pc->q_tail.load(simt::memory_order_acquire);
++                uint64_t cur_pc_tail;// = pc->q_tail.load(cuda::std::memory_order_acquire);
+ 
+                 uint16_t sq_pos = sq_enqueue(&qp->sq, cmd, pc->q_tail, &cur_pc_tail);
+                 uint32_t head, head_;
+                 uint32_t cq_pos = cq_poll(&qp->cq, cid, &head, &head_);
+ 
+-                pc->q_head->store(cur_pc_tail, simt::memory_order_release);
+-                pc->q_lock->store(0, simt::memory_order_release);
+-                pc->extra_reads->fetch_add(1, simt::memory_order_relaxed);
++                pc->q_head->store(cur_pc_tail, cuda::std::memory_order_release);
++                pc->q_lock->store(0, cuda::std::memory_order_release);
++                pc->extra_reads->fetch_add(1, cuda::std::memory_order_relaxed);
+                 cq_dequeue(&qp->cq, cq_pos, &qp->sq, head, head_);
+ 
+ 
+@@ -2035,9 +2042,9 @@ inline __device__ void read_data(page_cache_d_t* pc, QueuePair* qp, const uint64
+ 
+     uint32_t cq_pos = cq_poll(&qp->cq, cid, &head, &head_);
+ 
+-    qp->cq.tail.fetch_add(1, simt::memory_order_acq_rel);
+-    pc_prev_head = pc->q_head->load(simt::memory_order_relaxed);
+-    pc_pos = pc->q_tail->fetch_add(1, simt::memory_order_acq_rel);
++    qp->cq.tail.fetch_add(1, cuda::std::memory_order_acq_rel);
++    pc_prev_head = pc->q_head->load(cuda::std::memory_order_relaxed);
++    pc_pos = pc->q_tail->fetch_add(1, cuda::std::memory_order_acq_rel);
+ 
+     cq_dequeue(&qp->cq, cq_pos, &qp->sq, head, head_);
+     //sq_dequeue(&qp->sq, sq_pos);
+@@ -2082,9 +2089,9 @@ inline __device__ void write_data(page_cache_d_t* pc, QueuePair* qp, const uint6
+     uint64_t pc_prev_head;
+ 
+     uint32_t cq_pos = cq_poll(&qp->cq, cid, &head, &head_);
+-    qp->cq.tail.fetch_add(1, simt::memory_order_acq_rel);
+-    pc_prev_head = pc->q_head->load(simt::memory_order_relaxed);
+-    pc_pos = pc->q_tail->fetch_add(1, simt::memory_order_acq_rel);
++    qp->cq.tail.fetch_add(1, cuda::std::memory_order_acq_rel);
++    pc_prev_head = pc->q_head->load(cuda::std::memory_order_relaxed);
++    pc_pos = pc->q_tail->fetch_add(1, cuda::std::memory_order_acq_rel);
+     cq_dequeue(&qp->cq, cq_pos, &qp->sq, head, head_);
+     //sq_dequeue(&qp->sq, sq_pos);
+ 
+diff --git a/module/Makefile.in b/module/Makefile.in
+index c42ddf7..f4f87a2 100644
+--- a/module/Makefile.in
++++ b/module/Makefile.in
+@@ -1,8 +1,8 @@
+ 
+ ifneq ($(KERNELRELEASE),)
+ 	src := @module_root@
+-	obj-m := @CMAKE_PROJECT_NAME@.o
+-	@CMAKE_PROJECT_NAME@-objs := pci.o list.o ctrl.o map.o
++	obj-m := @module_name@.o
++	@module_name@-objs := pci.o list.o ctrl.o map.o
+ 	ccflags-y += @module_ccflags@
+ 	KBUILD_EXTRA_SYMBOLS := @module_symbols@
+ else
+@@ -18,14 +18,14 @@ clean:
+ reload: unload load
+ 
+ unload:
+-	-rmmod @CMAKE_PROJECT_NAME@.ko
++	-rmmod @module_name@.ko
+ 
+ load:
+-	insmod @CMAKE_PROJECT_NAME@.ko max_num_ctrls=64
++	insmod @module_name@.ko max_num_ctrls=64
+ 
+ install: default
+ 	$(MAKE) -C @KERNEL@ M=@module_output@ modules_install
+-	#$(MAKE) INSTALL_MOD_DIR=@CMAKE_PROJECT_NAME@ -C @KERNEL@ M=@module_output@ modules_install
++	#$(MAKE) INSTALL_MOD_DIR=@module_name@ -C @KERNEL@ M=@module_output@ modules_install
+ 
+ endif
+ 
+diff --git a/module/map.c b/module/map.c
+index baccb4c..d181690 100644
+--- a/module/map.c
++++ b/module/map.c
+@@ -34,7 +34,7 @@ static struct map* create_descriptor(const struct ctrl* ctrl, u64 vaddr, unsigne
+     unsigned long i;
+     struct map* map = NULL;
+ 
+-    map = kvmalloc(sizeof(struct map) + (n_pages - 1) * sizeof(uint64_t), GFP_KERNEL);
++    map = kvmalloc(sizeof(struct map) + (n_pages) * sizeof(uint64_t), GFP_KERNEL);
+     if (map == NULL)
+     {
+         printk(KERN_CRIT "Failed to allocate mapping descriptor\n");
+@@ -147,8 +147,10 @@ static long map_user_pages(struct map* map)
+ #elif LINUX_VERSION_CODE <= KERNEL_VERSION(4, 8, 17)
+ #warning "Building for older kernel, not properly tested"
+     retval = get_user_pages(map->vaddr, map->n_addrs, 1, 0, pages, NULL);
+-#else
++#elif LINUX_VERSION_CODE < KERNEL_VERSION(6, 5, 0)
+     retval = get_user_pages(map->vaddr, map->n_addrs, FOLL_WRITE, pages, NULL);
++#else
++    retval = get_user_pages(map->vaddr, map->n_addrs, FOLL_WRITE, pages);
+ #endif
+     if (retval <= 0)
+     {
+diff --git a/module/map.h b/module/map.h
+index 61997a0..ce0f71b 100644
+--- a/module/map.h
++++ b/module/map.h
+@@ -28,7 +28,7 @@ struct map
+     void*               data;           /* Custom data */
+     release             release;        /* Custom callback for unmapping and releasing memory */
+     unsigned long       n_addrs;        /* Number of mapped pages */
+-    uint64_t            addrs[1];       /* Bus addresses */
++    uint64_t            addrs[];       /* Bus addresses */
+ };
+ 
+ 
+diff --git a/module/pci.c b/module/pci.c
+index c19f1f5..3e9d3f0 100644
+--- a/module/pci.c
++++ b/module/pci.c
+@@ -12,6 +12,7 @@
+ #include <linux/err.h>
+ #include <linux/device.h>
+ #include <linux/uaccess.h>
++#include <linux/version.h>
+ #include <asm/io.h>
+ #include <asm/errno.h>
+ #include <asm/page.h>
+@@ -328,7 +329,11 @@ static int __init libnvm_helper_entry(void)
+     }
+ 
+     // Create character device class
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+     dev_class = class_create(THIS_MODULE, DRIVER_NAME);
++#else
++    dev_class = class_create(DRIVER_NAME);
++#endif
+     if (IS_ERR(dev_class))
+     {
+         unregister_chrdev_region(dev_first, max_num_ctrls);
+diff --git a/src/linux/device.cpp b/src/linux/device.cpp
+index d163472..b37d643 100644
+--- a/src/linux/device.cpp
++++ b/src/linux/device.cpp
+@@ -16,6 +16,7 @@
+ #include <fcntl.h>
+ #include <sys/mman.h>
+ #include <stdio.h>
++#include <algorithm>
+ #include "linux/map.h"
+ #include "linux/ioctl.h"
+ #include "lib_ctrl.h"
+@@ -107,7 +108,7 @@ static void ioctl_unmap(const struct device* dev, const struct va_range* va)
+ 
+ 
+ 
+-int nvm_ctrl_init(nvm_ctrl_t** ctrl, int filedes)
++int nvm_ctrl_init(nvm_ctrl_t** ctrl, int filedes, size_t mm_size)
+ {
+     int err;
+     struct device* dev;
+@@ -142,7 +143,7 @@ int nvm_ctrl_init(nvm_ctrl_t** ctrl, int filedes)
+         return errno;
+     }
+ 
+-    const size_t mm_size = NVM_CTRL_MEM_MINSIZE;
++    mm_size = std::max((size_t)NVM_CTRL_MEM_MINSIZE, mm_size);
+     void* mm_ptr = mmap(NULL, mm_size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FILE|MAP_LOCKED, dev->fd, 0);
+     if (mm_ptr == NULL)
+     {
+diff --git a/src/queue.cpp b/src/queue.cpp
+index da5519e..e526a5c 100644
+--- a/src/queue.cpp
++++ b/src/queue.cpp
+@@ -6,7 +6,8 @@
+ #include <time.h>
+ #include "regs.h"
+ #include "lib_util.h"
+-#include <simt/atomic>
++#include <cuda/atomic>
++#include <cuda/std/atomic>
+ 
+ 
+ int nvm_queue_clear(nvm_queue_t* queue, const nvm_ctrl_t* ctrl, bool cq, uint16_t no, uint32_t qs, 
