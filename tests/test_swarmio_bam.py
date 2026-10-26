@@ -523,6 +523,36 @@ bool fill(struct swarmio_io_work *w) { return __fill_cq_result(w); }
 
 
 class PipelineTests(unittest.TestCase):
+    def test_cmake_322_is_supported_without_native_architecture(self):
+        with patch.object(pipeline, 'output', return_value='cmake version 3.22.1') as query:
+            self.assertEqual(pipeline.cmake_info(), 'cmake version 3.22.1')
+            query.assert_called_once()
+        with patch.object(pipeline, 'output', return_value='cmake version 3.21.4'):
+            with self.assertRaises(pipeline.Error):
+                pipeline.cmake_info()
+        for path in [ROOT / 'bam/CMakeLists.txt', *(ROOT / 'bam/benchmarks').glob('*/CMakeLists.txt')]:
+            self.assertNotIn('VERSION 3.24', path.read_text())
+        self.assertNotIn('set(CMAKE_CUDA_ARCHITECTURES native)', (ROOT / 'bam/CMakeLists.txt').read_text())
+
+    def test_explicit_cuda_root_does_not_require_nvcc_on_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'bin').mkdir()
+            nvcc = root / 'bin/nvcc'
+            nvcc.write_text('#!/bin/sh\nexit 0\n')
+            nvcc.chmod(0o755)
+            with patch.object(pipeline.shutil, 'which', return_value=None):
+                self.assertEqual(pipeline.find_nvcc(root), nvcc.resolve())
+            with self.assertRaises(pipeline.Error):
+                pipeline.find_nvcc(root / 'missing')
+
+    def test_inaccessible_kernel_input_has_permission_diagnostic(self):
+        with patch.object(Path, 'open', side_effect=PermissionError(13, 'Permission denied')):
+            with self.assertRaises(pipeline.Error) as caught:
+                pipeline.require_readable_file(Path('/kernel/Makefile'))
+        self.assertIn('/kernel/Makefile', str(caught.exception))
+        self.assertIn('namei', str(caught.exception))
+
     def test_config_and_workload_limits(self):
         config = pipeline.read_config(ROOT / "configs/bam-cpu.json")
         self.assertEqual(config["benchmark"]["reqs"], 1)
@@ -653,6 +683,7 @@ class LifecycleTests(unittest.TestCase):
                 nvtable.write_text('0x1234 nvidia_p2p_get_pages nvidia EXPORT_SYMBOL\n')
                 out = base / 'build'
                 env = {'kernel': 'fake-kernel', 'kernel_build': str(kernel), 'nvidia_include': '/fake/nvidia',
+                       'nvcc_path': '/fake/cuda/bin/nvcc', 'cuda_root': '/fake/cuda',
                        'nvidia_symvers': str(nvtable), 'gpu': {'cuda_arch': '70'}}
 
                 def execute(command, **kwargs):

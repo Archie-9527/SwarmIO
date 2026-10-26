@@ -134,6 +134,36 @@ def linux_only(root=False):
         raise Error('此子命令需要 sudo')
 
 
+def find_nvcc(cuda_root=None):
+    """显式选择工具链，避免 sudo 的 secure_path 隐藏 nvcc 或误选其他 CUDA 版本。"""
+    if cuda_root is not None:
+        candidates = [Path(cuda_root) / 'bin/nvcc']
+    else:
+        found = shutil.which('nvcc')
+        candidates = [Path(found)] if found else []
+        for name in ('CUDA_HOME', 'CUDA_PATH'):
+            if os.environ.get(name):
+                candidates.append(Path(os.environ[name]) / 'bin/nvcc')
+        candidates.append(Path('/usr/local/cuda/bin/nvcc'))
+    for path in candidates:
+        if path.is_file() and os.access(path, os.X_OK):
+            return path.resolve()
+    raise Error('找不到可执行 nvcc；请在 doctor/build 后传入 --cuda-root /usr/local/cuda-12.4（按实际版本替换）')
+
+
+def require_readable_file(path):
+    """实际打开输入；路径某一级不可遍历时 Path.is_file 也可能直接抛 PermissionError。"""
+    try:
+        with Path(path).open('rb') as stream:
+            stream.read(1)
+    except PermissionError as exc:
+        raise Error('没有权限读取构建输入：' + str(path) +
+                    '；请用 sudo namei -l 检查该路径各级目录权限，并为构建用户开放必要的读取/遍历权限。'
+                    '只做环境检查可使用 sudo python3 scripts/swarmio_bam.py doctor --cuda-root <CUDA目录>') from exc
+    except (FileNotFoundError, IsADirectoryError) as exc:
+        raise Error('缺少构建输入文件：' + str(path)) from exc
+
+
 def gpu_info(selector):
     if not re.fullmatch(r'\d+|GPU-[A-Fa-f0-9-]+', str(selector)):
         raise Error('gpu 必须是单个 nvidia-smi index 或 GPU UUID')
@@ -149,16 +179,24 @@ def gpu_info(selector):
     return result
 
 
+def cmake_info():
+    """只查询一次，验证和 manifest 使用相同的版本输出。显式 CUDA 架构无需 native。"""
+    text = output(['cmake', '--version'])
+    match = re.search(r'cmake version (\d+)\.(\d+)', text)
+    if not match or tuple(map(int, match.groups())) < (3, 22):
+        raise Error('需要 CMake >= 3.22')
+    return text
+
+
 def environment(args, config):
     linux_only()
-    tools = ('git', 'cmake', 'make', 'cc', 'nvcc', 'nvidia-smi', 'nm', 'objcopy', 'modinfo',
+    tools = ('git', 'cmake', 'make', 'cc', 'nvidia-smi', 'nm', 'objcopy', 'modinfo',
              'modprobe', 'insmod', 'rmmod', 'udevadm', 'ldd', 'stdbuf')
     missing = [name for name in tools if not shutil.which(name)]
     if missing:
         raise Error('缺少工具：' + ', '.join(missing))
-    version_match = re.search(r'cmake version (\d+)\.(\d+)', output(['cmake', '--version']))
-    if not version_match or tuple(map(int, version_match.groups())) < (3, 24):
-        raise Error('需要 CMake >= 3.24')
+    nvcc = find_nvcc(args.cuda_root)
+    cmake = cmake_info()
     release = os.uname().release
     kernel = Path('/lib/modules') / release / 'build'
     driver_text = Path('/proc/driver/nvidia/version').read_text()
@@ -169,9 +207,14 @@ def environment(args, config):
     symvers = (args.nvidia_symvers or Path('/var/lib/dkms/nvidia') / version / release /
                os.uname().machine / 'module/Module.symvers').resolve()
     include = (args.nvidia_include or Path('/usr/src') / ('nvidia-' + version) / 'nvidia').resolve()
+    input_errors = []
     for p in (kernel / 'Makefile', kernel / 'Module.symvers', symvers, include / 'nv-p2p.h'):
-        if not p.is_file() or not os.access(p, os.R_OK):
-            raise Error('缺少或无法读取构建输入：' + str(p))
+        try:
+            require_readable_file(p)
+        except Error as exc:
+            input_errors.append(str(exc))
+    if input_errors:
+        raise Error('\n'.join(input_errors))
     for path in (ROOT, args.build_dir, kernel, symvers, include):
         if not re.fullmatch(r'[/A-Za-z0-9_.+\-]+', str(path)):
             raise Error('构建路径不能包含空格或 Makefile 特殊字符：' + str(path))
@@ -180,7 +223,7 @@ def environment(args, config):
     gpu = gpu_info(args.gpu or config['gpu'])
     if gpu['driver'] != version:
         raise Error('nvidia-smi 与内核 NVIDIA 驱动版本不一致')
-    if 'sm_' + gpu['cuda_arch'] not in output(['nvcc', '--list-gpu-code']).split():
+    if 'sm_' + gpu['cuda_arch'] not in output([str(nvcc), '--list-gpu-code']).split():
         raise Error('当前 CUDA 工具链不支持目标 GPU 架构 sm_' + gpu['cuda_arch'])
     nvtable, ktable = read_symvers(symvers), read_symvers(kernel / 'Module.symvers')
     if 'nvidia_p2p_get_pages' not in nvtable:
@@ -196,7 +239,8 @@ def environment(args, config):
             'nvidia_symvers_sha256': digest(symvers), 'gpu': gpu,
             'boot_reservation': expected, 'boot_reservation_ready': expected in Path('/proc/cmdline').read_text().split(),
             'service_cpus_online': cpu_set(config['module']['cpus']) <= online,
-            'nvcc': output(['nvcc', '--version']), 'cmake': output(['cmake', '--version'])}
+            'nvcc_path': str(nvcc), 'cuda_root': str(nvcc.parent.parent),
+            'nvcc': output([str(nvcc), '--version']), 'cmake': cmake}
 
 
 def source_inventory(root):
@@ -288,6 +332,7 @@ def build(args, config):
             raise Error('CPU SwarmIO 仍然依赖 idxd 私有符号')
         execute(['cmake', '-S', str(ROOT / 'bam'), '-B', str(out / 'bam'),
                  '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CUDA_ARCHITECTURES=' + env['gpu']['cuda_arch'],
+                 '-DCMAKE_CUDA_COMPILER=' + env['nvcc_path'], '-DCUDA_TOOLKIT_ROOT_DIR=' + env['cuda_root'],
                  '-Dno_module=ON', '-Dno_cuda=OFF', '-Dno_smartio=ON'])
         execute(['cmake', '--build', str(out / 'bam'), '--target', 'block-benchmark-module', '--parallel', str(args.jobs)])
         module_source = out / 'libnvm/source'
@@ -649,6 +694,7 @@ def main():
         p.add_argument('--gpu', help='nvidia-smi 的目标 index/UUID，默认使用配置中的 GPU')
         p.add_argument('--nvidia-symvers', type=Path)
         p.add_argument('--nvidia-include', type=Path)
+        p.add_argument('--cuda-root', type=Path, help='CUDA 工具链目录，例如 /usr/local/cuda-12.4；sudo 下也可显式选择')
         if name == 'build':
             p.add_argument('--jobs', type=int, default=8)
     p = commands.add_parser('load', help='加载两个模块并绑定虚拟控制器')

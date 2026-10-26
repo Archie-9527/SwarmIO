@@ -63,7 +63,7 @@ git submodule status
 
 ## 2. 准备服务器
 
-需要 Python >= 3.9、CMake >= 3.24、make、C/C++ 编译器、可用 CUDA/CCCL 工具链、
+需要 Python >= 3.9、CMake >= 3.22、make、C/C++ 编译器、可用 CUDA/CCCL 工具链、
 binutils、kmod、udev、Git，以及当前内核对应的构建树和 NVIDIA DKMS 构建符号表。
 沿用当前已经可用的 CUDA 工具链；不为本流程重装驱动或切换内核。
 
@@ -89,7 +89,7 @@ binutils、kmod、udev、Git，以及当前内核对应的构建树和 NVIDIA DK
 
 ## 3. 检查环境
 
-从新克隆的 SwarmIO 根目录执行，不需要 sudo：
+从新克隆的 SwarmIO 根目录执行。通常使用普通用户，前提是内核构建树和 DKMS 输入对该用户可读：
 
 ```bash
 python3 scripts/swarmio_bam.py doctor
@@ -102,6 +102,41 @@ python3 scripts/swarmio_bam.py doctor
 ```bash
 python3 scripts/swarmio_bam.py doctor --gpu 0
 ```
+
+如果普通用户出现 `/lib/modules/.../build/Makefile: Permission denied`，
+先检查软链接目标及沿途目录权限；当前账号可能无法遍历另一账号的源码目录：
+
+```bash
+sudo namei -l "/lib/modules/$(uname -r)/build/Makefile"
+```
+
+需要先用 root 完成只读环境检查时，显式指定已经安装的 CUDA 目录，避免 sudo 的 PATH 隐藏 nvcc：
+
+```bash
+sudo python3 scripts/swarmio_bam.py doctor --cuda-root /usr/local/cuda-12.4
+```
+
+对尚未更新、没有 `--cuda-root` 选项的脚本，可临时使用
+`sudo env PATH="$PATH" python3 scripts/swarmio_bam.py doctor`。
+普通用户构建前，仍需由内核源码的管理者根据 `namei` 输出开放必要的目录遍历和文件读取权限。
+脚本不会擅自更改内核树或其他用户目录权限。
+
+当前服务器若使用 `zhaohq` 构建、内核树为 `/mnt/sda-data/home/yanhan/linux-6.8`，
+由管理员为该用户授予所需的只读权限即可，不需要给内核树写权限：
+
+```bash
+# 缺少 setfacl 时先安装 acl 软件包。
+sudo apt-get install acl
+sudo setfacl -m u:zhaohq:--x /mnt /mnt/sda-data /mnt/sda-data/home /mnt/sda-data/home/yanhan
+sudo setfacl -R -m u:zhaohq:rX /mnt/sda-data/home/yanhan/linux-6.8
+python3 scripts/swarmio_bam.py doctor --cuda-root /usr/local/cuda-12.4
+```
+
+这是针对本机已经确认的路径和账号的授权，换账号/内核目录时需要替换。
+如果剩余 DKMS 输入仍不可读，doctor 会同时列出检查到的输入权限问题；只对这些输入补充读取权限。
+当前入口显式传入 CUDA 架构和编译器，已经移除 `native` 默认值，父/子工程统一支持 CMake 3.22 起。
+显式架构和 CUDA C++17 所需接口见 [CMake 3.22 架构文档](https://cmake.org/cmake/help/v3.22/prop_tgt/CUDA_ARCHITECTURES.html)
+与 [CUDA 标准文档](https://cmake.org/cmake/help/v3.22/prop_tgt/CUDA_STANDARD.html)。
 
 NVIDIA 路径默认根据已加载驱动版本和当前内核推导。当前实验机对应：
 
@@ -121,7 +156,7 @@ NVIDIA 路径默认根据已加载驱动版本和当前内核推导。当前实�
 python3 scripts/swarmio_bam.py build --jobs 8
 ```
 
-构建不安装、不加载、不卸载模块，不需要 sudo。自动采用目标 GPU 的 CUDA 架构，
+构建不安装、不加载、不卸载模块。输入权限处理好后使用普通用户构建，自动采用目标 GPU 的 CUDA 架构，
 避免 CMake `native` 同时选中其他旧 GPU。构建使用源码的逐字副本隔离对象文件，不改写 C/CUDA 源码。
 编译后会核对模块名、vermagic、full-I/O 标记、CPU 构建的 idxd 依赖、
 NVIDIA P2P 导入 CRC、GPL-only 导入及 benchmark 的 `libnvm.so` 路径。
@@ -272,7 +307,7 @@ BaM 的一次逻辑读可能发起额外底层命令，不能直接用逻辑操�
 | `bam/module/ctrl.c`、`ctrl.h`、`pci.c`、`map.c` | miscdevice、新内核和 NVIDIA P2P 兼容 |
 | `bam/CMakeLists.txt`、`bam/include/`、`bam/benchmarks/`、`bam/src/` | CUDA CCCL/C++17、API 与 benchmark 适配 |
 
-开发机本地已通过 18 项源码与入口回归检查，不加载 Linux 模块或执行 GPU I/O：
+开发机本地已通过 21 项源码与入口回归检查，不加载 Linux 模块或执行 GPU I/O：
 
 ```bash
 python3 -m unittest discover -s tests -v
