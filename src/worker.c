@@ -57,6 +57,84 @@ static inline void __swarmio_disable_worker_dma(void)
 	worker_using_dma = false;
 }
 
+#include "swarmio_queue_diagnostics.h"
+
+#ifdef CONFIG_SWARMIO_QUEUE_DIAGNOSTICS
+module_param_cb(qdiag_cq_state, &qdiag_ops, NULL, 0444);
+/* cq_head_abs 累计实际观察到的 doorbell 前进距离，不能恢复未观察到的完整一圈。 */
+static u64 qdiag_cqe_writes, qdiag_full_hits, qdiag_cq_head_abs;
+static int qdiag_last_slot = -1;
+static u32 qdiag_last_dw2, qdiag_last_dw3;
+
+/* Called by dispatcher 0 only while every other service thread is quiescent. */
+void swarmio_qdiag_reset_cq(void)
+{
+    unsigned long flags;
+    qdiag_cqe_writes = qdiag_full_hits = qdiag_cq_head_abs = 0;
+    qdiag_last_slot = -1;
+    qdiag_last_dw2 = qdiag_last_dw3 = 0;
+    qdiag_next_ns = 0;
+    spin_lock_irqsave(&qdiag_text_lock, flags);
+    scnprintf(qdiag_text, sizeof(qdiag_text), "epoch=%llu reset\n",
+              (unsigned long long)swarmio_qdiag_epoch);
+    spin_unlock_irqrestore(&qdiag_text_lock, flags);
+}
+
+static void qdiag_sample_cq(struct swarmio_worker *worker)
+{
+    int qid = READ_ONCE(swarmio_qdiag_qid), cqid;
+    struct nvme_submission_queue *sq;
+    struct nvme_completion_queue *cq;
+    struct swarmio_worker_local_queue *local = &worker->local_queue;
+    struct swarmio_io_work *front = NULL;
+    unsigned long flags;
+    unsigned short head, tail;
+    u64 now;
+    if (!qdiag_owns(worker->dispatcher, qid) ||
+        worker->id != __get_worker(qid, worker->dispatcher))
+        return;
+    sq = vdev->sqes[qid];
+    if (!sq)
+        return;
+    cqid = sq->cqid;
+    if (cqid <= 0 || cqid > NR_MAX_IO_QUEUE)
+        return;
+    cq = vdev->cqes[cqid];
+    if (!cq)
+        return;
+    now = ktime_get_ns();
+    if (!qdiag_due(now))
+        return;
+    head = local->head;
+    tail = smp_load_acquire(&local->tail);
+    if (head < local->size && head != tail)
+        front = &local->works[head];
+    spin_lock_irqsave(&qdiag_text_lock, flags);
+    scnprintf(qdiag_text, sizeof(qdiag_text),
+        "epoch=%llu sample_ns=%llu qid=%d cqid=%d worker=%u-%u depth=%d cq_db=%u cq_old_db=%u cq_head=%d cq_head_abs=%llu cq_tail=%d phase=%d cqe_writes=%llu full_hits=%llu last_slot=%d last_dw2=%08x last_dw3=%08x work_head=%u work_tail=%u budget=%d front_sqid=%d front_cid=%d issued=%d copied=%d completed=%d target_ns=%llu\n",
+        (unsigned long long)READ_ONCE(swarmio_qdiag_epoch),
+        (unsigned long long)now, qid, cqid, worker->disp_id, worker->id,
+        cq->queue_size, READ_ONCE(vdev->dbs[cqid * 2 + 1]),
+        READ_ONCE(vdev->old_dbs[cqid * 2 + 1]),
+        cq->cq_head, (unsigned long long)qdiag_cq_head_abs,
+        cq->cq_tail, cq->phase,
+        (unsigned long long)qdiag_cqe_writes,
+        (unsigned long long)qdiag_full_hits,
+        qdiag_last_slot, qdiag_last_dw2, qdiag_last_dw3,
+        (unsigned int)head, (unsigned int)tail,
+        dma_batch_size * num_dma_descs_per_worker,
+        front ? le16_to_cpu(front->cqe.sq_id) : -1,
+        front ? le16_to_cpu(front->cqe.command_id) : -1,
+        front ? front->is_issued : -1, front ? front->is_copied : -1,
+        front ? front->is_completed : -1,
+        (unsigned long long)(front ? front->nsecs_target : 0));
+    spin_unlock_irqrestore(&qdiag_text_lock, flags);
+}
+
+#else
+static inline void qdiag_sample_cq(struct swarmio_worker *worker) {}
+#endif
+
 #ifndef CONFIG_SWARMIO_COMMIT
 static bool __fill_cq_result(struct swarmio_io_work *w)
 {
@@ -77,6 +155,13 @@ static bool __fill_cq_result(struct swarmio_io_work *w)
 
 #ifndef CONFIG_SWARMIO_DISP_ALLOC_WORKER_RR
 	if (new_db != old_db) {
+#ifdef CONFIG_SWARMIO_QUEUE_DIAGNOSTICS
+		if (cqid == READ_ONCE(swarmio_qdiag_qid)) {
+			int head_delta = new_db - old_db;
+			if (head_delta < 0) head_delta += cq->queue_size;
+			qdiag_cq_head_abs += head_delta;
+		}
+#endif
 		cq->cq_head = new_db;
 		vdev->old_dbs[cqdb] = new_db;
 	}
@@ -89,6 +174,10 @@ static bool __fill_cq_result(struct swarmio_io_work *w)
 	if (unlikely(next_cq_tail == cq->queue_size))
 		next_cq_tail = 0;
 	if (unlikely(next_cq_tail == cq_head)) {
+#ifdef CONFIG_SWARMIO_QUEUE_DIAGNOSTICS
+		if (sqid == READ_ONCE(swarmio_qdiag_qid))
+			++qdiag_full_hits;
+#endif
 		SWARMIO_DEBUG_RL("cq %d is full!\n", cqid);
 		return false;
 	}
@@ -121,6 +210,17 @@ static bool __fill_cq_result(struct swarmio_io_work *w)
 	cqe_src->sq_head = vdev->sqes[sqid]->sq_head;
 	cqe_src->status = (u16)phase & 0x1;
 	memcpy((u32 *)cqe_dst + 2, (u32 *)cqe_src + 2, sizeof(u32) * 2);
+#ifdef CONFIG_SWARMIO_QUEUE_DIAGNOSTICS
+    /* Record the source bytes after the existing write; do not read back VRAM. */
+    if (sqid == READ_ONCE(swarmio_qdiag_qid)) {
+        ++qdiag_cqe_writes;
+        qdiag_last_slot = cq_tail;
+        memcpy(&qdiag_last_dw2, (u32 *)cqe_src + 2, sizeof(u32));
+        memcpy(&qdiag_last_dw3, (u32 *)cqe_src + 3, sizeof(u32));
+    }
+
+
+#endif
 
 #ifndef CONFIG_SWARMIO_DISP_ALLOC_WORKER_RR
 	/* update cq tail */
@@ -655,6 +755,7 @@ static int swarmio_worker_thread_fn(void *data)
 
 	while (!kthread_should_stop()) {
 		swarmio_proc_io(worker, &last_io_time);
+		qdiag_sample_cq(worker);
 #ifndef CONFIG_SWARMIO_COMMIT
 		swarmio_proc_irqs(worker);
 #endif
@@ -836,3 +937,24 @@ void swarmio_worker_exit(struct nvme_vdev *vdev)
 	vdev->workers = NULL;
 	vdev->num_workers_initialized = 0;
 }
+
+
+/* SWARMIO_FULLIO_BUILD_STATUS：由执行数据复制的编译单元报告 skip_io。 */
+#include <linux/module.h>
+
+bool swarmio_worker_build_skip_io(void);
+bool swarmio_worker_build_skip_io(void)
+{
+#ifdef CONFIG_SWARMIO_WORKER_SKIP_IO
+    return true;
+#else
+    return false;
+#endif
+}
+
+#ifdef CONFIG_SWARMIO_WORKER_SKIP_IO
+MODULE_INFO(swarmio_skip_io, "1");
+#else
+MODULE_INFO(swarmio_skip_io, "0");
+#endif
+MODULE_INFO(swarmio_build_profile, "cpu-fullio-512b-v1");

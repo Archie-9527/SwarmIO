@@ -13,7 +13,13 @@
 #include <linux/idxd.h>
 #include <linux/bitmap.h>
 
+#ifdef CONFIG_SWARMIO_HAS_DSA
 #include <idxd.h>
+#else
+/* CPU 模式只保留上下文中的指针类型，不需要 idxd 的内部结构定义。 */
+struct idxd_desc;
+struct idxd_wq;
+#endif
 
 #include "logging.h"
 
@@ -138,6 +144,7 @@ static inline void __dsa_prep_hw_desc(struct dsa_hw_desc *hw, char opcode,
 	hw->completion_addr = compl_dma;
 }
 
+#ifdef CONFIG_SWARMIO_HAS_DSA
 static inline void __dsa_sync_wait(struct idxd_desc *desc, int timeout)
 {
 	unsigned long timeout_jiffies = jiffies + msecs_to_jiffies(timeout);
@@ -151,6 +158,8 @@ static inline void __dsa_sync_wait(struct idxd_desc *desc, int timeout)
 		cpu_relax();
 	}
 }
+
+#endif
 
 int dsa_set_params(const struct dsa_cfg_params *p);
 int dsa_enable_devices(void);
@@ -178,9 +187,9 @@ int dsa_dma_wait_oldest_batch(struct dsa_dma_ctx_batch *ctx,
 			      void (*callback)(void *));
 int dsa_dma_wait_all_batch(struct dsa_dma_ctx_batch *ctx,
 			   void (*callback)(void *));
-inline bool __dsa_dma_is_issue_timeout_batch(struct dsa_dma_ctx_batch *ctx);
-inline bool __dsa_dma_is_wait_timeout_batch(struct dsa_dma_ctx_batch *ctx);
-inline bool __dsa_dma_all_busy_batch(struct dsa_dma_ctx_batch *ctx);
+bool __dsa_dma_is_issue_timeout_batch(struct dsa_dma_ctx_batch *ctx);
+bool __dsa_dma_is_wait_timeout_batch(struct dsa_dma_ctx_batch *ctx);
+bool __dsa_dma_all_busy_batch(struct dsa_dma_ctx_batch *ctx);
 
 /* single */
 int dsa_dma_ctx_single_init(struct dsa_dma_ctx_single *ctx, int dev_id,
@@ -199,6 +208,6 @@ int dsa_dma_wait_one_single(struct dsa_dma_ctx_single *ctx, int desc_id,
 			    void (*callback)(void *));
 int dsa_dma_wait_all_single(struct dsa_dma_ctx_single *ctx,
 			    void (*callback)(void *));
-inline bool __dsa_dma_should_sync_single(struct dsa_dma_ctx_single *ctx);
+bool __dsa_dma_should_sync_single(struct dsa_dma_ctx_single *ctx);
 
 #endif

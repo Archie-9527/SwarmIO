@@ -1,0 +1,53 @@
+{
+  "description": "当前 7950X 实验机：CPU 实际复制、512 B 读写、保留内核诊断，不启用 DSA",
+  "gpu": "0",
+  "build": {
+    "NR_MAX_IO_QUEUE": "64",
+    "NR_MAX_FETCH_SQE": "1024",
+    "NR_WORKER_QUEUE_SIZE": "32768",
+    "CONFIG_SWARMIO_WORKER_SKIP_IO": "n",
+    "CONFIG_SWARMIO_WORKER_BATCH_IO": "n",
+    "CONFIG_SWARMIO_DISP_PREFETCH_SQE": "n",
+    "CONFIG_SWARMIO_DISP_COALESCE_SQE": "y",
+    "CONFIG_SWARMIO_DISP_ASSIGN_QID_CONT": "n",
+    "CONFIG_SWARMIO_DISP_ALLOC_WORKER_RR": "n",
+    "CONFIG_SWARMIO_DMA_DISPATCHER": "n",
+    "CONFIG_SWARMIO_DMA_WORKER": "n",
+    "CONFIG_SWARMIO_AGGREGATED_TIMING_UPDATE": "y",
+    "CONFIG_SWARMIO_ATOMIC_CAS_TIMING_UPDATE": "y",
+    "CONFIG_SWARMIO_COMMIT": "n",
+    "CONFIG_SWARMIO_PROFILE_REQ": "n",
+    "CONFIG_SWARMIO_SQ_DIAGNOSTICS": "y",
+    "CONFIG_SWARMIO_QUEUE_DIAGNOSTICS": "y"
+  },
+  "module": {
+    "memmap_start": "4G",
+    "memmap_size": "24G",
+    "num_service_units": 4,
+    "num_workers_per_service_unit": 1,
+    "cpus": "8-15",
+    "disp_using_dma": 0,
+    "worker_using_dma": 0,
+    "num_sched_insts": 8,
+    "io_unit_shift": 9,
+    "read_sched_delay": 400,
+    "read_min_delay": 49600,
+    "write_sched_delay": 400,
+    "write_min_delay": 49600,
+    "dma_batch_size": 2,
+    "num_dma_descs_per_worker": 2,
+    "qdiag_qid": 1
+  },
+  "benchmark": {
+    "threads": 64,
+    "blk_size": 64,
+    "reqs": 1,
+    "pages": 4096,
+    "page_size": 512,
+    "num_blks": 2097152,
+    "queue_depth": 512,
+    "num_queues": 1,
+    "random": false,
+    "access_type": 0
+  }
+}

@@ -176,11 +176,17 @@ Makefile.local
 /results
 
 /configs/**
-!/configs/defconfig.conf
-!/configs/swarmio.conf
 
 *.txt
 *.log
 *.csv
 
-!bam*.patch
+# 本地构建、实验输出和 Python 缓存；不进入源码提交。
+/build/
+/build-*/
+/results/
+__pycache__/
+*.py[cod]
+
+# 唯一维护的 CPU full-I/O 配置。
+!/configs/bam-cpu.json

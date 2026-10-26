@@ -29,10 +29,19 @@ CONFIG_SWARMIO_COMMIT ?= n
 
 obj-m   := swarmio.o
 swarmio-objs := src/main.o nvmev/nvme_vdev.o src/proc.o nvmev/pci.o nvmev/admin.o src/dispatcher.o \
-			  src/worker.o dsa/config.o dsa/dsa.o dsa/batch.o dsa/single.o src/simple_timing_model.o
+			  src/worker.o src/simple_timing_model.o
+
+# CPU 复制构建不依赖 idxd 内部头文件或私有符号；DSA 配置仍走原实现。
+ifneq ($(filter y,$(CONFIG_SWARMIO_DMA_DISPATCHER) $(CONFIG_SWARMIO_DMA_WORKER)),)
+ccflags-y += -DCONFIG_SWARMIO_HAS_DSA=1
+swarmio-objs += dsa/config.o dsa/dsa.o dsa/batch.o dsa/single.o
+IDXD_INCLUDE ?= $(srctree)/drivers/dma/idxd
+ccflags-y += -I$(IDXD_INCLUDE)
+else
+swarmio-objs += dsa/stub.o
+endif
 ccflags-y += -Wno-unused-variable -Wno-unused-function
 ccflags-y += -I$(src) -I$(src)/src
-ccflags-y += -I/usr/src/linux-source-$(shell uname -r | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')/drivers/dma/idxd
 
 ccflags-$(CONFIG_SWARMIO_PROFILE_REQ) += -DCONFIG_SWARMIO_PROFILE_REQ=1
 
@@ -55,3 +64,9 @@ ccflags-$(CONFIG_SWARMIO_ATOMIC_CAS_TIMING_UPDATE) += -DCONFIG_SWARMIO_ATOMIC_CA
 
 ccflags-$(CONFIG_SWARMIO_COMMIT) += -DCONFIG_SWARMIO_COMMIT=1
 swarmio-$(CONFIG_SWARMIO_COMMIT) += src/committer.o
+
+# 诊断开关只选择已提交的源码，不再在 build 目录中生成补丁。
+CONFIG_SWARMIO_SQ_DIAGNOSTICS ?= n
+CONFIG_SWARMIO_QUEUE_DIAGNOSTICS ?= n
+ccflags-$(CONFIG_SWARMIO_SQ_DIAGNOSTICS) += -DCONFIG_SWARMIO_SQ_DIAGNOSTICS=1
+ccflags-$(CONFIG_SWARMIO_QUEUE_DIAGNOSTICS) += -DCONFIG_SWARMIO_QUEUE_DIAGNOSTICS=1

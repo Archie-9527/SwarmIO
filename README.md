@@ -1,323 +1,287 @@
-# SwarmIO 
-SwarmIO is an IOPS-scalable NVMe SSD emulation framework built for end-to-end modeling of next-generation GPU-centric storage systems.
+# SwarmIO + BaM：编译与运行
 
-SwarmIO builds on top of [NVMeVirt](https://github.com/snu-csl/nvmevirt) and is implemented as a Linux kernel module that exposes a virtual PCIe/NVMe device to the host system.
-It extends NVMeVirt's software architecture with a highly parallel design and integrates hardware-accelerated data movement through Intel Data Streaming Accelerator (DSA), enabling faithful modeling of high-IOPS GPU-centric storage systems.
-SwarmIO sustains real-time performance of up to 40 MIOPS (million IOPS) on a single-socket Intel Xeon 6787P CPU node equipped with four DSA devices, while concurrently operating with a real NVIDIA H200 GPU.
+SwarmIO 通过 Linux 内核模块创建虚拟 PCI/NVMe SSD，BaM 通过 GPU 发起 NVMe I/O。
+本仓库统一维护一套 **CPU 实际数据复制、512 B I/O、NVIDIA P2P** 的操作流程，
+对应当前 AMD 7950X、`6.8.0-multistream`、NVIDIA 专有驱动 `550.163.01` 实验机。
+DSA 后端源码保留，但不属于本入口的支持配置。
 
-For more details, please refer to our [paper](https://arxiv.org/abs/2604.06668).
+兼容修改已经直接合入源文件，包含中文注释。无需打补丁、修改二进制或复制旧构建目录。
+只维护以下入口：
 
-(Updated 2026-05-24) SwarmIO also includes [BaM](https://github.com/ZaidQureshi/bam) as a submodule for GPU-centric storage I/O benchmarks, with local patches for compatibility with the kernel versions recommended for SwarmIO. The BaM build uses CUDA CCCL atomic support and no longer depends on the [freestanding](https://github.com/ogiroux/freestanding) build path; this setup has been tested with CUDA 13.1.
+```text
+configs/bam-cpu.json         唯一配置：构建选项、模块参数、默认负载
+scripts/swarmio_bam.py       唯一命令：doctor / build / load / run / status / unload
+tests/test_swarmio_bam.py    源码回归检查，不是历史性能实验
+README.md                   当前完整操作说明与问题汇总
+```
 
-## Requirements
-### Hardware requirements
+**目前尚未解决随机读/队列循环复用卡顿，以及中断负载后的 worker 空指针和卸载等待。**
+此前小顺序读有成功记录，不能据此声称任意负载均可正常完成。本入口的目标是消除构建、
+库路径、驱动绑定和现场管理中的错误；脚本无法代替内核与 GPU 队列算法的后续修复。
+本版本尚需目标机验证，不能将“编译/加载成功”视为“I/O 验证通过”。
 
-SwarmIO requires a platform equipped with an Intel CPU with integrated DSA support.
+## 1. 提交并重新拉取源码
 
-For requirements specific to GPU-centric storage system setup, please also refer to [BaM](https://github.com/ZaidQureshi/bam).
-
-### System requirements
-
-To instantiate a virtual SSD device, the host system should be configured as follows.
-
-- Reserve sufficient system RAM for emulated storage space and NVMe
-  registers.
-- Reserve dedicated CPU cores for service units and workers.
-- Disable IOMMU or configure it in pass-through mode to avoid DMA remapping overhead during storage I/O emulation.
-
-Edit the GRUB command line:
+`bam/` 是独立 Git 子模块。先在 BaM 中提交、推送修改，再在父仓库记录新版本。
+仅提交父仓库不能保存 BaM 工作区中的修改。
 
 ```bash
-$ sudo vi /etc/default/grub
+# 在当前 SwarmIO 目录中检查、提交 BaM；detached HEAD 时先创建自己的分支。
+git -C bam status --short
+git -C bam diff --check
+git -C bam add -A
+git -C bam commit -m "Consolidate SwarmIO BaM runtime baseline"
+git -C bam push -u origin HEAD
+
+# 确认 .gitmodules 指向能获取上述提交的 BaM 仓库，再提交父仓库。
+git add -A
+git diff --cached --check
+git diff --cached --stat
+git diff --cached --submodule=short -- bam
+git commit -m "Unify SwarmIO BaM build and runtime workflow"
+git push
 ```
 
-If IOMMU can be disabled, use:
+若 `origin` 不是可写仓库，先设置可写远程；若 BaM 处于 detached HEAD，先执行
+`git -C bam switch -c <自己的分支名>`。不要把未推送的子模块 commit 留在父仓库中。
+脚本不会代替你提交、推送或修改 Git 暂存区。
+
+在服务器保留旧目录作为故障现场，重新克隆到新目录：
 
 ```bash
-GRUB_CMDLINE_LINUX="intel_iommu=off memmap=124G$134G isolcpus=53-85"
+git clone <你的SwarmIO仓库URL> ~/SwarmIO-clean
+cd ~/SwarmIO-clean
+# 若提交在非默认分支，先切换到对应分支。
+git submodule update --init bam
+git status --short
+git -C bam status --short
+git submodule status
 ```
 
-If IOMMU must remain enabled, use pass-through mode instead:
+两个工作区应干净，子模块状态行前不应有 `+` 或 `-`。
+不需要递归初始化已经不用的 freestanding 子模块。不要复制旧 `build-*`、`Release`、`.ko` 或 `.so`。
+
+## 2. 准备服务器
+
+需要 Python >= 3.9、CMake >= 3.24、make、C/C++ 编译器、可用 CUDA/CCCL 工具链、
+binutils、kmod、udev、Git，以及当前内核对应的构建树和 NVIDIA DKMS 构建符号表。
+沿用当前已经可用的 CUDA 工具链；不为本流程重装驱动或切换内核。
+
+当前实验机配置：
+
+| 参数 | 配置 |
+| --- | --- |
+| 运行内核 | `6.8.0-multistream` |
+| 物理内存预留 | `memmap=24G$4G`，4 GiB 起预留 24 GiB |
+| 虚拟 namespace | 预留内存扣除内部 4 GiB，约 20 GiB，非持久数据 |
+| 服务线程 | 4 个 dispatcher + 4 个 worker，CPU 8-15 |
+| 时序模型 | 512 B 单位；调度 400 ns，基础延迟 49600 ns，8 个时序资源 |
+| 后端数据搬运 | CPU 实际复制，dispatcher/worker DSA 均关闭 |
+| GPU | 配置中 `gpu=0` 是 nvidia-smi 的设备选择；运行时固定其 UUID |
+
+启动参数尚未预留内存时，先按本机内存布局设置 GRUB 并正常重启。
+例如 `/etc/default/grub` 的双引号内需要保留字面量 `$`，写作 `memmap=24G\$4G`。
+不要在尚未预留的普通 RAM 地址上加载仿真器。换机器时先修改 `configs/bam-cpu.json`，
+不能直接套用这里的地址和 CPU 编号。
+
+若之前已经发生 Oops 或 `rmmod` 卡在 `D` 状态，先保存原现场并正常重启。
+不能在这类状态上继续加载、运行或强制卸载。
+
+## 3. 检查环境
+
+从新克隆的 SwarmIO 根目录执行，不需要 sudo：
 
 ```bash
-GRUB_CMDLINE_LINUX="intel_iommu=on iommu=pt memmap=124G$134G isolcpus=53-85"
+python3 scripts/swarmio_bam.py doctor
 ```
 
-In these examples, `memmap=124G$134G` reserves 124 GiB of physical memory
-starting at the 134 GiB offset (in host physical address space), and `isolcpus=53-85` isolates CPU cores
-53 through 85 from the scheduler. Adjust both settings to match your testbed.
-For more information about kernel command-line parameters, see
-[the Linux kernel documentation](https://docs.kernel.org/admin-guide/kernel-parameters.html).
-
-Update GRUB and reboot:
+它会核对工具、内核构建输入、NVIDIA 驱动版本、DKMS 表、P2P 导出和 miscdevice 接口，
+输出目标 GPU 名称、UUID、PCI 地址、CUDA 架构及启动预留/CPU 在线状态。
+确认选中 Tesla 卡，避免选到 Quadro M2000。选另一块卡时：
 
 ```bash
-$ sudo update-grub
-$ sudo reboot
+python3 scripts/swarmio_bam.py doctor --gpu 0
 ```
 
-### Build dependencies
+NVIDIA 路径默认根据已加载驱动版本和当前内核推导。当前实验机对应：
 
-To build SwarmIO with DSA support, you need access to the Linux kernel headers for the `idxd` driver,
-such as `drivers/dma/idxd/idxd.h`.
+```text
+/var/lib/dkms/nvidia/550.163.01/6.8.0-multistream/x86_64/module/Module.symvers
+/usr/src/nvidia-550.163.01/nvidia/nv-p2p.h
+```
 
-- You can obtain them from the Linux source tree that matches your running kernel.
-- SwarmIO currently supports DSA on Linux kernel 6.8 or newer due to
-  symbol export requirements in the `idxd` driver.
-- We tested a manually installed mainline Linux kernel 6.16.10 on Ubuntu 25.10,
-  as well as the default Ubuntu kernel, version 6.8.0, on Ubuntu 24.04.
-- Ubuntu 22.04, which ships with the Ubuntu 5.15 kernel by default, must be upgraded to a newer kernel version.
+路径非标准时，`doctor` 和 `build` 均可显式传入
+`--nvidia-symvers <DKMS构建表>` 和 `--nvidia-include <包含nv-p2p.h的目录>`。
+不要使用 `/usr/src/nvidia-550.163.01/Module.symvers` 中此前不匹配的符号 CRC。
+构建前需确保普通用户可读取所需 DKMS 文件。
 
-Follow the instructions that match how your current kernel was installed.
-- If `uname -v` contains `Ubuntu`, follow the [Downloading Ubuntu kernel source](#1-downloading-ubuntu-kernel-source) method below.
-- If you are running a manually installed mainline kernel, follow the [Downloading mainline kernel source](#2-downloading-mainline-kernel-source) method below.
-
-#### 1. Downloading Ubuntu kernel source:
+## 4. 编译全部组件
 
 ```bash
-export KBASE="$(uname -r | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
-
-sudo apt update
-sudo apt install -y linux-source
-
-cd "/usr/src/linux-source-${KBASE}"
-
-sudo tar -xjf "linux-source-${KBASE}.tar.bz2" \
-  --strip-components=1 \
-  --wildcards \
-  "linux-source-${KBASE}/drivers/dma/idxd/*"
+python3 scripts/swarmio_bam.py build --jobs 8
 ```
 
-#### 2. Downloading mainline kernel source:
+构建不安装、不加载、不卸载模块，不需要 sudo。自动采用目标 GPU 的 CUDA 架构，
+避免 CMake `native` 同时选中其他旧 GPU。构建使用源码的逐字副本隔离对象文件，不改写 C/CUDA 源码。
+编译后会核对模块名、vermagic、full-I/O 标记、CPU 构建的 idxd 依赖、
+NVIDIA P2P 导入 CRC、GPL-only 导入及 benchmark 的 `libnvm.so` 路径。
+
+所有输出集中到一个目录：
+
+```text
+build/
+  manifest.json              源码哈希、两个 Git 提交/工作区状态、配置、环境、命令和产物哈希
+  build.log
+  swarmio/swarmio.ko         实际模块名 swarmio；已去除 BTF 段
+  swarmio/source/            源码副本与 Kbuild 对象，不提交
+  libnvm/libnvm.ko           实际模块名 libnvm；已去除 BTF 段
+  libnvm/source/             BaM 内核模块源码副本与对象，不提交
+  bam/lib/libnvm.so
+  bam/bin/nvm-block-bench
+```
+
+构建拒绝已有输出目录，避免旧缓存或旧二进制混入。失败时保留 `build.log`，修正源码后，
+使用新目录构建。全局选项必须放在子命令之前，例如：
 
 ```bash
-export KBASE="$(uname -r | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
-export KMAJOR="$(echo "$KBASE" | cut -d. -f1)"
-
-cd /usr/src
-sudo mkdir -p "linux-source-${KBASE}"
-
-sudo wget "https://www.kernel.org/pub/linux/kernel/v${KMAJOR}.x/linux-${KBASE}.tar.xz"
-sudo tar -xJf "linux-${KBASE}.tar.xz" \
-  -C "linux-source-${KBASE}" \
-  --strip-components=1 \
-  --wildcards \
-  "linux-${KBASE}/drivers/dma/idxd/*"
+python3 scripts/swarmio_bam.py --build-dir build-next build --jobs 8
 ```
 
-## Building SwarmIO
+后续 `load/run/unload` 也必须使用相同的 `--build-dir build-next`。
+运行参数取自构建时保存的配置；修改 JSON 后需重新构建，不会悄悄改变已有构建的加载参数。
 
-SwarmIO uses `*.conf` configuration files to manage build-time and runtime parameters. 
-Example configuration files are provided under [`configs/`](configs/).
+## 5. 加载仿真 SSD 和 BaM
 
-### Build-time configuration
-
-Build-time parameters are read from the `[build]` section of the configuration
-file (`*.conf`) and control how the kernel module is compiled.
-
-1. `max_queues`: Maximum number of I/O queue pairs supported by the
-   emulated device.
-2. `max_fetch_sqes`: Maximum number of SQ entries fetched at a time by
-   the dispatcher path when coalesced request fetching is enabled.
-3. `worker_queue_size`: Size of each worker-local queue.
-4. `coalesce_sqe`: Enables coalesced request fetching in the dispatcher
-   path.
-5. `prefetch_sqe`: Enables SQ entry prefetching across SQs within each
-   service unit.
-6. `skip_io`: Skips actual data movement for functional experiments and
-   oracle settings.
-7. `batch_worker_dma`: Enables batched DMA submission in workers.
-8. `use_cont_qid`: Assigns queue identifiers to service units in
-   contiguous ranges.
-9. `assign_worker_rr`: Assigns work (i.e., I/O requests) to workers in
-   round-robin order.
-10. `use_committer`: Enables the committer thread path, which separates
-    request completion handling from workers.
-11. `use_agg_timing_update`: Enables aggregated timing-model updates.
-12. `use_cas_timing_update`: Enables atomic CAS timing updates for
-    scheduling state.
-13. `profile_req`: Enables request latency breakdown profiling.
-14. `use_disp_dma`: Compiles dispatcher-side DMA support.
-15. `use_worker_dma`: Compiles worker-side DMA support.
-16. `clean`: Runs `make clean` before building.
-
-### Build script
-Build SwarmIO with the provided helper script (`--clean` ensures a clean build):
+在没有旧模块和旧 I/O 进程的干净状态下执行：
 
 ```bash
-$ scripts/build.sh -i configs/defconfig.conf --clean
+sudo python3 scripts/swarmio_bam.py load
 ```
 
-You can also override selected build parameters from the configuration
-file on the command line:
+此命令会核对当前内核、驱动、GPU 和四个产物的哈希，确认物理内存预留与 CPU 在线，
+先加载 SwarmIO，再识别唯一的虚拟控制器。它只接受 PCI vendor/device 为
+`0c51:0110` 的 SwarmIO 设备，不能指定物理 SSD。
+
+目标原本绑定 `nvme` 时，仅解绑该虚拟控制器并加载 `libnvm`；插入失败时尝试恢复原绑定。
+发现其他未绑定 NVMe 控制器时拒绝接管，已有 `swarmio/libnvm` 时拒绝自动替换。
+有多个虚拟设备时可显式指定：
 
 ```bash
-$ scripts/build.sh \
-  -i configs/defconfig.conf \
-  --max-queues 256 \
-  --max-fetch-sqes 1024 \
-  --worker-queue-size 4096 \
-  --use-disp-dma \
-  --use-worker-dma \
-  --clean
+sudo python3 scripts/swarmio_bam.py load --bdf 0001:10:00.0
 ```
 
-## Loading SwarmIO
+成功必须显示目标 `BDF -> /dev/libnvm0`，且节点属于目标虚拟控制器、动态设备号正确，
+`skip_io=0`、`sq_diag_faulted=N`。加载记录保存在 `build/loaded.json` 并关联当前启动和构建。
+中途失败时可能已有一个模块加载成功，脚本不会擅自回滚卸载；先使用 `status` 保存现场。
+如果模块已经部分加载，修正问题后在正常重启得到的干净状态中重新加载，不反复执行 load。
 
-### Runtime configuration
+## 6. 执行一轮 I/O
 
-Runtime parameters are read from the `[load]` section of the configuration file (`*.conf`)
-and control how the emulated device is instantiated.
-
-1. `num_sched_insts`: Number of parallel scheduling instances used by the timing
-   model.
-2. `block_size`: Emulated SSD block size in bytes.
-3. `target_latency`: Target per-request latency in nanoseconds used to
-   enforce the minimum latency.
-4. `target_miops`: Target throughput in MIOPS used to derive scheduling
-   delay.
-5. `memmap_start`: Start address of the reserved host physical memory
-   region used by SwarmIO.
-6. `memmap_size`: Size of the reserved host physical memory region.
-7. `num_service_units`: Number of service units. Each service unit
-   consists of one dispatcher and its associated workers.
-8. `num_workers_per_service_unit`: Number of workers assigned to each
-   service unit.
-9. `cpus`: Comma-separated list of CPU IDs and CPU ID ranges used for
-   binding dispatcher and worker threads.
-10. `use_disp_dma`: Enables dispatcher-side DMA.
-11. `use_worker_dma`: Enables worker-side DMA.
-12. `dsa_num_devs`: Number of DSA devices to use.
-13. `dsa_num_grps_per_dev`: Number of DSA groups configured per device.
-14. `dsa_num_wqs_per_grp`: Number of DSA WQs configured per
-    DSA group.
-15. `dsa_num_engs_per_grp`: Number of DSA engines configured per DSA
-    group.
-16. `dsa_wq_sizes`: Comma-separated list of DSA WQ sizes within each
-    DSA group.
-17. `dsa_wq_priorities`: Comma-separated list of DSA WQ priorities
-    within each DSA group.
-18. `dma_batch_size`: DMA batch size used by the worker DMA path.
-19. `num_dma_descs_per_worker`: Number of DMA descriptors reserved for
-    each worker (i.e., per-worker DSA WQ depth).
-    
-### Load script
-
-Load SwarmIO with the provided helper script:
+默认只运行一个小顺序读：64 线程、每线程 1 次逻辑操作、单队列、QD=512、
+2 MiB 缓冲区、1 GiB 地址范围、512 B 请求。
 
 ```bash
-$ scripts/load.sh -i configs/defconfig.conf
+sudo python3 scripts/swarmio_bam.py run
 ```
 
-You can override individual runtime parameters on the command line:
+脚本使用构建记录中的 GPU UUID 设置 `CUDA_VISIBLE_DEVICES`，benchmark 内部使用 `--gpu=0`，
+因此不会因 CUDA 与 nvidia-smi 的索引顺序不同而选错卡。
+动态库搜索优先使用本次 `build/bam/lib`，并检查实际链接路径。
+只有进程正常退出、输出 `Ops/sec` 且没有记录内核异常，才记为本轮完成。
+**这只是 I/O 路径和吞吐检查，不包含逐字节数据内容校验。**
+
+每轮创建唯一的目录：
+
+```text
+results/<时间>/run.json      命令、GPU、PID、构建指纹、完成状态
+results/<时间>/bench.log     benchmark 原始输出
+results/<时间>/before.log    运行前状态
+results/<时间>/after.log     运行后状态
+```
+
+长时间没有 benchmark 输出时，脚本每 10 秒报告仍在运行的 PID，不自动重试。
+在另一终端保存现场：
 
 ```bash
-$ scripts/load.sh \
-  --num-service-units 16 \
-  --block-size 512 \
-  --target-miops 40 \
+sudo python3 scripts/swarmio_bam.py status --output results/state.log
 ```
 
-After loading, the virtual NVMe SSD should be visible to the host
-system. For example:
+状态包括进程、模块状态、dispatcher/worker 栈、SQ/CQ 快照和内核日志；
+不读取硬件寄存器，不在故障采集中额外调用可能阻塞的 nvidia-smi。
+
+按 Ctrl+C 时只向 benchmark 发送一次 SIGINT，不强杀、不自动卸载；
+5 秒后仍未退出则报告 PID 并保留现场。任何未正常完成的本轮记录都会阻止后续运行/卸载，
+需保存状态并正常重启，避免重复使用半清理的队列。
+
+可以显式选择写请求或调整线程、请求数、QD 和队列数；具体选项见：
 
 ```bash
-$ lsblk | grep -i nvme
-nvme2n1     259:2    0   120G  0 disk
-
-$ sudo dmesg
-...
-[1178582.807408] nvme nvme2: pci function 0001:10:00.0
-[1178582.807576] SwarmIO: controller enabled
-[1178582.811741] SwarmIO: swarmio_dispatcher_0 assigned sq [01-86, stride: 16]
-[1178582.811751] SwarmIO: swarmio_dispatcher_1 assigned sq [02-86, stride: 16]
-...
-[1178582.811794] SwarmIO: swarmio_dispatcher_15 assigned sq [16-86, stride: 16]
-[1178582.819517] nvme nvme2: 86/0/0 default/read/poll queues
-[1178582.829290] SwarmIO: Virtual NVMe device created
+python3 scripts/swarmio_bam.py run --help
 ```
 
-To remove the emulated device, unload the module with:
+`--random` 以及增加 `--reqs/--threads/--num-queues` 可能触发尚未解决的停顿。
+不将原来的 4096×32 随机负载作为默认步骤，也不自动执行参数矩阵或性能实验。
+当前入口限制为 512 B 读/写，避免把未整理的多 LBA 随机地址边界路径当作已支持功能。
+
+## 7. 正常结束或切换构建
+
+仅在本轮已经正常完成、没有 I/O 进程、没有内核 Oops、模块均为 Live 时执行：
 
 ```bash
-$ scripts/load.sh --unload
+sudo python3 scripts/swarmio_bam.py unload
 ```
 
-## Usage
-### Benchmarking CPU-centric storage systems
-You can use [fio](https://github.com/axboe/fio) to run a simple
-CPU-centric storage benchmark on SwarmIO. 
-Our preprint reports results with an SPDK plugin built on top of this setup.
+脚本按 `libnvm -> swarmio` 顺序正常卸载；不使用 `rmmod -f` 或 SIGKILL。
+每个 `rmmod` 等待超过 15 秒时，保存状态并报告其 PID，**不终止正在内核中执行的卸载，也不继续下一步**。
+若已出现内核异常、未完成负载或模块处于 Unloading，直接拒绝继续卸载；保存状态后正常重启。
+`kill swarmio_dispatcher_0` 不能替代内核线程的正常退出。
 
-Example:
+正常卸载也仍受现有内核退出路径缺陷影响，脚本只负责检测和保留现场，不宣称已修复此缺陷。
+
+## 8. 已遇到的问题统一说明
+
+| 现象 | 已确认的原因/证据 | 当前处理 |
+| --- | --- | --- |
+| `insmod: Invalid parameters` | 单凭此消息无法定因；此前有 NVIDIA CRC 不匹配与 GPL-only 符号解析问题 | 结合本次 `dmesg`；构建前后核对匹配内核的 DKMS 表和模块导入 |
+| `nvidia_p2p_* disagrees about version` | 使用了不匹配的 NVIDIA 符号表；驱动版本号相同不足以证明 CRC 一致 | 使用运行内核对应 DKMS 表；审计编译输出 CRC；最终仍以实际加载为准 |
+| `class_create/device_create` 解析失败 | 当前内核将其导出为 GPL-only，依赖 NVIDIA 专有模块的 BaM 无法使用 | BaM 源码改用 miscdevice 和动态设备号，不改许可证、内核导出或 CRC |
+| `get_user_pages` 编译错误 | Linux 6.5+ 移除了旧的最后一个参数 | `bam/module/map.c` 中按内核版本选择接口 |
+| BTF 校验失败 | 自定义内核环境中曾无法加载带 BTF 的模块 | 构建关闭模块 BTF并生成去除 BTF 的加载产物，不修改代码段 |
+| 无 DSA 仍依赖 idxd 内部头/符号 | 原 Kbuild 无条件链接 DSA 实现 | CPU 配置只链接 `dsa/stub.c`；误调 DMA 返回错误，实际数据走 CPU 复制 |
+| 不确定是否真实复制数据 | `skip_io` 是编译开关，加载参数不能覆盖 | `skip_io` 只读状态由 worker 编译单元提供；加载验证必须为 0 |
+| dispatcher 聚合调度访问非法 namespace | 之前的栈定位在 SQ 命令到 namespace 的访问路径 | SQ 按页读取，BAR 使用 memcpy_fromio；在访问 namespace 前校验 NSID/LBA/PRP1 等，异常锁存并停止提交 |
+| 小顺序读成功，循环/随机负载仍卡住 | QD128/256 曾停顿；QD512 小负载完成，但较大随机负载仍停顿 | **未解决**。增大 QD 不是修复；保留 owner 快照与累计 CQ head 用于后续定位 |
+| CQ acquire 读取实验没有解决卡顿 | 加入后仍复现 | 已移除该对照项，不作为当前源码基线的已验证修复 |
+| `__fill_cq_result` NULL 指针、worker 异常退出 | 日志含内核 Oops 和 `exited with irqs disabled` | **未解决**。停止实验，保存现场并重启；不以反复卸载恢复 |
+| `rmmod swarmio` 卡住 | 栈为 `swarmio_dispatcher_exit -> kthread_stop`，模块 Unloading | 不强杀、不重复卸载；状态采集后正常重启 |
+| `tee: No such file or directory` / 不清楚运行了哪份库 | 日志目录未建立、旧 Release/build 路径混用 | 脚本先建唯一结果目录，统一输出路径并记录源码/产物哈希 |
+
+SQ 诊断当前仅接受读/写；队列快照要求 single-owner，不支持 committer/worker RR。
+诊断计数中的 `cqe_writes` 表示 CPU 已执行完成项写入，不证明 GPU 已观察到它。
+`cq_head_abs` 累计观察到的 doorbell 前进量，不能还原两次观察之间恰好转过完整一圈的变化。
+BaM 的一次逻辑读可能发起额外底层命令，不能直接用逻辑操作数与 NVMe 完成数不相等判错。
+
+## 9. 修改位置与验证范围
+
+| 源码 | 用途 |
+| --- | --- |
+| `Kbuild`、`dsa/dsa.h`、`dsa/stub.c` | CPU 构建不依赖 idxd 私有实现 |
+| `src/dispatcher.c`、`src/swarmio_sq_diagnostics.h` | SQ 读取与非法命令保护 |
+| `src/dispatcher.c`、`src/worker.c`、`src/swarmio_queue_diagnostics.h` | 队列状态与回绕计数 |
+| `src/main.c`、`src/worker.c` | 只读 full-I/O 编译模式 |
+| `bam/module/ctrl.c`、`ctrl.h`、`pci.c`、`map.c` | miscdevice、新内核和 NVIDIA P2P 兼容 |
+| `bam/CMakeLists.txt`、`bam/include/`、`bam/benchmarks/`、`bam/src/` | CUDA CCCL/C++17、API 与 benchmark 适配 |
+
+开发机本地已通过 18 项源码与入口回归检查，不加载 Linux 模块或执行 GPU I/O：
 
 ```bash
-$ scripts/run_fio.sh \
-  --input-config configs/swarmio.conf \
-  --target-miops 5 \
-  --num-service-units 16 \
-  --num-threads 8 \
-  --io-depths 32 \
-  --build
+python3 -m unittest discover -s tests -v
 ```
 
-However, host-side CPU IOPS can become a bottleneck when evaluating SwarmIO at high target IOPS.
-
-### Benchmarking GPU-centric storage systems
-You can use [BaM](https://github.com/ZaidQureshi/bam) to run a simple
-GPU-centric storage benchmark on SwarmIO.
-
-Initialize the BaM submodule from the top-level SwarmIO repository:
-
-```bash
-$ git submodule update --init bam
-```
-
-Apply the SwarmIO compatibility patch and build BaM from the submodule directory:
-
-```bash
-$ git -C bam apply ../bam_rev.patch
-$ scripts/build_bam.sh --clean
-```
-
-Run the BaM block benchmark with SwarmIO:
-
-```bash
-$ scripts/run_bam.sh \
-  --input-config configs/swarmio.conf \
-  --target-miops 5 \
-  --num-service-units 16 \
-  --num-threads 262144 \
-  --num-queues 256 \
-  --block-size 512 \
-  --build
-```
-
-Run without rebuilding SwarmIO/BaM:
-
-```bash
-$ scripts/run_bam.sh \
-  --input-config configs/swarmio.conf \
-  --target-miops 5 \
-  --num-service-units 16 \
-  --num-threads 262144 \
-  --num-queues 256 \
-  --block-size 512
-```
-
-## Acknowledgment
-This research is funded by the generous support from the following organizations:
-- Institute of Information & Communications Technology Planning & Evaluation(IITP) grant funded by the Korea government (MSIT) (No.RS-2024-00438851, (SW Starlab) High-performance Privacy-preserving Machine Learning System and System Software) and (No.RS-2025-02264029, Implementation and Validation of an AI Semiconductor-Based Data Center Composable Cluster Infrastructure)
-- SK hynix
-
-We appreciate their commitment to advancing research in this field.
-
-## Citation
-```bibtex
-@article{kim2026swarmio,
-  title={SwarmIO: Towards 100 Million IOPS SSD Emulation for Next-generation GPU-centric Storage Systems},
-  author={Kim, Hyeseong and Yeo, Gwangoo and Rhu, Minsoo},
-  journal = {arXiv preprint arXiv:2604.06668},
-  year={2026},
-}
-```
+覆盖 miscdevice 注册与分派、CPU/DSA 构建选择、无 idxd 私有头的 CPU backend 编译、
+SQ 边界及跨页复制、真实 CQ producer 的满/回绕/phase、CRC/GPL-only 拒绝路径、
+物理 NVMe 选择拒绝、产物哈希变化拒绝等。完整 Linux/CUDA 编译和运行仍需在目标机完成。
+生命周期检查使用构建工具替身和 CPU 子进程，覆盖精确源码复制、失败绑定恢复、运行状态记录和
+卸载超时不强杀；这些检查不能替代目标机验证。
+旧实验报告、性能矩阵、重建/打补丁脚本和重复入口已移除；`build/`、`build-*/`、`results/`、
+对象文件与 Python 缓存均不进入源码提交。

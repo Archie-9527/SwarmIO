@@ -18,6 +18,7 @@
 #include "queue.h"
 #include "worker.h"
 #include "dsa/dsa.h"
+#include "swarmio_sq_diagnostics.h"
 
 #define sq_dma(entry_id) (sq->dma_addr + sizeof(struct nvme_command) * entry_id)
 
@@ -35,6 +36,63 @@ static inline void __swarmio_disable_disp_dma(void)
 	SWARMIO_ERROR("disabling dispatcher DMA after DSA failure\n");
 	disp_using_dma = false;
 }
+
+#include "swarmio_queue_diagnostics.h"
+
+#ifdef CONFIG_SWARMIO_QUEUE_DIAGNOSTICS
+int swarmio_qdiag_qid = 1;
+u64 swarmio_qdiag_epoch;
+module_param_named(qdiag_qid, swarmio_qdiag_qid, int, 0444);
+MODULE_PARM_DESC(qdiag_qid, "Queue snapshot QID, fixed at load (default 1)");
+module_param_cb(qdiag_sq_state, &qdiag_ops, NULL, 0444);
+MODULE_INFO(swarmio_queue_diag, "1");
+static u64 qdiag_dispatched;
+
+/* 所有其他服务线程暂停时清零，避免混合 Linux nvme 探测和 BaM 的队列计数。 */
+static void qdiag_reset_sq(void)
+{
+    unsigned long flags;
+    ++swarmio_qdiag_epoch;
+    qdiag_dispatched = 0;
+    qdiag_next_ns = 0;
+    spin_lock_irqsave(&qdiag_text_lock, flags);
+    scnprintf(qdiag_text, sizeof(qdiag_text), "epoch=%llu reset\n",
+              (unsigned long long)swarmio_qdiag_epoch);
+    spin_unlock_irqrestore(&qdiag_text_lock, flags);
+    swarmio_qdiag_reset_cq();
+}
+
+static void qdiag_sample_sq(struct swarmio_dispatcher *dispatcher)
+{
+    int qid = READ_ONCE(swarmio_qdiag_qid), fetched = -1;
+    struct nvme_submission_queue *sq;
+    unsigned long flags;
+    u64 now;
+    if (!qdiag_owns(dispatcher, qid))
+        return;
+    sq = vdev->sqes[qid];
+    if (!sq)
+        return;
+    now = ktime_get_ns();
+    if (!qdiag_due(now))
+        return;
+#ifdef CONFIG_SWARMIO_DISP_COALESCE_SQE
+    fetched = sq->fetched_pos;
+#endif
+    spin_lock_irqsave(&qdiag_text_lock, flags);
+    scnprintf(qdiag_text, sizeof(qdiag_text),
+        "epoch=%llu sample_ns=%llu qid=%d disp=%u depth=%d sq_db=%u sq_old_db=%u sq_head=%d fetched=%d dispatched=%llu\n",
+        (unsigned long long)READ_ONCE(swarmio_qdiag_epoch),
+        (unsigned long long)now, qid, dispatcher->id, sq->queue_size,
+        READ_ONCE(vdev->dbs[qid * 2]), READ_ONCE(vdev->old_dbs[qid * 2]),
+        sq->sq_head, fetched, (unsigned long long)qdiag_dispatched);
+    spin_unlock_irqrestore(&qdiag_text_lock, flags);
+}
+
+#else
+static inline void qdiag_reset_sq(void) {}
+static inline void qdiag_sample_sq(struct swarmio_dispatcher *dispatcher) {}
+#endif
 
 /* BAR updates are handled only by dispatcher 0. */
 bool swarmio_proc_bars(struct swarmio_dispatcher *dispatcher)
@@ -174,6 +232,7 @@ bool swarmio_proc_bars(struct swarmio_dispatcher *dispatcher)
 					disp->qids.start = disp->qids.end = -1;
 				}
 
+				qdiag_reset_sq();
 				mb();
 
 				WRITE_ONCE(vdev->stop_flag, 0);
@@ -189,6 +248,7 @@ bool swarmio_proc_bars(struct swarmio_dispatcher *dispatcher)
 				}
 				kfree(queue);
 				vdev->admin_q = NULL;
+				memset(sq_diag_seen, 0, sizeof(sq_diag_seen));
 				SWARMIO_INFO("controller disabled\n");
 			}
 			bar->csts.rdy = 0;
@@ -337,6 +397,7 @@ static int swarmio_dispatcher_thread_fn(void *data)
 			last_dispatched_time = jiffies;
 		if (vdev_proc_dbs(dispatcher))
 			last_dispatched_time = jiffies;
+		qdiag_sample_sq(dispatcher);
 
 		if (CONFIG_SWARMIO_IDLE_TIMEOUT != 0 &&
 		    time_after(jiffies,
@@ -564,7 +625,14 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 		src = __sq_entry_at(sq, sq_entry);
 	}
 #endif
-	memcpy(&w->cmd, src, sizeof(struct nvme_command));
+	#ifndef CONFIG_SWARMIO_DISP_COALESCE_SQE
+    if (!disp_using_dma && sq->mapped && READ_ONCE(sq_cpu_fromio))
+        memcpy_fromio(&w->cmd, (const void __iomem *)src, sizeof(struct nvme_command));
+    else
+#endif
+        memcpy(&w->cmd, src, sizeof(struct nvme_command));
+    if (!sq_diag_valid(sq, &w->cmd, sq_entry))
+        return false;
 	cmd = &w->cmd;
 
 #ifndef CONFIG_SWARMIO_AGGREGATED_TIMING_UPDATE
@@ -624,6 +692,10 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 
 	/* enqueue into work queue */
 	smp_store_release(&local_queue->tail, new_local_queue_tail);
+#ifdef CONFIG_SWARMIO_QUEUE_DIAGNOSTICS
+	if (sqid == READ_ONCE(swarmio_qdiag_qid))
+		++qdiag_dispatched;
+#endif
 
 	return true;
 }
@@ -673,9 +745,10 @@ void swarmio_prefetch_sq(int qid, struct swarmio_dispatcher *dispatcher)
 int swarmio_dispatch_sq(int sqid, int new_db, int old_db,
 			struct swarmio_dispatcher *dispatcher)
 {
-	struct nvme_submission_queue *sq = vdev->sqes[sqid];
+	struct nvme_submission_queue *sq =
+		(sqid > 0 && sqid <= NR_MAX_IO_QUEUE) ? vdev->sqes[sqid] : NULL;
 #if defined(CONFIG_SWARMIO_DISP_COALESCE_SQE)
-	int num_fetch = new_db - sq->fetched_pos;
+	int num_fetch;
 	int ret;
 #endif
 	int num_proc;
@@ -684,8 +757,24 @@ int swarmio_dispatch_sq(int sqid, int new_db, int old_db,
 	int latest_db;
 	dma_addr_t cmd_buffer_dma;
 
-	if (unlikely(!sq))
-		return old_db;
+	if (unlikely(!sq) || READ_ONCE(sq_diag_faulted))
+        return old_db;
+    if (sq->queue_size <= 0 || sq->queue_size > NR_MAX_QUEUE_SIZE ||
+        old_db < 0 || old_db >= sq->queue_size ||
+        new_db < 0 || new_db >= sq->queue_size) {
+        WRITE_ONCE(sq_diag_faulted, true);
+        SWARMIO_ERROR("SQDIAG INVALID_RING qid=%d depth=%d new=%d old=%d\n",
+                       sqid, sq->queue_size, new_db, old_db);
+        return old_db;
+    }
+#ifdef CONFIG_SWARMIO_DISP_COALESCE_SQE
+    if (sq->fetched_pos < 0 || sq->fetched_pos >= sq->queue_size) {
+        WRITE_ONCE(sq_diag_faulted, true);
+        SWARMIO_ERROR("SQDIAG INVALID_FETCHED_POS qid=%d fetched=%d\n", sqid, sq->fetched_pos);
+        return old_db;
+    }
+    num_fetch = new_db - sq->fetched_pos;
+#endif
 
 #ifdef CONFIG_SWARMIO_DISP_COALESCE_SQE
 	if (num_fetch < 0)
@@ -720,15 +809,15 @@ int swarmio_dispatch_sq(int sqid, int new_db, int old_db,
 #endif
 			if (ret) {
 				__swarmio_disable_disp_dma();
-				memcpy(sq->cmd_buffer + sq->fetched_pos,
-				       __sq_entry_at(sq, sq->fetched_pos),
-				       sizeof(struct nvme_command) * num_fetch);
+				sq_diag_copy(sq, sq->cmd_buffer + sq->fetched_pos, sq->fetched_pos, num_fetch);
 			}
 		} else {
-			memcpy(sq->cmd_buffer + sq->fetched_pos,
-			       __sq_entry_at(sq, sq->fetched_pos),
-			       sizeof(struct nvme_command) * num_fetch);
+			sq_diag_copy(sq, sq->cmd_buffer + sq->fetched_pos, sq->fetched_pos, num_fetch);
 		}
+
+if (!sq_diag_batch(sq, sq->cmd_buffer + sq->fetched_pos,
+                       sq->fetched_pos, num_fetch))
+            return old_db;
 
 #ifdef CONFIG_SWARMIO_AGGREGATED_TIMING_UPDATE
 		{

@@ -472,5 +472,32 @@ static void swarmio_exit(void)
 }
 
 MODULE_LICENSE("GPL v2");
+
+
+/* SWARMIO_FULLIO_BUILD_STATUS：读取 worker 的实际编译模式，禁止运行时写入。 */
+#include <linux/errno.h>
+extern bool swarmio_worker_build_skip_io(void);
+
+static int fullio_skip_io_get(char *buffer, const struct kernel_param *kp)
+{
+    (void)kp;
+    return scnprintf(buffer, PAGE_SIZE, "%u\n",
+                     swarmio_worker_build_skip_io() ? 1U : 0U);
+}
+
+static int fullio_skip_io_set(const char *value, const struct kernel_param *kp)
+{
+    (void)value;
+    (void)kp;
+    return -EPERM;
+}
+
+static const struct kernel_param_ops fullio_skip_io_ops = {
+    .set = fullio_skip_io_set,
+    .get = fullio_skip_io_get,
+};
+module_param_cb(skip_io, &fullio_skip_io_ops, NULL, 0444);
+MODULE_PARM_DESC(skip_io, "Immutable worker build mode: 0=real copy, 1=skip");
+
 module_init(swarmio_init);
 module_exit(swarmio_exit);
