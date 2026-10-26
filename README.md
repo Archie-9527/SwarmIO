@@ -1,7 +1,7 @@
 # SwarmIO + BaM：编译与运行
 
 SwarmIO 通过 Linux 内核模块创建虚拟 PCI/NVMe SSD，BaM 通过 GPU 发起 NVMe I/O。
-本仓库统一维护一套 **CPU 实际数据复制、512 B I/O、NVIDIA P2P** 的操作流程，
+本仓库统一维护一套 **CPU 实际数据复制、512 B/4 KiB I/O、NVIDIA P2P** 的操作流程，
 对应当前 AMD 7950X、`6.8.0-multistream`、NVIDIA 专有驱动 `550.163.01` 实验机。
 DSA 后端源码保留，但不属于本入口的支持配置。
 
@@ -281,7 +281,20 @@ sudo python3 scripts/swarmio_bam.py run --random --access read \
 
 `--random` 以及增加 `--reqs/--threads/--num-queues` 可能触发尚未解决的停顿。
 不将原来的 4096×32 随机负载作为默认步骤，也不自动执行参数矩阵或性能实验。
-当前入口限制为 512 B 读/写，避免把未整理的多 LBA 随机地址边界路径当作已支持功能。
+入口支持 `--page-size 512` 或 `--page-size 4096`，默认仍为 512 B。
+`--num-blks` 表示请求大小单位的地址范围块数，因此 4 KiB 下 `262144` 块对应 1 GiB。
+容量检查按 `num_blks × page_size` 计算；BaM 随机起始 LBA 的上限扣除整条请求占用的 LBA 数，
+避免多 LBA 请求越过范围末尾。更新 BaM 后需要重新编译 benchmark。
+
+```bash
+sudo python3 scripts/swarmio_bam.py --build-dir build-4k run \
+  --random --access read --threads 4096 --reqs 256 \
+  --num-queues 16 --queue-depth 512 --page-size 4096 --num-blks 262144
+```
+
+4 KiB 请求不改变 namespace 的 512 B LBA 或 `io_unit_shift=9` 时序单位。
+`run_random_read.sh` 继续使用构建记录中的请求大小；已有 512 B 构建用上面的 `run` 选项覆盖。
+本地参数及 CPU 复制检查通过不代表目标 GPU 的 4 KiB 性能或稳定性已验证。
 
 ## 7. 正常结束或切换构建
 
@@ -343,7 +356,7 @@ CPU 数据路径及 PRP 列表同样区分 RAM/BAR，并映射物理页基址后
 | `bam/module/ctrl.c`、`ctrl.h`、`pci.c`、`map.c` | miscdevice、新内核和 NVIDIA P2P 兼容 |
 | `bam/CMakeLists.txt`、`bam/include/`、`bam/benchmarks/`、`bam/src/` | CUDA CCCL/C++17、API 与 benchmark 适配 |
 
-开发机本地已通过 23 项源码与入口回归检查，不加载 Linux 模块或执行 GPU I/O：
+开发机本地已通过 24 项源码与入口回归检查，不加载 Linux 模块或执行 GPU I/O：
 
 ```bash
 python3 -m unittest discover -s tests -v

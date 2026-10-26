@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SwarmIO + BaM 的统一入口：doctor/build/load/run/status/unload。
 
-仅支持当前 CPU full-I/O、512 B 基线。所有实现来自仓库源码，不生成源码补丁。
+支持当前 CPU full-I/O 的 512 B/4 KiB 请求。所有实现来自仓库源码，不生成源码补丁。
 """
 import argparse
 import csv
@@ -87,8 +87,8 @@ def validate_benchmark(bench, config):
     for name in ('threads', 'blk_size', 'reqs', 'pages', 'page_size', 'num_blks', 'queue_depth', 'num_queues'):
         if type(bench[name]) is not int or bench[name] <= 0:
             raise Error(name + ' 必须为正整数')
-    if bench['page_size'] != 512 or bench['blk_size'] != 64 or bench['threads'] % 64:
-        raise Error('当前基线仅支持 512 B、block=64、线程数为 64 的倍数')
+    if bench['page_size'] not in (512, 4096) or bench['blk_size'] != 64 or bench['threads'] % 64:
+        raise Error('当前支持 512 B/4096 B、block=64、线程数为 64 的倍数')
     depth = bench['queue_depth']
     if depth < 2 or depth > 1024 or depth & (depth - 1):
         raise Error('queue_depth 必须是 2..1024 内的 2 的幂')
@@ -97,7 +97,7 @@ def validate_benchmark(bench, config):
     if type(bench['random']) is not bool or type(bench['access_type']) is not int or bench['access_type'] not in (0, 1):
         raise Error('仅支持顺序/随机读或写，不支持混合负载')
     capacity = parse_size(config['module']['memmap_size']) - (4 << 30)
-    if bench['num_blks'] * 512 > capacity or bench['threads'] > bench['num_blks']:
+    if bench['num_blks'] * bench['page_size'] > capacity or bench['threads'] > bench['num_blks']:
         raise Error('访问范围超过虚拟 namespace 容量或不足以容纳顺序线程起始 LBA')
 
 
@@ -570,8 +570,8 @@ def run(args):
     check_no_workload()
     manifest = verify_session(args)
     bench = dict(manifest['config']['benchmark'])
-    for name in ('threads', 'reqs', 'queue_depth', 'num_queues'):
-        if getattr(args, name) is not None:
+    for name in ('threads', 'reqs', 'queue_depth', 'num_queues', 'page_size', 'num_blks'):
+        if getattr(args, name, None) is not None:
             bench[name] = getattr(args, name)
     if args.random:
         bench['random'] = True
@@ -700,7 +700,7 @@ def main():
     p = commands.add_parser('load', help='加载两个模块并绑定虚拟控制器')
     p.add_argument('--bdf', help='可选；必须属于 SwarmIO 虚拟设备')
     p = commands.add_parser('run', help='运行单轮读/写检查')
-    for name in ('threads', 'reqs', 'queue-depth', 'num-queues'):
+    for name in ('threads', 'reqs', 'queue-depth', 'num-queues', 'page-size', 'num-blks'):
         p.add_argument('--' + name, type=int)
     p.add_argument('--random', action='store_true')
     p.add_argument('--access', choices=('read', 'write'))

@@ -708,11 +708,22 @@ class PipelineTests(unittest.TestCase):
     def test_config_and_workload_limits(self):
         config = pipeline.read_config(ROOT / "configs/bam-cpu.json")
         self.assertEqual(config["benchmark"]["reqs"], 1)
-        for field, invalid in [("queue_depth", 3), ("page_size", 4096), ("threads", 65),
+        for field, invalid in [("queue_depth", 3), ("page_size", 2048), ("threads", 65),
                                ("num_queues", 65), ("num_blks", 1 << 50)]:
             bench = dict(config["benchmark"], **{field: invalid})
             with self.assertRaises(pipeline.Error):
                 pipeline.validate_benchmark(bench, config)
+
+    def test_4k_range_validation_and_command(self):
+        config = pipeline.read_config(ROOT / "configs/bam-cpu.json")
+        bench = dict(config["benchmark"], page_size=4096, num_blks=262144)
+        pipeline.validate_benchmark(bench, config)
+        cmd = pipeline.benchmark_command(Path("/bench"), bench)
+        self.assertIn("--page_size=4096", cmd)
+        self.assertIn("--num_blks=262144", cmd)
+        bench["num_blks"] = ((20 << 30) // 4096) + 1
+        with self.assertRaises(pipeline.Error):
+            pipeline.validate_benchmark(bench, config)
 
     def test_sizes_and_cpu_ranges(self):
         self.assertEqual(pipeline.parse_size("24G"), 24 << 30)
