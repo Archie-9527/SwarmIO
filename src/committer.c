@@ -64,8 +64,19 @@ static bool __fill_cq_result(struct swarmio_commit_desc *desc)
 
 	/* write cqe */
 	cqe_src->sq_head = vdev->sqes[sqid]->sq_head;
-	cqe_src->status = (u16)cq->phase & 0x1;
-	memcpy((u32 *)cqe_dst + 2, (u32 *)cqe_src + 2, sizeof(u32) * 2);
+	cqe_src->status = cpu_to_le16((le16_to_cpu(cqe_src->status) & ~1U) | (cq->phase & 1));
+	/* 先发布 SQHD/SQID，最后发布 CID/phase；禁止普通 memcpy 写 GPU BAR。 */
+	memcpy(&dword2, (u32 *)cqe_src + 2, sizeof(dword2));
+	memcpy(&dword3, (u32 *)cqe_src + 3, sizeof(dword3));
+	if (cq->mapped) {
+		writel(le32_to_cpu(dword2), (u32 __iomem *)cqe_dst + 2);
+		wmb();
+		writel(le32_to_cpu(dword3), (u32 __iomem *)cqe_dst + 3);
+	} else {
+		WRITE_ONCE(*((u32 *)cqe_dst + 2), dword2);
+		wmb();
+		WRITE_ONCE(*((u32 *)cqe_dst + 3), dword3);
+	}
 
 	/* update cq tail */
 	if (++cq_tail == cq->queue_size) {

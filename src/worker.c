@@ -208,8 +208,19 @@ static bool __fill_cq_result(struct swarmio_io_work *w)
 
 	/* write cqe */
 	cqe_src->sq_head = vdev->sqes[sqid]->sq_head;
-	cqe_src->status = (u16)phase & 0x1;
-	memcpy((u32 *)cqe_dst + 2, (u32 *)cqe_src + 2, sizeof(u32) * 2);
+	cqe_src->status = cpu_to_le16((le16_to_cpu(cqe_src->status) & ~1U) | (phase & 1));
+	/* 先发布 SQHD/SQID，最后发布 CID/phase；禁止普通 memcpy 写 GPU BAR。 */
+	memcpy(&dword2, (u32 *)cqe_src + 2, sizeof(dword2));
+	memcpy(&dword3, (u32 *)cqe_src + 3, sizeof(dword3));
+	if (cq->mapped) {
+		writel(le32_to_cpu(dword2), (u32 __iomem *)cqe_dst + 2);
+		wmb();
+		writel(le32_to_cpu(dword3), (u32 __iomem *)cqe_dst + 3);
+	} else {
+		WRITE_ONCE(*((u32 *)cqe_dst + 2), dword2);
+		wmb();
+		WRITE_ONCE(*((u32 *)cqe_dst + 3), dword3);
+	}
 #ifdef CONFIG_SWARMIO_QUEUE_DIAGNOSTICS
     /* Record the source bytes after the existing write; do not read back VRAM. */
     if (sqid == READ_ONCE(swarmio_qdiag_qid)) {
@@ -288,94 +299,94 @@ static inline void __swarmio_dma_cb(void *data)
 #endif
 }
 
-static void __swarmio_xfer_data(struct nvme_rw_command *cmd)
+/* CPU 后端：主机 RAM 与 GPU BAR 分别使用普通内存和 I/O 访问接口。 */
+static int __swarmio_xfer_data(struct nvme_rw_command *cmd)
 {
-	size_t offset, length, remaining;
-	int prp_offs = 0;
-	int prp2_offs = 0;
-	u64 paddr;
+	size_t offset = __cmd_io_offset(cmd);
+	size_t remaining = __cmd_io_size(cmd);
+	size_t nsid = cmd->nsid - 1;
+	int prp_offs = 0, prp2_offs = 0;
+	void *list_base = NULL;
 	u64 *paddr_list = NULL;
-	size_t nsid = cmd->nsid - 1; // 0-based
-	bool is_paddr_memremap = false;
-
-	offset = __cmd_io_offset(cmd);
-	length = __cmd_io_size(cmd);
-	remaining = length;
+	bool list_io = false;
+	int ret = 0;
 
 	while (remaining) {
-		size_t io_size;
-		void *vaddr;
-		size_t mem_offs = 0;
-		bool is_vaddr_memremap = false;
+		u64 paddr = 0;
+		void *base;
+		bool data_io;
+		size_t mem_offs, io_size;
 
 		if (prp_offs == 0) {
 			paddr = cmd->dptr.prp1;
 		} else if (prp_offs == 1) {
 			paddr = cmd->dptr.prp2;
 			if (remaining > PAGE_SIZE) {
-				if (pfn_valid(paddr >> PAGE_SHIFT)) {
-					paddr_list =
-						kmap_atomic_pfn(PRP_PFN(paddr));
-				} else {
-					paddr_list = memremap(paddr, PAGE_SIZE,
-							      MEMREMAP_WT);
-					is_paddr_memremap = true;
+				list_io = !pfn_valid(paddr >> PAGE_SHIFT);
+				if (list_io)
+					list_base = ioremap(paddr & PAGE_MASK, PAGE_SIZE);
+				else
+					list_base = kmap_local_page(pfn_to_page(paddr >> PAGE_SHIFT));
+				if (!list_base) {
+					ret = -ENOMEM;
+					goto out;
 				}
-				paddr_list =
-					(u64 *)((uintptr_t)paddr_list +
-						(paddr & PAGE_OFFSET_MASK));
-				paddr = paddr_list[prp2_offs++];
+				paddr_list = list_base + (paddr & PAGE_OFFSET_MASK);
 			}
-		} else {
+		}
+		if (prp_offs && paddr_list) {
+			/* 保留列表原始映射地址，释放时不能传入加过偏移的地址。 */
 			BUG_ON(prp2_offs == (PTRS_PER_PRP_LIST - 1) &&
 			       remaining > PAGE_SIZE);
-			paddr = paddr_list[prp2_offs++];
+			if (list_io)
+				memcpy_fromio(&paddr, (void __iomem *)(paddr_list + prp2_offs), sizeof(paddr));
+			else
+				paddr = paddr_list[prp2_offs];
+			paddr = le64_to_cpu(paddr);
+			prp2_offs++;
 		}
 
-		if (pfn_valid(paddr >> PAGE_SHIFT)) {
-			vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
-		} else {
-			vaddr = memremap(paddr, PAGE_SIZE, MEMREMAP_WT);
-			is_vaddr_memremap = true;
+		data_io = !pfn_valid(paddr >> PAGE_SHIFT);
+		/* ioremap 会保留物理地址偏移，故必须映射页基址，只加一次页内偏移。 */
+		if (data_io)
+			base = ioremap(paddr & PAGE_MASK, PAGE_SIZE);
+		else
+			base = kmap_local_page(pfn_to_page(paddr >> PAGE_SHIFT));
+		if (!base) {
+			ret = -ENOMEM;
+			goto out;
 		}
-
-		io_size = min_t(size_t, remaining, PAGE_SIZE);
-
-		if (paddr & PAGE_OFFSET_MASK) {
-			mem_offs = paddr & PAGE_OFFSET_MASK;
-			if (io_size + mem_offs > PAGE_SIZE)
-				io_size = PAGE_SIZE - mem_offs;
-		}
-
-		if (cmd->opcode == nvme_cmd_write ||
-		    cmd->opcode == nvme_cmd_zone_append) {
-			memcpy(vdev->ns[nsid].mapped + offset, vaddr + mem_offs,
-			       io_size);
+		mem_offs = paddr & PAGE_OFFSET_MASK;
+		io_size = min_t(size_t, remaining, PAGE_SIZE - mem_offs);
+		if (cmd->opcode == nvme_cmd_write || cmd->opcode == nvme_cmd_zone_append) {
+			if (data_io)
+				memcpy_fromio(vdev->ns[nsid].mapped + offset,
+					      (void __iomem *)(base + mem_offs), io_size);
+			else
+				memcpy(vdev->ns[nsid].mapped + offset, base + mem_offs, io_size);
 		} else if (cmd->opcode == nvme_cmd_read) {
-			memcpy_toio(vaddr + mem_offs,
-				    vdev->ns[nsid].mapped + offset, io_size);
+			if (data_io)
+				memcpy_toio((void __iomem *)(base + mem_offs),
+					    vdev->ns[nsid].mapped + offset, io_size);
+			else
+				memcpy(base + mem_offs, vdev->ns[nsid].mapped + offset, io_size);
 		}
-
-		if (vaddr != NULL && !is_vaddr_memremap) {
-			kunmap_atomic(vaddr);
-			vaddr = NULL;
-		} else if (vaddr != NULL && is_vaddr_memremap) {
-			memunmap(vaddr);
-			vaddr = NULL;
-			is_vaddr_memremap = false;
-		}
-
+		if (data_io)
+			iounmap(base);
+		else
+			kunmap_local(base);
 		remaining -= io_size;
 		offset += io_size;
 		prp_offs++;
 	}
-
-	if (paddr_list) {
-		if (!is_paddr_memremap)
-			kunmap_atomic(paddr_list);
-		else if (is_paddr_memremap)
-			memunmap(paddr_list);
+out:
+	if (list_base) {
+		if (list_io)
+			iounmap(list_base);
+		else
+			kunmap_local(list_base);
 	}
+	return ret;
 }
 
 static inline int __swarmio_submit_dma(dma_ctx_t *dma_ctx, u8 opcode, u64 paddr,
@@ -548,7 +559,8 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 						worker->paddr_list);
 					if (unlikely(ret)) {
 						__swarmio_disable_worker_dma();
-						__swarmio_xfer_data(&w->cmd.rw);
+						if (__swarmio_xfer_data(&w->cmd.rw))
+							w->cqe.status = cpu_to_le16(NVME_SC_INTERNAL << 1);
 						__swarmio_mark_copied(w);
 					}
 #else
@@ -562,7 +574,8 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 					w->nsecs_issued = ktime_get_ns();
 #endif
 #ifndef CONFIG_SWARMIO_WORKER_SKIP_IO
-					__swarmio_xfer_data(&w->cmd.rw);
+					if (__swarmio_xfer_data(&w->cmd.rw))
+						w->cqe.status = cpu_to_le16(NVME_SC_INTERNAL << 1);
 #endif
 					__swarmio_mark_copied(w);
 				}
@@ -629,6 +642,7 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 				commit_desc->is_internal = true;
 			} else {
 				commit_desc->is_internal = false;
+				commit_desc->cqe.status = w->cqe.status;
 				commit_desc->cqe.sq_id = w->cqe.sq_id;
 				commit_desc->cqe.command_id =
 					w->cmd.rw.command_id;
@@ -875,8 +889,9 @@ int swarmio_worker_init(struct nvme_vdev *vdev)
 					      worker->thread_name);
 				goto err;
 			}
-			SWARMIO_DEBUG("%s assigned %s\n", worker->thread_name,
-				      worker->dma_ctx->wq->name);
+			/* 日志不依赖 idxd_wq 私有字段，保证 CPU-only 配置也能完成类型检查。 */
+			SWARMIO_DEBUG("%s assigned dsa%d/wq%d\n",
+				     worker->thread_name, dev_id, wq_id);
 		}
 
 		worker->task_struct = kthread_create(swarmio_worker_thread_fn,

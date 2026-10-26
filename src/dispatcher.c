@@ -501,9 +501,9 @@ int swarmio_dispatcher_init(struct nvme_vdev *vdev)
 					      dispatcher->thread_name);
 				goto err;
 			}
-			SWARMIO_DEBUG("%s assigned %s\n",
-				      dispatcher->thread_name,
-				      dispatcher->dma_ctx->wq->name);
+			/* CPU 构建不包含 idxd_wq 的内部定义；日志使用已有编号，避免解引用私有结构。 */
+			SWARMIO_DEBUG("%s assigned dsa%d/wq%d\n",
+				     dispatcher->thread_name, dev_id, wq_id);
 		}
 
 		mb();
@@ -625,14 +625,18 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 		src = __sq_entry_at(sq, sq_entry);
 	}
 #endif
-	#ifndef CONFIG_SWARMIO_DISP_COALESCE_SQE
-    if (!disp_using_dma && sq->mapped && READ_ONCE(sq_cpu_fromio))
-        memcpy_fromio(&w->cmd, (const void __iomem *)src, sizeof(struct nvme_command));
-    else
+#ifndef CONFIG_SWARMIO_DISP_COALESCE_SQE
+	if (!disp_using_dma && sq->mapped && READ_ONCE(sq_cpu_fromio)) {
+		memcpy_fromio(&w->cmd, (const void __iomem *)src,
+			      sizeof(struct nvme_command));
+	} else
 #endif
-        memcpy(&w->cmd, src, sizeof(struct nvme_command));
-    if (!sq_diag_valid(sq, &w->cmd, sq_entry))
-        return false;
+	{
+		memcpy(&w->cmd, src, sizeof(struct nvme_command));
+	}
+	if (!sq_diag_valid(sq, &w->cmd, sq_entry)) {
+		return false;
+	}
 	cmd = &w->cmd;
 
 #ifndef CONFIG_SWARMIO_AGGREGATED_TIMING_UPDATE
@@ -654,6 +658,7 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 
 	/////////////////////////////////
 	/* populate work desc */
+	w->cqe.status = 0;
 	w->cqe.sq_id = sqid;
 	w->cqe.command_id = cmd->rw.command_id;
 	w->cqid = sq->cqid;

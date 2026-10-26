@@ -72,7 +72,7 @@ void vdev_delete_sq(struct nvme_submission_queue *sq)
 	sq->sq = NULL;
 
 	if (sq->mapped)
-		memunmap(sq->mapped);
+		iounmap(sq->mapped);
 	sq->mapped = NULL;
 
 	kfree(sq);
@@ -87,7 +87,7 @@ void vdev_delete_cq(struct nvme_completion_queue *cq)
 	cq->cq = NULL;
 
 	if (cq->mapped)
-		memunmap(cq->mapped);
+		iounmap(cq->mapped);
 	cq->mapped = NULL;
 
 	kfree(cq);
@@ -103,6 +103,10 @@ static void admin_create_cq(int eid)
 	int dbs_idx;
 
 	cq = kzalloc(sizeof(struct nvme_completion_queue), GFP_KERNEL);
+	if (!cq) {
+		__make_cq_entry(eid, NVME_SC_INTERNAL | NVME_STATUS_DNR);
+		return;
+	}
 
 	cq->qid = cmd->cqid;
 
@@ -133,14 +137,19 @@ static void admin_create_cq(int eid)
 		cq->queue_size * sizeof(struct nvme_completion), PAGE_SIZE);
 	cq->cq = kzalloc(sizeof(struct nvme_completion *) * num_pages,
 			 GFP_KERNEL);
+	if (!cq->cq)
+		goto fail;
 
 	if (pfn_valid(cmd->prp1 >> PAGE_SHIFT)) {
 		cq->mapped = NULL;
 		for (i = 0; i < num_pages; i++)
 			cq->cq[i] = prp_address_offset(cmd->prp1, i);
 	} else {
+		/* GPU BAR 不与 CPU 缓存一致；队列复用时必须重新读取设备内存。 */
 		cq->mapped =
-			memremap(cmd->prp1, num_pages * PAGE_SIZE, MEMREMAP_WT);
+			ioremap(cmd->prp1, num_pages * PAGE_SIZE);
+		if (!cq->mapped)
+			goto fail;
 		for (i = 0; i < num_pages; i++)
 			cq->cq[i] =
 				(void *)((uint64_t)cq->mapped + i * PAGE_SIZE);
@@ -152,6 +161,11 @@ static void admin_create_cq(int eid)
 	vdev->dbs[dbs_idx] = vdev->old_dbs[dbs_idx] = 0;
 
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
+	return;
+
+fail:
+	vdev_delete_cq(cq);
+	__make_cq_entry(eid, NVME_SC_INTERNAL | NVME_STATUS_DNR);
 }
 
 static void admin_delete_cq(int eid)
@@ -182,6 +196,10 @@ static void admin_create_sq(int eid)
 	unsigned long cmd_buffer_start;
 
 	sq = kzalloc(sizeof(struct nvme_submission_queue), GFP_KERNEL);
+	if (!sq) {
+		__make_cq_entry(eid, NVME_SC_INTERNAL | NVME_STATUS_DNR);
+		return;
+	}
 
 	sq->qid = cmd->sqid;
 	sq->cqid = cmd->cqid;
@@ -214,7 +232,7 @@ static void admin_create_sq(int eid)
 	if (unlikely(!sq->cmd_buffer)) {
 		SWARMIO_ERROR("Failed to memremap cmd buffer for SQ %d\n",
 			      sq->qid);
-		__make_cq_entry(eid, NVME_SC_INTERNAL | NVME_STATUS_DNR);
+		goto fail;
 	}
 
 	/* TODO Physically non-contiguous prp list */
@@ -223,6 +241,8 @@ static void admin_create_sq(int eid)
 	num_pages = DIV_ROUND_UP(sq->queue_size * sizeof(struct nvme_command),
 				 PAGE_SIZE);
 	sq->sq = kzalloc(sizeof(struct nvme_command *) * num_pages, GFP_KERNEL);
+	if (!sq->sq)
+		goto fail;
 
 	sq->dma_addr = cmd->prp1;
 	if (pfn_valid(cmd->prp1 >> PAGE_SHIFT)) {
@@ -230,8 +250,11 @@ static void admin_create_sq(int eid)
 		for (i = 0; i < num_pages; i++)
 			sq->sq[i] = prp_address_offset(cmd->prp1, i);
 	} else {
+		/* GPU BAR 不与 CPU 缓存一致；队列复用时必须重新读取设备内存。 */
 		sq->mapped =
-			memremap(cmd->prp1, num_pages * PAGE_SIZE, MEMREMAP_WT);
+			ioremap(cmd->prp1, num_pages * PAGE_SIZE);
+		if (!sq->mapped)
+			goto fail;
 		for (i = 0; i < num_pages; i++)
 			sq->sq[i] =
 				(void *)((uint64_t)sq->mapped + i * PAGE_SIZE);
@@ -244,6 +267,11 @@ static void admin_create_sq(int eid)
 	vdev->old_dbs[dbs_idx] = 0;
 
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
+	return;
+
+fail:
+	vdev_delete_sq(sq);
+	__make_cq_entry(eid, NVME_SC_INTERNAL | NVME_STATUS_DNR);
 }
 
 static void admin_delete_sq(int eid)

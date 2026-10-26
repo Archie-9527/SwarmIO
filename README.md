@@ -11,6 +11,7 @@ DSA 后端源码保留，但不属于本入口的支持配置。
 ```text
 configs/bam-cpu.json         唯一配置：构建选项、模块参数、默认负载
 scripts/swarmio_bam.py       唯一命令：doctor / build / load / run / status / unload
+scripts/run_random_read.sh   单轮随机读加压快捷入口，仅转发到上述 run
 tests/test_swarmio_bam.py    源码回归检查，不是历史性能实验
 README.md                   当前完整操作说明与问题汇总
 ```
@@ -254,6 +255,30 @@ sudo python3 scripts/swarmio_bam.py status --output results/state.log
 python3 scripts/swarmio_bam.py run --help
 ```
 
+小顺序读正常完成后，可使用单轮随机读加压脚本：
+
+```bash
+sudo bash scripts/run_random_read.sh
+```
+
+默认复用 `build` 的加载记录：1024 线程 × 每线程 8 次请求、8 个队列、每队列 QD=512，
+仍为 512 B、2 MiB 缓冲区、1 GiB 地址范围。共 8192 次逻辑读，是默认小检查的 128 倍操作数；
+这是一次短负载加压，不是持续时长或数据内容校验。底层 NVMe 命令数可能包含额外读取。
+不重新编译、加载或卸载模块，GPU 和日志沿用统一入口。
+
+位置参数依次为 `构建目录 线程数 每线程请求数 队列数 QD`。例如使用其他已加载构建：
+
+```bash
+sudo bash scripts/run_random_read.sh build-cpu-fixed 1024 8 8 512
+```
+
+也可不复制快捷脚本，直接执行等价命令：
+
+```bash
+sudo python3 scripts/swarmio_bam.py run --random --access read \
+  --threads 1024 --reqs 8 --num-queues 8 --queue-depth 512
+```
+
 `--random` 以及增加 `--reqs/--threads/--num-queues` 可能触发尚未解决的停顿。
 不将原来的 4096×32 随机负载作为默认步骤，也不自动执行参数矩阵或性能实验。
 当前入口限制为 512 B 读/写，避免把未整理的多 LBA 随机地址边界路径当作已支持功能。
@@ -283,9 +308,10 @@ sudo python3 scripts/swarmio_bam.py unload
 | `get_user_pages` 编译错误 | Linux 6.5+ 移除了旧的最后一个参数 | `bam/module/map.c` 中按内核版本选择接口 |
 | BTF 校验失败 | 自定义内核环境中曾无法加载带 BTF 的模块 | 构建关闭模块 BTF并生成去除 BTF 的加载产物，不修改代码段 |
 | 无 DSA 仍依赖 idxd 内部头/符号 | 原 Kbuild 无条件链接 DSA 实现 | CPU 配置只链接 `dsa/stub.c`；误调 DMA 返回错误，实际数据走 CPU 复制 |
+| `invalid use of undefined type struct idxd_wq` | DMA 初始化日志仍访问 `wq->name`；运行时关闭 DMA 不能跳过编译期类型检查 | dispatcher/worker 日志改用已知的设备/队列编号，CPU 模式无需 idxd 私有结构定义 |
 | 不确定是否真实复制数据 | `skip_io` 是编译开关，加载参数不能覆盖 | `skip_io` 只读状态由 worker 编译单元提供；加载验证必须为 0 |
 | dispatcher 聚合调度访问非法 namespace | 之前的栈定位在 SQ 命令到 namespace 的访问路径 | SQ 按页读取，BAR 使用 memcpy_fromio；在访问 namespace 前校验 NSID/LBA/PRP1 等，异常锁存并停止提交 |
-| 小顺序读成功，循环/随机负载仍卡住 | QD128/256 曾停顿；QD512 小负载完成，但较大随机负载仍停顿 | **未解决**。增大 QD 不是修复；保留 owner 快照与累计 CQ head 用于后续定位 |
+| 小顺序读成功，循环/随机负载仍卡住 | GPU SQ/CQ 使用 WT 缓存映射；CQ 用普通 memcpy 发布；CPU PRP 复制重复叠加页内偏移 | 已修正这些源码缺陷，**随机读卡顿是否消除仍待目标机验证**；增大 QD 不能替代修复 |
 | CQ acquire 读取实验没有解决卡顿 | 加入后仍复现 | 已移除该对照项，不作为当前源码基线的已验证修复 |
 | `__fill_cq_result` NULL 指针、worker 异常退出 | 日志含内核 Oops 和 `exited with irqs disabled` | **未解决**。停止实验，保存现场并重启；不以反复卸载恢复 |
 | `rmmod swarmio` 卡住 | 栈为 `swarmio_dispatcher_exit -> kthread_stop`，模块 Unloading | 不强杀、不重复卸载；状态采集后正常重启 |
@@ -296,6 +322,15 @@ SQ 诊断当前仅接受读/写；队列快照要求 single-owner，不支持 co
 `cq_head_abs` 累计观察到的 doorbell 前进量，不能还原两次观察之间恰好转过完整一圈的变化。
 BaM 的一次逻辑读可能发起额外底层命令，不能直接用逻辑操作数与 NVMe 完成数不相等判错。
 
+GPU BAR 上的 SQ/CQ 现在使用 `ioremap/iounmap`，保留主机 RAM 命令缓冲区的 WB 映射。
+完成项先写 SQHD/SQID，再经过写屏障，最后写包含 CID/phase 的 DWORD；BAR 使用 `writel`，
+RAM 使用 `WRITE_ONCE`。不能用普通 `memcpy` 的实现顺序保证 GPU 轮询看到的发布顺序。
+CPU 数据路径及 PRP 列表同样区分 RAM/BAR，并映射物理页基址后只叠加一次页内偏移。
+例如 PRP1 为 `页基址+512` 时，原实现可能实际复制到 `页基址+1024`；现在复制到正确的 `+512`。
+列表释放使用原始映射地址；映射失败返回内部错误完成项，复用 work 时清除上次状态。
+这些修正遵循 [Linux 6.8 设备 I/O 接口规则](https://docs.kernel.org/6.8/driver-api/device-io.html)。
+源码缺陷与卡顿现象的因果关系仍需目标机复测，CPU 模拟检查不能验证 PCIe/GPU 可见性。
+
 ## 9. 修改位置与验证范围
 
 | 源码 | 用途 |
@@ -303,19 +338,23 @@ BaM 的一次逻辑读可能发起额外底层命令，不能直接用逻辑操�
 | `Kbuild`、`dsa/dsa.h`、`dsa/stub.c` | CPU 构建不依赖 idxd 私有实现 |
 | `src/dispatcher.c`、`src/swarmio_sq_diagnostics.h` | SQ 读取与非法命令保护 |
 | `src/dispatcher.c`、`src/worker.c`、`src/swarmio_queue_diagnostics.h` | 队列状态与回绕计数 |
+| `nvmev/admin.c`、`src/worker.c`、`src/committer.c` | GPU BAR 非缓存映射、CQ 发布顺序、CPU PRP 偏移及映射释放 |
 | `src/main.c`、`src/worker.c` | 只读 full-I/O 编译模式 |
 | `bam/module/ctrl.c`、`ctrl.h`、`pci.c`、`map.c` | miscdevice、新内核和 NVIDIA P2P 兼容 |
 | `bam/CMakeLists.txt`、`bam/include/`、`bam/benchmarks/`、`bam/src/` | CUDA CCCL/C++17、API 与 benchmark 适配 |
 
-开发机本地已通过 21 项源码与入口回归检查，不加载 Linux 模块或执行 GPU I/O：
+开发机本地已通过 23 项源码与入口回归检查，不加载 Linux 模块或执行 GPU I/O：
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
 
 覆盖 miscdevice 注册与分派、CPU/DSA 构建选择、无 idxd 私有头的 CPU backend 编译、
-SQ 边界及跨页复制、真实 CQ producer 的满/回绕/phase、CRC/GPL-only 拒绝路径、
+SQ 边界及跨页复制、真实 CQ producer 的满/回绕/phase 与 MMIO 发布顺序、
+CPU PRP 全部 512 B 页内位置的读写哨兵、跨页/列表复制及映射失败、CRC/GPL-only 拒绝路径、
 物理 NVMe 选择拒绝、产物哈希变化拒绝等。完整 Linux/CUDA 编译和运行仍需在目标机完成。
+初始化日志检查在不定义 idxd_wq 内部结构、启用日志参数类型检查的条件下编译实际日志语句，
+分别覆盖 -O0/-O2，并确认旧写法失败、当前写法通过。
 生命周期检查使用构建工具替身和 CPU 子进程，覆盖精确源码复制、失败绑定恢复、运行状态记录和
 卸载超时不强杀；这些检查不能替代目标机验证。
 旧实验报告、性能矩阵、重建/打补丁脚本和重复入口已移除；`build/`、`build-*/`、`results/`、

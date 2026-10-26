@@ -131,6 +131,44 @@ int main(void) {
 
 
 class CPUConfigurationTests(unittest.TestCase):
+    def test_actual_dma_init_debug_calls_accept_opaque_idxd_wq(self):
+        if not shutil.which('cc'):
+            self.skipTest('C compiler unavailable')
+        calls = []
+        for name in ('dispatcher', 'worker'):
+            text = (ROOT / 'src' / (name + '.c')).read_text()
+            init = text[text.index('int swarmio_' + name + '_init('):]
+            found = re.findall(r'SWARMIO_DEBUG\("%s assigned .*?\);', init, re.S)
+            self.assertEqual(len(found), 1)
+            calls.extend(found)
+        # 和 CONFIG_DYNAMIC_DEBUG 一样，日志参数实际参与 C 类型检查；不能靠运行时 if(false) 隐藏错误。
+        prefix = r'''
+#include <stdio.h>
+#include <stdbool.h>
+struct idxd_wq;
+struct dma_context { struct idxd_wq *wq; };
+struct service_thread { const char *thread_name; struct dma_context *dma_ctx; };
+#define SWARMIO_DEBUG(...) fprintf(stderr, __VA_ARGS__)
+void probe(bool using_dma, struct service_thread *dispatcher, struct service_thread *worker) {
+    int dev_id = 0, wq_id = 0;
+    if (using_dma) {
+'''
+        suffix = '\n    }\n}\n'
+        broken = [r'SWARMIO_DEBUG("%s assigned %s\n", dispatcher->thread_name, dispatcher->dma_ctx->wq->name);',
+                  r'SWARMIO_DEBUG("%s assigned %s\n", worker->thread_name, worker->dma_ctx->wq->name);']
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'init-debug.c'
+            for optimization in ('-O0', '-O2'):
+                command = ['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', optimization,
+                           '-fsyntax-only', str(source)]
+                source.write_text(prefix + '\n'.join(broken) + suffix)
+                before = subprocess.run(command, capture_output=True, text=True)
+                self.assertNotEqual(before.returncode, 0)
+                self.assertRegex(before.stderr, 'incomplete|undefined')
+                source.write_text(prefix + '\n'.join(calls) + suffix)
+                after = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(after.returncode, 0, after.stderr)
+
     def test_kbuild_selects_cpu_or_real_dsa_backend(self):
         if not shutil.which("make"):
             self.skipTest("make unavailable")
@@ -379,6 +417,17 @@ typedef uint16_t u16;
 #define CONFIG_SWARMIO_DISP_COALESCE_SQE 1
 #define READ_ONCE(x) (x)
 #define le16_to_cpu(x) (x)
+#define le32_to_cpu(x) (x)
+#define cpu_to_le16(x) (x)
+#define __iomem
+#define WRITE_ONCE(x, v) ((x) = (v))
+extern int io_writes, barriers, last_io_barrier;
+#define wmb() (++barriers)
+static void writel(u32 value, u32 *dst) {
+    if (io_writes % 2) assert(barriers > last_io_barrier);
+    else last_io_barrier = barriers;
+    ++io_writes; *dst = value;
+}
 #define DEFINE_SPINLOCK(x) int x
 #define spin_lock_irqsave(lock, flags) ((void)(lock), (flags) = 0)
 #define spin_unlock_irqrestore(lock, flags) ((void)(lock), (void)(flags))
@@ -400,6 +449,7 @@ struct nvme_completion { u32 result, reserved; u16 sq_head, sq_id, command_id, s
 struct nvme_submission_queue { int queue_size, sq_head, fetched_pos, cqid; };
 struct nvme_completion_queue {
     int queue_size, cq_head, cq_tail, phase; bool interrupt_ready;
+    void *mapped;
     struct nvme_completion entries[128];
 };
 struct swarmio_io_work {
@@ -442,6 +492,7 @@ extern bool fill(struct swarmio_io_work *);
 struct state storage, *vdev = &storage;
 u64 test_now = 1000000000ULL;
 int dma_batch_size = 2, num_dma_descs_per_worker = 2;
+int io_writes, barriers, last_io_barrier;
 int main(void) {
     struct nvme_submission_queue sq = { .queue_size=128, .sq_head=5, .fetched_pos=5, .cqid=1 };
     struct nvme_completion_queue cq = { .queue_size=128, .phase=1 };
@@ -473,6 +524,11 @@ int main(void) {
     test_now += 250000000ULL; sample_cq(&worker); get_cq(buffer);
     assert(strstr(buffer, "cq_head=0 cq_head_abs=128 cq_tail=3 phase=0 cqe_writes=131"));
     assert(strstr(buffer, "last_dw3=00000007"));
+    cq.mapped = (void *)1;
+    work.cqe.status = 12;
+    assert(fill(&work)); assert(io_writes == 2);
+    assert(cq.entries[3].status == 12 && cq.entries[3].command_id == 7);
+    assert(cq.entries[3].sq_id == 1 && cq.entries[3].sq_head == 5);
     strcpy(saved, buffer);
     /* A wrong owner and a removed SQ must not access this queue or replace text. */
     disp.qids.start=2; test_now += 250000000ULL;
@@ -520,6 +576,102 @@ bool fill(struct swarmio_io_work *w) { return __fill_cq_result(w); }
             self.assertEqual(result.returncode, 0, result.stderr)
             subprocess.run([str(base / "probe")], check=True)
 
+
+
+class CpuBarTransferTests(unittest.TestCase):
+    def test_actual_prp_copy_offsets_lists_and_mapping_failure(self):
+        if not shutil.which("cc"):
+            self.skipTest("C compiler unavailable")
+        source = (ROOT / "src/worker.c").read_text()
+        start = source.index("static int __swarmio_xfer_data(")
+        end = source.index("static inline int __swarmio_submit_dma", start)
+        prelude = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <errno.h>
+typedef uint64_t u64;
+#define __iomem
+#define PAGE_SIZE 4096UL
+#define PAGE_SHIFT 12
+#define PAGE_MASK (~(PAGE_SIZE - 1))
+#define PAGE_OFFSET_MASK (PAGE_SIZE - 1)
+#define PTRS_PER_PRP_LIST 512
+#define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))
+#define le64_to_cpu(x) (x)
+#define BUG_ON(x) assert(!(x))
+enum { nvme_cmd_read, nvme_cmd_write, nvme_cmd_zone_append };
+struct nvme_rw_command { int opcode, nsid; size_t length; struct { u64 prp1, prp2; } dptr; };
+static unsigned char gpu[8 * PAGE_SIZE], ram[8 * PAGE_SIZE], disk[8 * PAGE_SIZE];
+static struct { struct { void *mapped; } ns[1]; } device, *vdev = &device;
+static int active, io_reads, io_writes, fail_map;
+static size_t __cmd_io_offset(struct nvme_rw_command *c) { (void)c; return 0; }
+static size_t __cmd_io_size(struct nvme_rw_command *c) { return c->length; }
+static bool pfn_valid(u64 pfn) { return pfn < 0xf0000000UL / PAGE_SIZE; }
+static void *pfn_to_page(u64 pfn) { return ram + (pfn * PAGE_SIZE - 0x100000); }
+static void *kmap_local_page(void *page) { ++active; return page; }
+static void kunmap_local(void *p) { assert(((uintptr_t)p - (uintptr_t)ram) % PAGE_SIZE == 0); --active; }
+static void *ioremap(u64 addr, size_t n) {
+    assert(addr % PAGE_SIZE == 0 && n == PAGE_SIZE);
+    if (fail_map) return NULL;
+    assert(addr >= 0xf0000000 && addr + n <= 0xf0000000 + sizeof(gpu));
+    ++active; return gpu + (addr - 0xf0000000);
+}
+static void iounmap(void *p) { assert(((uintptr_t)p - (uintptr_t)gpu) % PAGE_SIZE == 0); --active; }
+static void memcpy_fromio(void *dst, const void *src, size_t n) { ++io_reads; memcpy(dst, src, n); }
+static void memcpy_toio(void *dst, const void *src, size_t n) { ++io_writes; memcpy(dst, src, n); }
+'''
+        checks = r'''
+int main(void) {
+    device.ns[0].mapped = disk;
+    for (size_t i=0; i<sizeof(disk); ++i) disk[i] = (unsigned char)(i * 7 + i / 512);
+    /* 每个 512 B 页内位置都检查前后哨兵，捕获重复加偏移及邻接内存破坏。 */
+    for (int io=0; io<2; ++io) {
+        unsigned char *target = io ? gpu : ram;
+        u64 phys = io ? 0xf0000000 : 0x100000;
+        for (size_t off=0; off<PAGE_SIZE; off+=512) {
+            memset(target, 0xa5, sizeof(gpu));
+            struct nvme_rw_command c = { .opcode=nvme_cmd_read, .nsid=1, .length=512,
+                .dptr={phys+off,0} };
+            assert(__swarmio_xfer_data(&c)==0 && active==0);
+            assert(!memcmp(target+off, disk, 512));
+            for (size_t i=0; i<sizeof(gpu); ++i)
+                if (i<off || i>=off+512) assert(target[i]==0xa5);
+            memset(disk, 0, 512); c.opcode=nvme_cmd_write;
+            assert(__swarmio_xfer_data(&c)==0 && active==0);
+            assert(!memcmp(target+off, disk, 512));
+            memset(disk, 0x6b, 512);
+        }
+        /* PRP1 跨页 + PRP2 直接页地址。 */
+        struct nvme_rw_command c = { .opcode=nvme_cmd_read, .nsid=1, .length=1024,
+            .dptr={phys+3584,phys+PAGE_SIZE} };
+        assert(__swarmio_xfer_data(&c)==0 && active==0);
+        assert(!memcmp(target+3584,disk,1024));
+        /* 偏移 8 B 的 PRP 列表必须用原始页基址释放；列表可在 RAM 或 BAR。 */
+        u64 list[2] = {phys+PAGE_SIZE,phys+2*PAGE_SIZE};
+        memcpy(target+4*PAGE_SIZE+8,list,sizeof(list));
+        c.length=3*PAGE_SIZE; c.dptr.prp1=phys; c.dptr.prp2=phys+4*PAGE_SIZE+8;
+        assert(__swarmio_xfer_data(&c)==0 && active==0);
+        assert(!memcmp(target,disk,3*PAGE_SIZE));
+    }
+    assert(io_reads>0 && io_writes>0);
+    fail_map=1;
+    struct nvme_rw_command c = { .opcode=nvme_cmd_read, .nsid=1, .length=512,
+        .dptr={0xf0000200,0} };
+    assert(__swarmio_xfer_data(&c)==-ENOMEM && active==0);
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "probe.c").write_text(prelude + source[start:end] + checks)
+            result = subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
+                                     str(path / "probe.c"), "-o", str(path / "probe")],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            subprocess.run([str(path / "probe")], check=True)
 
 
 class PipelineTests(unittest.TestCase):
