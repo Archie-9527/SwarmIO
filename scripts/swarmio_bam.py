@@ -578,6 +578,10 @@ def run(args):
     if args.access:
         bench['access_type'] = {'read': 0, 'write': 1}[args.access]
     validate_benchmark(bench, manifest['config'])
+    monitor_interval = getattr(args, 'monitor_interval', None)
+    if monitor_interval is not None:
+        from swarmio_monitor import ResourceMonitor, interval_value
+        monitor_interval = interval_value(monitor_interval)
     check_library(args.build_dir / ARTIFACTS[3], args.build_dir / ARTIFACTS[2])
     directory = ROOT / 'results' / dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
     directory.mkdir(parents=True)
@@ -593,6 +597,7 @@ def run(args):
     interrupted = [None]
     with (directory / 'bench.log').open('wb') as log, (directory / 'bench.log').open('r') as tail:
         process = subprocess.Popen(command, env=child_env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        monitor = None
         record['pid'] = process.pid
         save_json(directory / 'run.json', record)
         session = json.loads((args.build_dir / 'loaded.json').read_text())
@@ -608,6 +613,9 @@ def run(args):
         previous = signal.signal(signal.SIGINT, interrupt)
         next_message = time.monotonic() + 10
         try:
+            if monitor_interval is not None:
+                monitor = ResourceMonitor(directory, manifest['environment']['gpu']['uuid'], process.pid, monitor_interval)
+                monitor.start()
             while True:
                 chunk = tail.read()
                 if chunk:
@@ -627,6 +635,12 @@ def run(args):
                 time.sleep(0.2)
         finally:
             signal.signal(signal.SIGINT, previous)
+            if monitor:
+                monitor.stop()
+                try:
+                    monitor.report({'state': 'pending_final_status'})
+                except Exception as exc:
+                    print('监控报告生成失败，保留原始 CSV：', exc, flush=True)
     text = (directory / 'bench.log').read_text(errors='replace')
     record.update(returncode=code, state='completed' if code == 0 and 'Ops/sec:' in text else 'incomplete')
     try:
@@ -636,6 +650,11 @@ def run(args):
     session['run_state'] = 'completed' if record['state'] == 'completed' else 'incomplete'
     save_json(args.build_dir / 'loaded.json', session)
     save_json(directory / 'run.json', record)
+    if monitor:
+        try:
+            print('资源图表：', monitor.report(record), flush=True)
+        except Exception as exc:
+            print('监控报告生成失败，保留原始 CSV：', exc, flush=True)
     (directory / 'after.log').write_text(snapshot())
     if record['state'] != 'completed':
         raise Error('本轮没有正常完成；日志位于 ' + str(directory) + '；不自动重跑或卸载')
@@ -685,6 +704,7 @@ def unload(args):
 
 
 def main():
+    from swarmio_monitor import interval_value
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=ROOT / 'configs/bam-cpu.json')
     parser.add_argument('--build-dir', type=Path, default=ROOT / 'build')
@@ -704,6 +724,8 @@ def main():
         p.add_argument('--' + name, type=int)
     p.add_argument('--random', action='store_true')
     p.add_argument('--access', choices=('read', 'write'))
+    p.add_argument('--monitor-interval', type=interval_value,
+                   help='启用资源及 NVMe 吞吐采样，单位秒，例如 0.1；范围 0.01..60，默认关闭')
     p = commands.add_parser('status', help='只读收集队列、进程、线程栈和内核日志')
     p.add_argument('--output', type=Path)
     commands.add_parser('unload', help='仅在无负载和无内核异常时正常卸载')

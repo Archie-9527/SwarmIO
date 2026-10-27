@@ -12,6 +12,7 @@ DSA 后端源码保留，但不属于本入口的支持配置。
 configs/bam-cpu.json         唯一配置：构建选项、模块参数、默认负载
 scripts/swarmio_bam.py       唯一命令：doctor / build / load / run / status / unload
 scripts/run_random_read.sh   单轮随机读加压快捷入口，仅转发到上述 run
+scripts/swarmio_monitor.py   资源采样、HTML/SVG 图表与历史 CSV 重绘（Python 标准库）
 tests/test_swarmio_bam.py    源码回归检查，不是历史性能实验
 README.md                   当前完整操作说明与问题汇总
 ```
@@ -296,6 +297,74 @@ sudo python3 scripts/swarmio_bam.py --build-dir build-4k run \
 `run_random_read.sh` 继续使用构建记录中的请求大小；已有 512 B 构建用上面的 `run` 选项覆盖。
 本地参数及 CPU 复制检查通过不代表目标 GPU 的 4 KiB 性能或稳定性已验证。
 
+### 资源与吞吐打点
+
+统一入口增加 `--monitor-interval 秒数`，支持 0.01..60 秒，默认关闭。
+例如 100 ms 打点的 4 KiB 随机读：
+
+```bash
+sudo python3 scripts/swarmio_bam.py --build-dir build-metrics run \
+  --random --access read --threads 4096 --reqs 512 \
+  --num-queues 16 --queue-depth 512 --page-size 4096 --num-blks 262144 \
+  --monitor-interval 0.1
+```
+
+512 B 快捷脚本的可选第六参数也可以启用打点：
+
+```bash
+sudo bash scripts/run_random_read.sh build-metrics 4096 512 16 512 0.1
+```
+
+GPU/主机资源采样只依赖 Python 标准库、Linux `/proc` 和现有 `nvidia-smi`，不用安装绘图库。
+**全队列 NVMe IOPS/带宽曲线需要新增的 `src/swarmio_io_metrics.h` 和 worker 调用点。**
+同步源码后使用新目录构建一次：
+
+```bash
+python3 scripts/swarmio_bam.py --build-dir build-metrics build \
+  --jobs 8 --cuda-root /usr/local/cuda-12.4
+```
+
+用当前已加载构建的目录执行正常 `unload`，再执行
+`sudo python3 scripts/swarmio_bam.py --build-dir build-metrics load`。
+旧模块没有 `/sys/module/swarmio/parameters/io_metrics` 时，资源采样仍能工作，
+报告会明确说明吞吐曲线缺失，不用单个 QID 的诊断计数冒充全部 I/O。
+
+每轮在已有 `results/<时间>/` 中增加：
+
+| 文件 | 内容 |
+| --- | --- |
+| `resources.csv` | 时间戳、GPU/主机/进程资源、全队列累计完成计数与区间吞吐 |
+| `cpu-cores.csv` | 主机逐 CPU 核 busy/iowait |
+| `tasks.csv` | BaM 进程、SwarmIO 各内核线程及监控进程的 CPU/RSS 明细 |
+| `gpu-raw.csv`、`gpu-sampler.log` | 收到的 GPU 指标及采样进程错误输出 |
+| `monitor-summary.json` | 实际采样间隔、采样耗时、告警、BaM 平均逻辑吞吐与监控窗口实际吞吐 |
+| `monitor.html`、`*.svg` | 可离线打开的完整图表报告，以及可单独导出的矢量图 |
+
+正常完成或统一入口处理 SIGINT/失败后都会尝试生成报告；原始 CSV 逐次刷新。
+若进程被外部强制终止，保留 CSV 后可重新绘图：
+
+```bash
+python3 scripts/swarmio_monitor.py results/<实际目录名>
+```
+
+图表口径：
+
+- GPU `busy` 是采样窗口内执行 kernel 的时间比例，包含轮询等待，**不是 SM occupancy**。
+  `memory busy` 是显存读写忙碌率，显存 `used/total` 为整卡容量占用，不单独归因于 BaM。
+- GPU 使用一个常驻 `nvidia-smi --loop-ms` 子进程；驱动刷新窗口可能慢于打点间隔，
+  因此 100 ms 打点不保证每 100 ms 都得到一份独立的 GPU 硬件测量。
+  缺失、N/A、过期数据留空，不伪造为零。口径见
+  [NVIDIA 官方说明](https://docs.nvidia.com/deploy/nvidia-smi/index.html)。
+- 整机 CPU busy 归一到 100%；BaM、SwarmIO 和监控进程以一个核为 100%，合计可以超过 100%。
+  SwarmIO 空闲轮询也可能持续占用 CPU。主机 RAM 数据不包括 `memmap` 预留内存。
+- NVMe 曲线按全队列成功发布的 CQE 和真实命令长度差分，包含 BaM 额外读及其 512 B 数据量，
+  失败命令单独累计为 errors。不是 `threads × reqs` 的逻辑 IOPS，也不证明 GPU 已看到 CQE。
+  当前仅支持已有的 single-owner CPU 配置；每队列计数使用 seqcount，避免共享全局原子热点。
+- 图表覆盖进程初始化、kernel 执行和清理；BaM 末尾平均吞吐仅覆盖它的 GPU kernel 计时区间。
+  报告把两者分别标注。极短测试应增加 reqs，以便取得足够采样点。
+- 采样和内核计数本身都有开销。CSV 保留真实时间与采样耗时，错过的点不补造；
+  需要比较带监控和不带监控的运行，才能评估监控对性能的影响。
+
 ## 7. 正常结束或切换构建
 
 仅在本轮已经正常完成、没有 I/O 进程、没有内核 Oops、模块均为 Live 时执行：
@@ -351,12 +420,13 @@ CPU 数据路径及 PRP 列表同样区分 RAM/BAR，并映射物理页基址后
 | `Kbuild`、`dsa/dsa.h`、`dsa/stub.c` | CPU 构建不依赖 idxd 私有实现 |
 | `src/dispatcher.c`、`src/swarmio_sq_diagnostics.h` | SQ 读取与非法命令保护 |
 | `src/dispatcher.c`、`src/worker.c`、`src/swarmio_queue_diagnostics.h` | 队列状态与回绕计数 |
+| `src/swarmio_io_metrics.h`、`scripts/swarmio_monitor.py` | 全队列实际完成计数、资源采样和离线图表 |
 | `nvmev/admin.c`、`src/worker.c`、`src/committer.c` | GPU BAR 非缓存映射、CQ 发布顺序、CPU PRP 偏移及映射释放 |
 | `src/main.c`、`src/worker.c` | 只读 full-I/O 编译模式 |
 | `bam/module/ctrl.c`、`ctrl.h`、`pci.c`、`map.c` | miscdevice、新内核和 NVIDIA P2P 兼容 |
 | `bam/CMakeLists.txt`、`bam/include/`、`bam/benchmarks/`、`bam/src/` | CUDA CCCL/C++17、API 与 benchmark 适配 |
 
-开发机本地已通过 24 项源码与入口回归检查，不加载 Linux 模块或执行 GPU I/O：
+开发机本地已通过 29 项源码与入口回归检查，不加载 Linux 模块或执行 GPU I/O：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -372,3 +442,6 @@ CPU PRP 全部 512 B 页内位置的读写哨兵、跨页/列表复制及映射�
 卸载超时不强杀；这些检查不能替代目标机验证。
 旧实验报告、性能矩阵、重建/打补丁脚本和重复入口已移除；`build/`、`build-*/`、`results/`、
 对象文件与 Python 缓存均不进入源码提交。
+监控检查覆盖 20 ms 采样、流式 GPU 子进程替身、CPU guest 时间去重、PID stat 解析、
+实际内核计数实现的跨 QID/不同请求大小/错误计数、SVG 格式与缺失指标重绘。
+这些检查没有在开发机加载 NVIDIA 驱动或 Linux 模块，目标机计数与监控开销仍需实测。

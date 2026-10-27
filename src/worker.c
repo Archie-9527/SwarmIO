@@ -58,6 +58,7 @@ static inline void __swarmio_disable_worker_dma(void)
 }
 
 #include "swarmio_queue_diagnostics.h"
+#include "swarmio_io_metrics.h"
 
 #ifdef CONFIG_SWARMIO_QUEUE_DIAGNOSTICS
 module_param_cb(qdiag_cq_state, &qdiag_ops, NULL, 0444);
@@ -221,6 +222,9 @@ static bool __fill_cq_result(struct swarmio_io_work *w)
 		wmb();
 		WRITE_ONCE(*((u32 *)cqe_dst + 3), dword3);
 	}
+	/* 只在 CQE 成功发布后累计一次，bytes 使用真实命令长度，包含额外读。 */
+	swarmio_metrics_record(sqid, __cmd_io_size(&w->cmd.rw),
+			       !(le16_to_cpu(cqe_src->status) & ~1U));
 #ifdef CONFIG_SWARMIO_QUEUE_DIAGNOSTICS
     /* Record the source bytes after the existing write; do not read back VRAM. */
     if (sqid == READ_ONCE(swarmio_qdiag_qid)) {
@@ -800,6 +804,8 @@ int swarmio_worker_init(struct nvme_vdev *vdev)
 	unsigned int num_workers = vdev->config.num_workers;
 	unsigned int num_workers_per_service_unit =
 		vdev->config.num_workers_per_service_unit;
+
+	swarmio_metrics_init();
 
 	local_queue_size =
 		min_t(size_t, NR_WORKER_QUEUE_SIZE,

@@ -377,7 +377,7 @@ def _implementation(name, end):
 
 
 DISPATCH = _implementation("dispatcher", "#else\nstatic inline void qdiag_reset_sq")
-WORKER = _implementation("worker", "#else\nstatic inline void qdiag_sample_cq")
+WORKER = _implementation("worker", "#else\nstatic inline void qdiag_sample_cq").replace('#include "swarmio_io_metrics.h"', '')
 
 
 
@@ -434,6 +434,8 @@ static void writel(u32 value, u32 *dst) {
 #define smp_load_acquire(ptr) (*(ptr))
 #define unlikely(x) (x)
 #define SWARMIO_DEBUG_RL(...) ((void)0)
+#define __cmd_io_size(ptr) 512
+#define swarmio_metrics_record(qid, bytes, ok) ((void)(qid), (void)(bytes), (void)(ok))
 #define module_param_named(name, arg, type, mode)
 #define module_param_cb(name, ops, arg, mode)
 #define MODULE_PARM_DESC(name, desc)
@@ -911,8 +913,11 @@ class LifecycleTests(unittest.TestCase):
                                  ('print("Ops/sec: 1")\n' if finished else 'print("Unexpected error")\n'))
                 manifest = {'config': config, 'environment': {'gpu': {'uuid': 'GPU-12345678'}}}
                 args = SimpleNamespace(build_dir=out, threads=None, reqs=None, queue_depth=None,
-                                       num_queues=None, random=False, access=None)
+                                       num_queues=None, random=False, access=None, monitor_interval=.1)
+                sampler = Mock()
+                monitoring = SimpleNamespace(ResourceMonitor=Mock(return_value=sampler), interval_value=float)
                 with patch.object(pipeline, 'ROOT', base), \
+                     patch.dict(sys.modules, {'swarmio_monitor': monitoring}), \
                      patch.object(pipeline, 'linux_only'), \
                      patch.object(pipeline, 'verify_session', return_value=manifest), \
                      patch.object(pipeline, 'check_no_workload'), \
@@ -929,6 +934,9 @@ class LifecycleTests(unittest.TestCase):
                 result = next((base / 'results').iterdir())
                 self.assertIn('GPU-12345678', (result / 'bench.log').read_text())
                 expected = 'completed' if finished else 'incomplete'
+                sampler.start.assert_called_once()
+                sampler.stop.assert_called_once()
+                self.assertEqual(sampler.report.call_args.args[0]['state'], expected)
                 self.assertEqual(json.loads((result / 'run.json').read_text())['state'], expected)
                 self.assertEqual(json.loads((out / 'loaded.json').read_text())['run_state'], expected)
 
