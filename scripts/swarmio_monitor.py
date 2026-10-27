@@ -5,6 +5,7 @@
 GPU 通过一个常驻 nvidia-smi 子进程采样，绝不向 benchmark 或内核线程发送信号。
 """
 import argparse
+import contextlib
 import csv
 import datetime as dt
 import html
@@ -15,11 +16,20 @@ from pathlib import Path
 import re
 import statistics
 import subprocess
+import sys
 import threading
 import time
 
 PROC = Path('/proc')
 METRICS = Path('/sys/module/swarmio/parameters/io_metrics')
+LATENCY_SWITCH = Path('/sys/module/swarmio/parameters/io_latency')
+BAR_COUNTERS = {'bar_ios_total': 'latency_ios', 'bar_segments_total': 'segments',
+                'bar_map_ns_total': 'map_ns', 'bar_copy_ns_total': 'copy_ns',
+                'bar_unmap_ns_total': 'unmap_ns', 'bar_span_ns_total': 'bar_ns',
+                'bar_xfer_ns_total': 'xfer_ns', 'bar_request_ns_total': 'request_ns'}
+BAR_AVERAGES = {'bar_map_us': 'bar_map_ns_total', 'bar_copy_us': 'bar_copy_ns_total',
+                'bar_unmap_us': 'bar_unmap_ns_total', 'bar_span_us': 'bar_span_ns_total',
+                'bar_xfer_us': 'bar_xfer_ns_total', 'bar_request_us': 'bar_request_ns_total'}
 GPU_FIELDS = ('gpu_busy_pct', 'gpu_memory_busy_pct', 'gpu_memory_used_mib',
               'gpu_memory_total_mib', 'gpu_power_w', 'gpu_temperature_c')
 FIELDS = ('time', 'elapsed_s', 'sample_duration_s', 'gpu_age_s', *GPU_FIELDS,
@@ -27,7 +37,9 @@ FIELDS = ('time', 'elapsed_s', 'sample_duration_s', 'gpu_age_s', *GPU_FIELDS,
           'host_memory_used_mib', 'host_memory_available_mib', 'host_swap_used_mib',
           'bam_cpu_pct', 'bam_rss_mib', 'swarmio_cpu_pct', 'monitor_cpu_pct',
           'nvidia_smi_cpu_pct', 'nvme_ops_total', 'nvme_bytes_total', 'nvme_errors_total',
-          'nvme_sample_ns', 'nvme_iops', 'nvme_bandwidth_gib_s')
+          'nvme_sample_ns', 'nvme_iops', 'nvme_miops', 'nvme_bandwidth_gib_s',
+          *BAR_COUNTERS, *BAR_AVERAGES, 'bar_calls_us', 'bar_calls_share_xfer_pct',
+          'bar_calls_share_request_pct')
 NOTES = [
     'GPU 指标为所选 GPU 整卡数据；显存占用不等于 BaM 独占用量。',
     'GPU busy 为采样窗口内执行 kernel 的时间比例，包含轮询；不是 SM occupancy 或算术单元利用率。',
@@ -39,6 +51,11 @@ NOTES = [
     '完成计数表示 CPU 已发布 CQE，不证明 GPU 已观察到它；各队列顺序聚合存在微小采样偏差。',
     '资源图从 benchmark 进程启动附近开始，包含初始化与清理；BaM 平均吞吐只覆盖其 kernel 计时区间。',
     '采样自身会产生开销。此工具不测 PCIe 链路吞吐、DRAM 带宽或 GPU warp/SM occupancy。',
+    'BAR 延迟仅统计启用打点且成功完成的 GPU 数据命令，包含 BaM 额外读；不保存逐请求时间序列。',
+    'map/copy/unmap 为 CPU 调用耗时（含可能的抢占与等待），不是 PCIe 传输到达 GPU 的完成延迟；未增加读回或 flush。',
+    'BAR span 是各数据段从 ioremap 开始至 iounmap 返回的累计时间；不含 SQ/CQ 常驻映射和 PRP 列表映射。',
+    'CPU xfer 是整个 CPU 数据搬运函数耗时；host request 是 dispatcher 开始复制 SQE 至 CPU 发布 CQE，含排队和仿真延迟，不含 GPU 端完整请求生命周期。',
+    '占比按同一批请求的累计耗时相除；累计阶段耗时/整轮墙钟时间可超过 100%，不能当成可相加的墙钟时间占比。',
 ]
 
 
@@ -86,9 +103,51 @@ def task_stat(text):
 
 def io_stats(text):
     values = {key: int(value) for key, value in re.findall(r'(\w+)=(\d+)', text)}
-    if values.get('version') != 1 or not all(k in values for k in ('sample_ns', 'ops', 'bytes', 'errors')):
+    if values.get('version') not in (1, 2) or not all(k in values for k in ('sample_ns', 'ops', 'bytes', 'errors')):
         raise ValueError('不支持的 io_metrics 格式')
+    if values['version'] == 2 and not all(key in values for key in BAR_COUNTERS.values()):
+        raise ValueError('io_metrics v2 缺少延迟计数')
     return values
+
+
+@contextlib.contextmanager
+def bar_latency_mode():
+    """在启动 benchmark 前开启，离开测试范围后恢复；不清零共享累计计数。"""
+    baseline = io_stats(METRICS.read_text())
+    if baseline['version'] < 2:
+        raise ValueError('BAR 延迟需要 io_metrics v2，请重新编译并加载 SwarmIO')
+    previous = LATENCY_SWITCH.read_text().strip()
+    LATENCY_SWITCH.write_text('Y\n')
+    state = {'previous': previous, 'restored': False, 'baseline': baseline}
+    try:
+        yield state
+    finally:
+        try:
+            state['final'] = io_stats(METRICS.read_text())
+        except (OSError, ValueError) as exc:
+            state['counter_warning'] = str(exc)
+        try:
+            LATENCY_SWITCH.write_text(previous + '\n')
+            state['restored'] = True
+        except OSError as exc:
+            print('WARNING: 无法恢复 io_latency 开关：' + str(exc), file=sys.stderr)
+
+
+def bar_interval(previous, current):
+    if previous.get('version') != 2 or current.get('version') != 2:
+        return {}
+    delta = {field: current[key] - previous[key] for field, key in BAR_COUNTERS.items()}
+    if any(value < 0 for value in delta.values()) or delta['bar_ios_total'] <= 0:
+        return {}
+    result = {field: delta[counter] / delta['bar_ios_total'] / 1000
+              for field, counter in BAR_AVERAGES.items()}
+    calls = delta['bar_map_ns_total'] + delta['bar_copy_ns_total'] + delta['bar_unmap_ns_total']
+    result['bar_calls_us'] = calls / delta['bar_ios_total'] / 1000
+    for field, denominator in (('bar_calls_share_xfer_pct', 'bar_xfer_ns_total'),
+                               ('bar_calls_share_request_pct', 'bar_request_ns_total')):
+        if delta[denominator] > 0:
+            result[field] = 100 * calls / delta[denominator]
+    return result
 
 
 def io_delta(previous, current):
@@ -235,8 +294,13 @@ class ResourceMonitor:
             current_io = io_stats(METRICS.read_text())
             row.update(nvme_ops_total=current_io['ops'], nvme_bytes_total=current_io['bytes'],
                        nvme_errors_total=current_io['errors'], nvme_sample_ns=current_io['sample_ns'])
+            if current_io['version'] == 2:
+                row.update({field: current_io[key] for field, key in BAR_COUNTERS.items()})
             if self.previous_io:
                 row['nvme_iops'], row['nvme_bandwidth_gib_s'] = io_delta(self.previous_io, current_io)
+                if row['nvme_iops'] is not None:
+                    row['nvme_miops'] = row['nvme_iops'] / 1e6
+                row.update(bar_interval(self.previous_io, current_io))
             self.previous_io = current_io
         except (OSError, ValueError) as exc:
             self.warn('无可用的全队列 io_metrics，NVMe 曲线留空；需重编译并加载新增计数的模块。' +
@@ -296,10 +360,78 @@ class ResourceMonitor:
 
     def report(self, record):
         return render(self.directory, {'interval_s': self.interval, 'gpu_uuid': self.gpu_uuid,
-                                      'warnings': self.warnings, 'run_state': record.get('state')})
+                                      'warnings': self.warnings, 'run_state': record.get('state'),
+                                      'bar_latency_requested': record.get('bar_latency_requested', False),
+                                      'bar_latency_boundary': record.get('bar_latency_setting')})
 
 
 COLORS = ('#2563eb', '#dc2626', '#059669', '#9333ea', '#d97706', '#0891b2')
+
+
+def plain_number(value):
+    """保留约四位有效数字，但永不使用科学计数法；仅用于展示。"""
+    if value is None or not math.isfinite(value):
+        return '—'
+    places = max(0, 3 - math.floor(math.log10(abs(value)))) if value else 0
+    text = format(value, f',.{places}f')
+    return text.rstrip('0').rstrip('.') if '.' in text else text
+
+
+def bar_summary(rows, metadata):
+    boundary = metadata.get('bar_latency_boundary') or {}
+    if boundary.get('baseline') and boundary.get('final'):
+        first = {field: boundary['baseline'][key] for field, key in BAR_COUNTERS.items()}
+        last = {field: boundary['final'][key] for field, key in BAR_COUNTERS.items()}
+        scope = 'benchmark 进程启动前至运行退出/中断后的计数边界；未完成请求不在成功统计中'
+    else:
+        valid = [row for row in rows if all(number(row.get(key)) is not None for key in BAR_COUNTERS)]
+        if len(valid) < 2:
+            return None
+        first, last = valid[0], valid[-1]
+        scope = '首末有效资源采样点之间；不保证覆盖整个进程'
+    delta = {key: int(last[key]) - int(first[key]) for key in BAR_COUNTERS}
+    if any(value < 0 for value in delta.values()) or delta['bar_ios_total'] <= 0:
+        return None
+    ios, xfer, request = delta['bar_ios_total'], delta['bar_xfer_ns_total'], delta['bar_request_ns_total']
+    calls = sum(delta[key] for key in ('bar_map_ns_total', 'bar_copy_ns_total', 'bar_unmap_ns_total'))
+    stage_times = [('ioremap', delta['bar_map_ns_total']), ('memcpy_toio/fromio', delta['bar_copy_ns_total']),
+                   ('iounmap', delta['bar_unmap_ns_total']), ('three_calls_sum', calls),
+                   ('bar_span', delta['bar_span_ns_total']), ('cpu_xfer', xfer), ('host_request', request)]
+    stages = {name: {'total_ns': ns, 'total_ms': ns / 1e6, 'avg_us_per_io': ns / ios / 1000,
+                     'share_of_cpu_xfer_pct': 100 * ns / xfer if xfer else None,
+                     'share_of_host_request_pct': 100 * ns / request if request else None}
+              for name, ns in stage_times}
+    result = {'scope': scope, 'successful_bar_ios': ios, 'data_segments': delta['bar_segments_total'], 'stages': stages}
+    wall = metadata.get('bam_kernel_average', {}).get('elapsed_s')
+    if wall and wall > 0:
+        result['cumulative_calls_over_bam_wall_pct'] = 100 * calls / (wall * 1e9)
+        result['cumulative_bar_span_over_bam_wall_pct'] = 100 * delta['bar_span_ns_total'] / (wall * 1e9)
+        result['wall_ratio_note'] = '多 worker 累计时间/整轮墙钟时间，允许超过 100%；不是串行墙钟占比。'
+    return result
+
+
+def bar_table(summary):
+    if not summary:
+        return '<h2>GPU BAR 延迟</h2><p>无有效延迟数据。启用 --bar-latency 并加载 io_metrics v2 模块后重新测试；历史数据无法补算。</p>'
+    labels = {'ioremap': 'ioremap', 'memcpy_toio/fromio': 'memcpy_toio / memcpy_fromio', 'iounmap': 'iounmap',
+              'three_calls_sum': '三段调用合计', 'bar_span': 'BAR 整段（含段内其他处理）',
+              'cpu_xfer': '整个 CPU 数据搬运函数', 'host_request': '主机侧请求（含排队和仿真延迟）'}
+    out = '<h2>GPU BAR 延迟汇总</h2><p>' + html.escape(summary['scope']) + '</p>'
+    out += '<p>成功 BAR 命令数：' + plain_number(summary['successful_bar_ios'])
+    out += '；数据段数：' + plain_number(summary['data_segments']) + '。平均值按命令计，包含该命令的所有数据段。</p>'
+    out += '<table><thead><tr><th>阶段</th><th>累计耗时 ms</th><th>平均 μs/命令</th><th>占 CPU 搬运函数 %</th><th>占主机请求延迟 %</th></tr></thead><tbody>'
+    for name, values in summary['stages'].items():
+        # 整个请求包含排队，不放到 CPU 搬运函数内部占比列，避免误读。
+        fraction = None if name == 'host_request' else values['share_of_cpu_xfer_pct']
+        out += '<tr><td>' + labels[name] + '</td>'
+        for value in (values['total_ms'], values['avg_us_per_io'], fraction, values['share_of_host_request_pct']):
+            out += '<td>' + plain_number(value) + '</td>'
+        out += '</tr>'
+    out += '</tbody></table>'
+    if 'cumulative_calls_over_bam_wall_pct' in summary:
+        out += '<p>三段调用累计耗时 / BaM 整轮墙钟时间：' + plain_number(summary['cumulative_calls_over_bam_wall_pct'])
+        out += '%。' + html.escape(summary['wall_ratio_note']) + '</p>'
+    return out
 
 
 def chart(rows, title, series, unit):
@@ -315,9 +447,9 @@ def chart(rows, title, series, unit):
     for i in range(5):
         y = top + ph * i / 4
         out += [f'<path d="M {left} {y} H {left+pw}" stroke="#e2e8f0"/>',
-                f'<text x="{left-8}" y="{y+4}" text-anchor="end">{ymax*(1-i/4):.3g}</text>']
+                f'<text x="{left-8}" y="{y+4}" text-anchor="end">{plain_number(ymax*(1-i/4))}</text>']
         x = left + pw * i / 4
-        out.append(f'<text x="{x}" y="{top+ph+18}" text-anchor="middle">{xmax*i/4:.3g}</text>')
+        out.append(f'<text x="{x}" y="{top+ph+18}" text-anchor="middle">{plain_number(xmax*i/4)}</text>')
     out += [f'<text x="{left}" y="{top-10}">{html.escape(unit)}</text>',
             f'<text x="{left+pw}" y="{top+ph+37}" text-anchor="end">Elapsed seconds</text>']
     for index, (key, label) in enumerate(series):
@@ -355,6 +487,9 @@ def render(directory, metadata=None):
     if path.exists():
         with path.open() as stream:
             rows = list(csv.DictReader(stream))
+    for row in rows:
+        iops = number(row.get('nvme_iops'))
+        row['nvme_miops'] = iops / 1e6 if iops is not None else None
     bench = (directory / 'bench.log').read_text(errors='replace') if (directory / 'bench.log').exists() else ''
     match = re.search(r'Elapsed Time:\s*([\deE+.-]+)\s+Number of Ops:\s*(\d+)\s+Data Size \(bytes\):\s*(\d+)', bench)
     if match:
@@ -385,6 +520,10 @@ def render(directory, metadata=None):
         if elapsed > 0 and ops >= 0 and size >= 0:
             metadata['nvme_monitor_window'] = {'elapsed_s': elapsed, 'ops': ops, 'bytes': size,
                 'iops': ops / elapsed, 'bandwidth_gib_s': size / elapsed / 2**30}
+    metadata.pop('gpu_bar_latency', None)
+    latency = bar_summary(rows, metadata)
+    if latency:
+        metadata['gpu_bar_latency'] = latency
     panels = [
         ('gpu-utilization', 'GPU activity', [('gpu_busy_pct', 'Kernel busy'), ('gpu_memory_busy_pct', 'Memory busy')], '%'),
         ('gpu-memory', 'GPU device memory', [('gpu_memory_used_mib', 'Used'), ('gpu_memory_total_mib', 'Total')], 'MiB'),
@@ -393,9 +532,13 @@ def render(directory, metadata=None):
             ('monitor_cpu_pct', 'Python runner'), ('nvidia_smi_cpu_pct', 'GPU sampler')], '%'),
         ('host-memory', 'Host memory', [('host_memory_used_pct', 'Used / total')], '%'),
         ('bam-memory', 'BaM host resident memory', [('bam_rss_mib', 'RSS')], 'MiB'),
-        ('nvme-iops', 'SwarmIO successful NVMe completions (including extra reads)', [('nvme_iops', 'NVMe IOPS')], 'ops/s'),
+        ('nvme-iops', 'SwarmIO successful NVMe completions (including extra reads)', [('nvme_miops', 'NVMe MIOPS')], 'MIOPS'),
         ('nvme-bandwidth', 'SwarmIO completed command payload', [('nvme_bandwidth_gib_s', 'NVMe bandwidth')], 'GiB/s'),
         ('gpu-power', 'GPU power', [('gpu_power_w', 'Power')], 'W'),
+        ('bar-latency', 'GPU BAR mean CPU call latency per completed command',
+            [('bar_map_us', 'ioremap'), ('bar_copy_us', 'memcpy_toio/fromio'), ('bar_unmap_us', 'iounmap')], 'us / command'),
+        ('bar-latency-share', 'Three calls / CPU transfer function and host request latency',
+            [('bar_calls_share_xfer_pct', 'Calls / CPU xfer'), ('bar_calls_share_request_pct', 'Calls / host req')], '%'),
     ]
     images = []
     for name, title, series, unit in panels:
@@ -424,8 +567,9 @@ def render(directory, metadata=None):
     (directory / 'monitor-summary.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + '\n')
     title = 'BaM + SwarmIO 资源与吞吐采样'
     content = '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>' + title + '</title>'
-    content += '<style>body{font:15px system-ui;margin:24px auto;padding:0 18px;max-width:1100px;background:#f1f5f9;color:#0f172a}section{background:white;margin:18px 0;border-radius:8px}svg{width:100%;height:auto}li{margin:8px 0}pre{white-space:pre-wrap;background:white;padding:16px}</style>'
+    content += '<style>body{font:15px system-ui;margin:24px auto;padding:0 18px;max-width:1100px;background:#f1f5f9;color:#0f172a}section{background:white;margin:18px 0;border-radius:8px}svg{width:100%;height:auto}li{margin:8px 0}pre{white-space:pre-wrap;background:white;padding:16px}table{border-collapse:collapse;width:100%;background:white}th,td{padding:10px;border-bottom:1px solid #e2e8f0;text-align:right}th:first-child,td:first-child{text-align:left}</style>'
     content += '<h1>' + title + '</h1><p>CSV 保留原始采样；空白表示不可用，不代表零。图表可单独保存为 SVG。</p>'
+    content += bar_table(latency)
     content += '<pre>' + html.escape(json.dumps({k: v for k, v in metadata.items() if k != 'notes'}, ensure_ascii=False, indent=2)) + '</pre>'
     content += '<ul>' + ''.join('<li>' + html.escape(n) + '</li>' for n in NOTES) + '</ul>'
     content += '<p>指标含义参考 <a href="https://docs.nvidia.com/deploy/nvidia-smi/index.html">NVIDIA nvidia-smi 官方文档</a>。</p>'

@@ -5,6 +5,7 @@
 """
 import argparse
 import csv
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -579,9 +580,16 @@ def run(args):
         bench['access_type'] = {'read': 0, 'write': 1}[args.access]
     validate_benchmark(bench, manifest['config'])
     monitor_interval = getattr(args, 'monitor_interval', None)
+    bar_latency = getattr(args, 'bar_latency', False)
+    if bar_latency and monitor_interval is None:
+        raise Error('--bar-latency 必须配合 --monitor-interval 使用')
+    latency_context = contextlib.nullcontext()
     if monitor_interval is not None:
         from swarmio_monitor import ResourceMonitor, interval_value
         monitor_interval = interval_value(monitor_interval)
+    if bar_latency:
+        from swarmio_monitor import bar_latency_mode
+        latency_context = bar_latency_mode()
     check_library(args.build_dir / ARTIFACTS[3], args.build_dir / ARTIFACTS[2])
     directory = ROOT / 'results' / dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
     directory.mkdir(parents=True)
@@ -591,11 +599,14 @@ def run(args):
     child_env['LD_LIBRARY_PATH'] = str(args.build_dir / 'bam/lib') + (
         os.pathsep + child_env['LD_LIBRARY_PATH'] if child_env.get('LD_LIBRARY_PATH') else '')
     record = {'command': command, 'gpu': manifest['environment']['gpu'], 'state': 'running',
-              'build_manifest_sha256': digest(args.build_dir / 'manifest.json')}
+              'build_manifest_sha256': digest(args.build_dir / 'manifest.json'),
+              'bar_latency_requested': bar_latency}
     print('输出目录：', directory, flush=True)
     (directory / 'before.log').write_text(snapshot())
     interrupted = [None]
-    with (directory / 'bench.log').open('wb') as log, (directory / 'bench.log').open('r') as tail:
+    with latency_context as latency_setting, (directory / 'bench.log').open('wb') as log, (directory / 'bench.log').open('r') as tail:
+        if latency_setting is not None:
+            record['bar_latency_setting'] = latency_setting
         process = subprocess.Popen(command, env=child_env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         monitor = None
         record['pid'] = process.pid
@@ -726,6 +737,8 @@ def main():
     p.add_argument('--access', choices=('read', 'write'))
     p.add_argument('--monitor-interval', type=interval_value,
                    help='启用资源及 NVMe 吞吐采样，单位秒，例如 0.1；范围 0.01..60，默认关闭')
+    p.add_argument('--bar-latency', action='store_true',
+                   help='配合监控记录 GPU BAR map/copy/unmap 平均耗时和累计占比，默认关闭')
     p = commands.add_parser('status', help='只读收集队列、进程、线程栈和内核日志')
     p.add_argument('--output', type=Path)
     commands.add_parser('unload', help='仅在无负载和无内核异常时正常卸载')

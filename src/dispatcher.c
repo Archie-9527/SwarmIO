@@ -604,6 +604,14 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 
 	/* copy cmd */
 	w = local_queue->works + local_queue->tail;
+	/* 请求延迟从 dispatcher 开始复制本条 SQE 算起，至 CPU 发布 CQE。
+	 * 不含 GPU 提交前等待和 GPU 观察 CQE 后的收尾时间。
+	 */
+	w->bar_timing.enabled = READ_ONCE(swarmio_io_latency_enabled);
+	if (w->bar_timing.enabled) {
+		w->bar_timing = (struct swarmio_bar_timing){ .enabled = true };
+		w->bar_timing.start_ns = ktime_get_ns();
+	}
 #ifdef CONFIG_SWARMIO_DISP_COALESCE_SQE
 	src = sq->cmd_buffer + sq_entry;
 #else

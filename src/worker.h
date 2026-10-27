@@ -8,6 +8,7 @@
 #define _SWARMIO_WORKER_H
 
 #include "common.h"
+#include "swarmio_io_timing.h"
 
 struct swarmio_dispatcher;
 struct swarmio_commit_queue;
@@ -21,6 +22,7 @@ typedef struct dsa_dma_ctx_single dma_ctx_t;
 
 struct swarmio_io_work {
 	struct nvme_command cmd;
+	struct swarmio_bar_timing bar_timing;
 
 	union {
 		struct nvme_completion cqe;

@@ -60,6 +60,11 @@ static inline void __swarmio_disable_worker_dma(void)
 #include "swarmio_queue_diagnostics.h"
 #include "swarmio_io_metrics.h"
 
+/* 按请求保存开关快照，中途修改不会把同一请求的各阶段混用两套口径。 */
+bool swarmio_io_latency_enabled;
+module_param_named(io_latency, swarmio_io_latency_enabled, bool, 0644);
+MODULE_PARM_DESC(io_latency, "Measure CPU GPU-BAR map/copy/unmap call times (default off)");
+
 #ifdef CONFIG_SWARMIO_QUEUE_DIAGNOSTICS
 module_param_cb(qdiag_cq_state, &qdiag_ops, NULL, 0444);
 /* cq_head_abs 累计实际观察到的 doorbell 前进距离，不能恢复未观察到的完整一圈。 */
@@ -224,7 +229,7 @@ static bool __fill_cq_result(struct swarmio_io_work *w)
 	}
 	/* 只在 CQE 成功发布后累计一次，bytes 使用真实命令长度，包含额外读。 */
 	swarmio_metrics_record(sqid, __cmd_io_size(&w->cmd.rw),
-			       !(le16_to_cpu(cqe_src->status) & ~1U));
+			       !(le16_to_cpu(cqe_src->status) & ~1U), &w->bar_timing);
 #ifdef CONFIG_SWARMIO_QUEUE_DIAGNOSTICS
     /* Record the source bytes after the existing write; do not read back VRAM. */
     if (sqid == READ_ONCE(swarmio_qdiag_qid)) {
@@ -304,8 +309,10 @@ static inline void __swarmio_dma_cb(void *data)
 }
 
 /* CPU 后端：主机 RAM 与 GPU BAR 分别使用普通内存和 I/O 访问接口。 */
-static int __swarmio_xfer_data(struct nvme_rw_command *cmd)
+static int __swarmio_xfer_data(struct nvme_rw_command *cmd,
+			      struct swarmio_bar_timing *timing)
 {
+	u64 xfer_start = timing->enabled ? ktime_get_ns() : 0;
 	size_t offset = __cmd_io_offset(cmd);
 	size_t remaining = __cmd_io_size(cmd);
 	size_t nsid = cmd->nsid - 1;
@@ -320,6 +327,7 @@ static int __swarmio_xfer_data(struct nvme_rw_command *cmd)
 		void *base;
 		bool data_io;
 		size_t mem_offs, io_size;
+		u64 map_start = 0, stage_start = 0, unmap_end;
 
 		if (prp_offs == 0) {
 			paddr = cmd->dptr.prp1;
@@ -351,17 +359,23 @@ static int __swarmio_xfer_data(struct nvme_rw_command *cmd)
 		}
 
 		data_io = !pfn_valid(paddr >> PAGE_SHIFT);
+		if (data_io && timing->enabled)
+			map_start = ktime_get_ns();
 		/* ioremap 会保留物理地址偏移，故必须映射页基址，只加一次页内偏移。 */
 		if (data_io)
 			base = ioremap(paddr & PAGE_MASK, PAGE_SIZE);
 		else
 			base = kmap_local_page(pfn_to_page(paddr >> PAGE_SHIFT));
+		if (data_io && timing->enabled)
+			timing->map_ns += ktime_get_ns() - map_start;
 		if (!base) {
 			ret = -ENOMEM;
 			goto out;
 		}
 		mem_offs = paddr & PAGE_OFFSET_MASK;
 		io_size = min_t(size_t, remaining, PAGE_SIZE - mem_offs);
+		if (data_io && timing->enabled)
+			stage_start = ktime_get_ns();
 		if (cmd->opcode == nvme_cmd_write || cmd->opcode == nvme_cmd_zone_append) {
 			if (data_io)
 				memcpy_fromio(vdev->ns[nsid].mapped + offset,
@@ -375,10 +389,20 @@ static int __swarmio_xfer_data(struct nvme_rw_command *cmd)
 			else
 				memcpy(base + mem_offs, vdev->ns[nsid].mapped + offset, io_size);
 		}
+		if (data_io && timing->enabled)
+			timing->copy_ns += ktime_get_ns() - stage_start;
+		if (data_io && timing->enabled)
+			stage_start = ktime_get_ns();
 		if (data_io)
 			iounmap(base);
 		else
 			kunmap_local(base);
+		if (data_io && timing->enabled) {
+			unmap_end = ktime_get_ns();
+			timing->unmap_ns += unmap_end - stage_start;
+			timing->bar_ns += unmap_end - map_start;
+			timing->segments++;
+		}
 		remaining -= io_size;
 		offset += io_size;
 		prp_offs++;
@@ -390,6 +414,8 @@ out:
 		else
 			kunmap_local(list_base);
 	}
+	if (timing->enabled)
+		timing->xfer_ns += ktime_get_ns() - xfer_start;
 	return ret;
 }
 
@@ -563,7 +589,7 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 						worker->paddr_list);
 					if (unlikely(ret)) {
 						__swarmio_disable_worker_dma();
-						if (__swarmio_xfer_data(&w->cmd.rw))
+						if (__swarmio_xfer_data(&w->cmd.rw, &w->bar_timing))
 							w->cqe.status = cpu_to_le16(NVME_SC_INTERNAL << 1);
 						__swarmio_mark_copied(w);
 					}
@@ -578,7 +604,7 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 					w->nsecs_issued = ktime_get_ns();
 #endif
 #ifndef CONFIG_SWARMIO_WORKER_SKIP_IO
-					if (__swarmio_xfer_data(&w->cmd.rw))
+					if (__swarmio_xfer_data(&w->cmd.rw, &w->bar_timing))
 						w->cqe.status = cpu_to_le16(NVME_SC_INTERNAL << 1);
 #endif
 					__swarmio_mark_copied(w);

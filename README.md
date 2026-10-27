@@ -337,7 +337,7 @@ python3 scripts/swarmio_bam.py --build-dir build-metrics build \
 | `cpu-cores.csv` | 主机逐 CPU 核 busy/iowait |
 | `tasks.csv` | BaM 进程、SwarmIO 各内核线程及监控进程的 CPU/RSS 明细 |
 | `gpu-raw.csv`、`gpu-sampler.log` | 收到的 GPU 指标及采样进程错误输出 |
-| `monitor-summary.json` | 实际采样间隔、采样耗时、告警、BaM 平均逻辑吞吐与监控窗口实际吞吐 |
+| `monitor-summary.json` | 实际采样间隔、采样耗时、告警、BaM 平均逻辑吞吐、实际吞吐及可选 BAR 延迟汇总 |
 | `monitor.html`、`*.svg` | 可离线打开的完整图表报告，以及可单独导出的矢量图 |
 
 正常完成或统一入口处理 SIGINT/失败后都会尝试生成报告；原始 CSV 逐次刷新。
@@ -346,6 +346,67 @@ python3 scripts/swarmio_bam.py --build-dir build-metrics build \
 ```bash
 python3 scripts/swarmio_monitor.py results/<实际目录名>
 ```
+
+所有图表坐标使用普通小数，不使用科学计数法；`nvme-iops.svg` 采用 **MIOPS**，
+即 `1 MIOPS = 1,000,000 次/秒`。CSV 的 `nvme_iops` 仍保留原始 ops/s。
+重绘历史 CSV 即可更新坐标格式，不需要重跑 I/O；历史未采集的延迟无法补算。
+
+### GPU BAR 映射、复制与解映射延迟
+
+显式增加 `--bar-latency`，并配合 `--monitor-interval`：
+
+```bash
+sudo python3 scripts/swarmio_bam.py --build-dir build-bar-latency run \
+  --random --access read --threads 4096 --reqs 512 \
+  --num-queues 16 --queue-depth 512 --page-size 4096 --num-blks 262144 \
+  --monitor-interval 0.1 --bar-latency
+```
+
+延迟功能需要新的 `io_metrics version=2` 模块、dispatcher 和 worker 修改，
+以及 `src/swarmio_io_timing.h`。同步完整源码后，在新目录编译并切换模块：
+
+```bash
+sudo python3 scripts/swarmio_bam.py --build-dir build-bar-latency build \
+  --jobs 8 --cuda-root /usr/local/cuda-12.4
+# 旧测试已正常完成时，以实际加载目录执行 unload；例如：
+sudo python3 scripts/swarmio_bam.py --build-dir build-metrics unload
+sudo python3 scripts/swarmio_bam.py --build-dir build-bar-latency load
+```
+
+脚本在启动 benchmark 前开启 `io_latency`，退出测试范围后恢复原开关；
+不清零模块累计计数，而是在 `run.json` 保存启动前/结束后的计数边界。
+这样最终汇总覆盖这次进程范围内成功完成的 BAR 请求，而非仅首末资源采样点之间的请求。
+发生失败/中断时也恢复开关；已在途请求使用其入队时保存的开关快照。
+默认不打延迟时间戳，开启后会增加计时及计数开销，应与关闭时的结果比较。
+
+`monitor.html` 增加延迟汇总表，`monitor-summary.json` 的 `gpu_bar_latency` 保存原始累计纳秒与计算结果：
+
+| 指标 | 统计含义 |
+| --- | --- |
+| ioremap / memcpy_toio（写入 GPU）或 memcpy_fromio / iounmap | 分别累计 CPU 调用耗时，输出累计 ms 和平均 μs/成功 NVMe 命令 |
+| 三段调用合计 | 上述三项累计值之和 |
+| BAR span | 每个 GPU 数据段从 ioremap 开始到 iounmap 返回，包含段内其他处理；多段请求取所有段之和 |
+| CPU xfer | 整个 CPU 数据搬运函数，含 PRP 解析、主机/设备页处理等 |
+| host request | dispatcher 开始复制该 SQE 至 CPU 发布 CQE，含本地队列等待、搬运及仿真延迟 |
+
+平均值分母为成功且开启计时的 **NVMe 命令数**，包含 BaM 的额外读；不是 `threads × reqs`。
+失败命令、未完成请求、完全使用主机 RAM 的请求不进入 BAR 成功延迟汇总。
+数据段数量另外记录；跨页命令的每段映射/复制/解映射都计入该命令，避免把调用次数当作请求次数。
+不输出逐请求明细，仅维护队列累计计数和采样区间平均值。
+`bar-latency.svg` 展示区间平均调用耗时，`bar-latency-share.svg` 展示区间累计占比。
+
+报告同时给出三种不同的比值：
+
+1. `三段累计耗时 / 同批请求的 CPU xfer 累计耗时`：定位数据搬运函数内部开销。
+2. `三段累计耗时 / 同批请求的 host request 累计延迟`：包含排队与仿真延迟的主机请求口径。
+3. `三段累计耗时 / BaM 整轮墙钟时间`：多 worker 会并行，结果可超过 100%，**不是串行墙钟占比**。
+
+不会把累计耗时误当成墙钟上可相加的分段；也不会把主机侧请求延迟称为 GPU 端到端延迟。
+若需所有 worker 的区间并集/真实墙钟覆盖比例，需要另外记录事件时间线，本功能不采集逐请求事件。
+测量仅包围 GPU **数据页**的三个 CPU 调用，不包含 SQ/CQ 常驻映射和 PRP 列表映射。
+CPU 调用耗时含可能的抢占和等待；`memcpy_toio` 返回并不证明 PCIe posted writes 已到达 GPU，
+本功能没有插入读回/flush 来改变原测试的行为。参考
+[Linux 设备 I/O 文档](https://docs.kernel.org/6.8/driver-api/device-io.html)。
 
 图表口径：
 
@@ -420,13 +481,13 @@ CPU 数据路径及 PRP 列表同样区分 RAM/BAR，并映射物理页基址后
 | `Kbuild`、`dsa/dsa.h`、`dsa/stub.c` | CPU 构建不依赖 idxd 私有实现 |
 | `src/dispatcher.c`、`src/swarmio_sq_diagnostics.h` | SQ 读取与非法命令保护 |
 | `src/dispatcher.c`、`src/worker.c`、`src/swarmio_queue_diagnostics.h` | 队列状态与回绕计数 |
-| `src/swarmio_io_metrics.h`、`scripts/swarmio_monitor.py` | 全队列实际完成计数、资源采样和离线图表 |
+| `src/swarmio_io_metrics.h`、`src/swarmio_io_timing.h`、`scripts/swarmio_monitor.py` | 全队列完成计数、BAR 延迟累计、资源采样和离线图表 |
 | `nvmev/admin.c`、`src/worker.c`、`src/committer.c` | GPU BAR 非缓存映射、CQ 发布顺序、CPU PRP 偏移及映射释放 |
 | `src/main.c`、`src/worker.c` | 只读 full-I/O 编译模式 |
 | `bam/module/ctrl.c`、`ctrl.h`、`pci.c`、`map.c` | miscdevice、新内核和 NVIDIA P2P 兼容 |
 | `bam/CMakeLists.txt`、`bam/include/`、`bam/benchmarks/`、`bam/src/` | CUDA CCCL/C++17、API 与 benchmark 适配 |
 
-开发机本地已通过 29 项源码与入口回归检查，不加载 Linux 模块或执行 GPU I/O：
+开发机本地已通过 32 项源码与入口回归检查，不加载 Linux 模块或执行 GPU I/O：
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -444,4 +505,6 @@ CPU PRP 全部 512 B 页内位置的读写哨兵、跨页/列表复制及映射�
 对象文件与 Python 缓存均不进入源码提交。
 监控检查覆盖 20 ms 采样、流式 GPU 子进程替身、CPU guest 时间去重、PID stat 解析、
 实际内核计数实现的跨 QID/不同请求大小/错误计数、SVG 格式与缺失指标重绘。
+还覆盖 MIOPS 与普通小数坐标、实际 CPU 搬运函数的三阶段时钟、关闭计时不读时钟、
+加权平均与累计占比、并行累计时间/墙钟比超过 100%、异常退出恢复延迟开关。
 这些检查没有在开发机加载 NVIDIA 驱动或 Linux 模块，目标机计数与监控开销仍需实测。

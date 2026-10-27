@@ -435,7 +435,7 @@ static void writel(u32 value, u32 *dst) {
 #define unlikely(x) (x)
 #define SWARMIO_DEBUG_RL(...) ((void)0)
 #define __cmd_io_size(ptr) 512
-#define swarmio_metrics_record(qid, bytes, ok) ((void)(qid), (void)(bytes), (void)(ok))
+#define swarmio_metrics_record(qid, bytes, ok, timing) ((void)(qid), (void)(bytes), (void)(ok))
 #define module_param_named(name, arg, type, mode)
 #define module_param_cb(name, ops, arg, mode)
 #define MODULE_PARM_DESC(name, desc)
@@ -609,6 +609,9 @@ struct nvme_rw_command { int opcode, nsid; size_t length; struct { u64 prp1, prp
 static unsigned char gpu[8 * PAGE_SIZE], ram[8 * PAGE_SIZE], disk[8 * PAGE_SIZE];
 static struct { struct { void *mapped; } ns[1]; } device, *vdev = &device;
 static int active, io_reads, io_writes, fail_map;
+static u64 test_clock;
+static int clock_reads;
+static u64 ktime_get_ns(void) { ++clock_reads; return test_clock; }
 static size_t __cmd_io_offset(struct nvme_rw_command *c) { (void)c; return 0; }
 static size_t __cmd_io_size(struct nvme_rw_command *c) { return c->length; }
 static bool pfn_valid(u64 pfn) { return pfn < 0xf0000000UL / PAGE_SIZE; }
@@ -617,16 +620,18 @@ static void *kmap_local_page(void *page) { ++active; return page; }
 static void kunmap_local(void *p) { assert(((uintptr_t)p - (uintptr_t)ram) % PAGE_SIZE == 0); --active; }
 static void *ioremap(u64 addr, size_t n) {
     assert(addr % PAGE_SIZE == 0 && n == PAGE_SIZE);
+    test_clock += 100;
     if (fail_map) return NULL;
     assert(addr >= 0xf0000000 && addr + n <= 0xf0000000 + sizeof(gpu));
     ++active; return gpu + (addr - 0xf0000000);
 }
-static void iounmap(void *p) { assert(((uintptr_t)p - (uintptr_t)gpu) % PAGE_SIZE == 0); --active; }
-static void memcpy_fromio(void *dst, const void *src, size_t n) { ++io_reads; memcpy(dst, src, n); }
-static void memcpy_toio(void *dst, const void *src, size_t n) { ++io_writes; memcpy(dst, src, n); }
+static void iounmap(void *p) { test_clock += 50; assert(((uintptr_t)p - (uintptr_t)gpu) % PAGE_SIZE == 0); --active; }
+static void memcpy_fromio(void *dst, const void *src, size_t n) { test_clock += 200; ++io_reads; memcpy(dst, src, n); }
+static void memcpy_toio(void *dst, const void *src, size_t n) { test_clock += 200; ++io_writes; memcpy(dst, src, n); }
 '''
         checks = r'''
 int main(void) {
+    struct swarmio_bar_timing timing = {0};
     device.ns[0].mapped = disk;
     for (size_t i=0; i<sizeof(disk); ++i) disk[i] = (unsigned char)(i * 7 + i / 512);
     /* 每个 512 B 页内位置都检查前后哨兵，捕获重复加偏移及邻接内存破坏。 */
@@ -637,38 +642,46 @@ int main(void) {
             memset(target, 0xa5, sizeof(gpu));
             struct nvme_rw_command c = { .opcode=nvme_cmd_read, .nsid=1, .length=512,
                 .dptr={phys+off,0} };
-            assert(__swarmio_xfer_data(&c)==0 && active==0);
+            assert(__swarmio_xfer_data(&c, &timing)==0 && active==0);
             assert(!memcmp(target+off, disk, 512));
             for (size_t i=0; i<sizeof(gpu); ++i)
                 if (i<off || i>=off+512) assert(target[i]==0xa5);
             memset(disk, 0, 512); c.opcode=nvme_cmd_write;
-            assert(__swarmio_xfer_data(&c)==0 && active==0);
+            assert(__swarmio_xfer_data(&c, &timing)==0 && active==0);
             assert(!memcmp(target+off, disk, 512));
             memset(disk, 0x6b, 512);
         }
         /* PRP1 跨页 + PRP2 直接页地址。 */
         struct nvme_rw_command c = { .opcode=nvme_cmd_read, .nsid=1, .length=1024,
             .dptr={phys+3584,phys+PAGE_SIZE} };
-        assert(__swarmio_xfer_data(&c)==0 && active==0);
+        assert(__swarmio_xfer_data(&c, &timing)==0 && active==0);
         assert(!memcmp(target+3584,disk,1024));
         /* 偏移 8 B 的 PRP 列表必须用原始页基址释放；列表可在 RAM 或 BAR。 */
         u64 list[2] = {phys+PAGE_SIZE,phys+2*PAGE_SIZE};
         memcpy(target+4*PAGE_SIZE+8,list,sizeof(list));
         c.length=3*PAGE_SIZE; c.dptr.prp1=phys; c.dptr.prp2=phys+4*PAGE_SIZE+8;
-        assert(__swarmio_xfer_data(&c)==0 && active==0);
+        assert(__swarmio_xfer_data(&c, &timing)==0 && active==0);
         assert(!memcmp(target,disk,3*PAGE_SIZE));
     }
     assert(io_reads>0 && io_writes>0);
+    assert(clock_reads==0);
+    timing = (struct swarmio_bar_timing){ .enabled=true };
+    struct nvme_rw_command timed = { .opcode=nvme_cmd_read, .nsid=1, .length=4096,
+        .dptr={0xf0000000,0} };
+    assert(__swarmio_xfer_data(&timed, &timing)==0);
+    assert(timing.map_ns==100 && timing.copy_ns==200 && timing.unmap_ns==50);
+    assert(timing.bar_ns==350 && timing.xfer_ns==350 && timing.segments==1);
+    assert(clock_reads==8);
     fail_map=1;
     struct nvme_rw_command c = { .opcode=nvme_cmd_read, .nsid=1, .length=512,
         .dptr={0xf0000200,0} };
-    assert(__swarmio_xfer_data(&c)==-ENOMEM && active==0);
+    assert(__swarmio_xfer_data(&c, &timing)==-ENOMEM && active==0);
     return 0;
 }
 '''
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            (path / "probe.c").write_text(prelude + source[start:end] + checks)
+            (path / "probe.c").write_text(prelude + (ROOT / "src/swarmio_io_timing.h").read_text().replace("#include <linux/types.h>", "") + source[start:end] + checks)
             result = subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                                      str(path / "probe.c"), "-o", str(path / "probe")],
                                     capture_output=True, text=True)
