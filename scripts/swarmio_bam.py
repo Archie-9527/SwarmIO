@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SwarmIO + BaM 的统一入口：doctor/build/load/run/status/unload。
+"""SwarmIO + CoPilotIO/BaM 的统一入口：doctor/build/load/run/status/unload。
 
 支持当前 CPU full-I/O 的 512 B/4 KiB 请求。所有实现来自仓库源码，不生成源码补丁。
 """
@@ -23,7 +23,9 @@ ROOT = Path(__file__).resolve().parents[1]
 PCI = Path('/sys/bus/pci/devices')
 MODULES = Path('/sys/module')
 ARTIFACTS = ('swarmio/swarmio.ko', 'libnvm/libnvm.ko',
-             'bam/lib/libnvm.so', 'bam/bin/nvm-block-bench')
+             'bam/lib/libnvm.so', 'bam/bin/nvm-block-bench',
+             'copilotio/lib/libnvm.so', 'copilotio/bin/nvm-block-bench',
+             'gdrcopy/src/libgdrapi.so', 'gdrcopy/src/gdrdrv/gdrdrv.ko')
 
 
 class Error(RuntimeError):
@@ -74,13 +76,16 @@ def read_symvers(path):
 def validate_sources(root):
     """兼容实现必须已在 BaM 源文件中；此处不改写源码或符号表。"""
     root = Path(root)
-    files = {name: (root / 'bam/module' / name).read_text()
+    files = {name: (root / 'copilotio/bam/module' / name).read_text()
              for name in ('ctrl.h', 'ctrl.c', 'pci.c')}
     if 'struct miscdevice' not in files['ctrl.h'] or 'misc_register(' not in files['ctrl.c']:
         raise Error('BaM 子模块尚未包含 miscdevice 兼容，请检查其提交版本')
     forbidden = r'\b(?:class_create|class_destroy|device_create|device_destroy|cdev_add|cdev_del|cdev_init)\s*\('
     if any(re.search(forbidden, text) for text in files.values()):
         raise Error('BaM 仍引用旧 cdev/class 注册接口')
+    other = {name: (root / 'copilotio/copilot-io/module' / name).read_text() for name in files}
+    if other != files:
+        raise Error('CoPilotIO 与 BaM 内核接口源码不同，不能共用 libnvm 模块')
     return files
 
 
@@ -88,6 +93,10 @@ def validate_benchmark(bench, config):
     for name in ('threads', 'blk_size', 'reqs', 'pages', 'page_size', 'num_blks', 'queue_depth', 'num_queues'):
         if type(bench[name]) is not int or bench[name] <= 0:
             raise Error(name + ' 必须为正整数')
+    if bench['pages'] < bench['threads']:
+        raise Error('pages 必须不少于 threads，避免并发请求覆盖同一缓冲页')
+    if bench['access_type'] != 0:
+        raise Error('本分支统一基准仅支持读测试')
     if bench['page_size'] not in (512, 4096) or bench['blk_size'] != 64 or bench['threads'] % 64:
         raise Error('当前支持 512 B/4096 B、block=64、线程数为 64 的倍数')
     depth = bench['queue_depth']
@@ -222,6 +231,8 @@ def environment(args, config):
     if output(['modinfo', '-F', 'version', 'nvidia']) != version:
         raise Error('磁盘上的 NVIDIA 驱动版本与已加载版本不同，请先完成驱动切换')
     gpu = gpu_info(args.gpu or config['gpu'])
+    if int(gpu['cuda_arch']) < 70:
+        raise Error('CoPilotIO 随机读基准要求 GPU compute capability >= 7.0')
     if gpu['driver'] != version:
         raise Error('nvidia-smi 与内核 NVIDIA 驱动版本不一致')
     if 'sm_' + gpu['cuda_arch'] not in output([str(nvcc), '--list-gpu-code']).split():
@@ -248,13 +259,13 @@ def source_inventory(root):
     paths = output(['git', '-C', str(root), 'ls-files', '-z', '--cached', '--others', '--exclude-standard']).split('\0')
     return {name: digest(root / name) for name in sorted(set(paths)) if name and (root / name).is_file()
             and ((root / name).suffix in {'.c', '.h', '.cu', '.cuh', '.cpp', '.py', '.in', '.json'}
-                 or (root / name).name in {'Makefile', 'Kbuild', 'CMakeLists.txt'})}
+                 or (root / name).name in {'Makefile', 'Kbuild', 'CMakeLists.txt', 'swarmio-CMakeLists.txt'})}
 
 
-def audit_libnvm(module, kernel_symbols, nvidia_symbols):
+def audit_libnvm(module, kernel_symbols, nvidia_symbols, allow_gpl=False):
     undefined = {line.split()[-1] for line in output(['nm', '-u', str(module)]).splitlines() if line.split()}
     forbidden = sorted(name for name in undefined if 'GPL' in kernel_symbols.get(name, {}).get('export', ''))
-    if forbidden:
+    if forbidden and not allow_gpl:
         raise Error('libnvm 仍引用 GPL-only 符号：' + ', '.join(forbidden))
     imported = {}
     for line in output(['modprobe', '--show-modversions', str(module)]).splitlines():
@@ -285,15 +296,15 @@ def build(args, config):
     out = args.build_dir
     if args.jobs < 1:
         raise Error('jobs 必须为正数')
-    if out.exists() or out == ROOT or out in ROOT.parents or out.is_relative_to(ROOT / 'bam'):
+    if out.exists() or out == ROOT or out in ROOT.parents or out.is_relative_to(ROOT / 'copilotio'):
         raise Error('构建目录必须是一个新目录，不能覆盖源码或位于 bam 子模块内')
     out.mkdir(parents=True)
     manifest = {'state': 'building', 'config': config, 'environment': env, 'commands': [],
                 'source_transformations': False, 'source_sha256': {
-                    'swarmio': source_inventory(ROOT), 'bam': source_inventory(ROOT / 'bam')},
+                    'swarmio': source_inventory(ROOT), 'copilotio': source_inventory(ROOT / 'copilotio')},
                 'git': {name: {'commit': output(['git', '-C', str(path), 'rev-parse', 'HEAD']),
                                'status': output(['git', '-C', str(path), 'status', '--short'])}
-                        for name, path in [('swarmio', ROOT), ('bam', ROOT / 'bam')]}}
+                        for name, path in [('swarmio', ROOT), ('copilotio', ROOT / 'copilotio')]}}
 
     def execute(command):
         manifest['commands'].append(list(map(str, command)))
@@ -314,7 +325,7 @@ def build(args, config):
         source.mkdir(parents=True)
         for directory in ('src', 'nvmev', 'dsa'):
             destination = source / directory
-            destination.mkdir()
+            destination.mkdir(parents=True)
             for p in (ROOT / directory).iterdir():
                 if p.suffix in ('.c', '.h'):
                     shutil.copy2(p, destination / p.name)
@@ -331,17 +342,38 @@ def build(args, config):
                 raise Error('SwarmIO 编译模式不符：' + field)
         if re.search(r'\b(?:idxd_\w+|dsa_bus_type)\b', output(['nm', '-u', str(swarmio)])):
             raise Error('CPU SwarmIO 仍然依赖 idxd 私有符号')
-        execute(['cmake', '-S', str(ROOT / 'bam'), '-B', str(out / 'bam'),
-                 '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CUDA_ARCHITECTURES=' + env['gpu']['cuda_arch'],
-                 '-DCMAKE_CUDA_COMPILER=' + env['nvcc_path'], '-DCUDA_TOOLKIT_ROOT_DIR=' + env['cuda_root'],
-                 '-Dno_module=ON', '-Dno_cuda=OFF', '-Dno_smartio=ON'])
-        execute(['cmake', '--build', str(out / 'bam'), '--target', 'block-benchmark-module', '--parallel', str(args.jobs)])
+        gdr = out / 'gdrcopy'
+        shutil.copytree(ROOT / 'copilotio/gdrcopy', gdr,
+                        ignore=shutil.ignore_patterns('.git', '*.o', '*.ko', '*.so*'))
+        # Use the actual DKMS symbol CRCs; never build/load nv-p2p-dummy.
+        gdr_makefile = gdr / 'src/gdrdrv/Makefile'
+        gdr_makefile.write_text(gdr_makefile.read_text().replace(
+            'obj-m := nv-p2p-dummy.o\nobj-m += gdrdrv.o', 'obj-m := gdrdrv.o'))
+        execute(['make', '-C', str(gdr / 'src'), '-j' + str(args.jobs)])
+        execute(['make', '-C', env['kernel_build'], 'M=' + str(gdr / 'src/gdrdrv'),
+                 'NVIDIA_SRC_DIR=' + env['nvidia_include'],
+                 'KBUILD_EXTRA_SYMBOLS=' + env['nvidia_symvers'],
+                 'HAVE_VM_FLAGS_SET=y', 'HAVE_PROC_OPS=y', 'CONFIG_DEBUG_INFO_BTF_MODULES=n',
+                 '-j' + str(args.jobs), 'modules'])
+        manifest['gdrdrv_nvidia_import_crcs'] = audit_libnvm(out / ARTIFACTS[7], read_symvers(Path(env['kernel_build']) / 'Module.symvers'),
+                     read_symvers(env['nvidia_symvers']), allow_gpl=True)
+        bench_source = out / 'benchmark-source'
+        bench_source.mkdir()
+        shutil.copy2(ROOT / 'copilotio/microbenchmark/swarmio-CMakeLists.txt', bench_source / 'CMakeLists.txt')
+        for engine, source_name in (('bam', 'bam'), ('copilotio', 'copilot-io')):
+            execute(['cmake', '-S', str(bench_source), '-B', str(out / engine),
+                     '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CUDA_ARCHITECTURES=' + env['gpu']['cuda_arch'],
+                     '-DCMAKE_CUDA_COMPILER=' + env['nvcc_path'], '-DENGINE=' + engine,
+                     '-DENGINE_SOURCE=' + str(ROOT / 'copilotio' / source_name),
+                     '-DBENCH_SOURCE=' + str(ROOT / 'copilotio/microbenchmark/swarmio_read.cu'),
+                     '-DGDRCOPY_SOURCE=' + str(gdr), '-DGDRCOPY_LIBRARY=' + str(out / ARTIFACTS[6])])
+            execute(['cmake', '--build', str(out / engine), '--target', 'block-benchmark-module', '--parallel', str(args.jobs)])
         module_source = out / 'libnvm/source'
         module_source.mkdir(parents=True)
-        for p in (ROOT / 'bam/module').iterdir():
+        for p in (ROOT / 'copilotio/bam/module').iterdir():
             if p.suffix in ('.c', '.h'):
                 shutil.copy2(p, module_source / p.name)
-        shutil.copy2(ROOT / 'bam/src/linux/ioctl.h', module_source / 'ioctl.h')
+        shutil.copy2(ROOT / 'copilotio/bam/src/linux/ioctl.h', module_source / 'ioctl.h')
         # 只生成 Kbuild 文件；C 实现与 bam/module 中一致。
         (module_source / 'Makefile').write_text('obj-m := libnvm.o\nlibnvm-objs := pci.o list.o ctrl.o map.o\n'
                                                'ccflags-y += -D_CUDA -I' + env['nvidia_include'] + '\n')
@@ -351,14 +383,15 @@ def build(args, config):
         libnvm = out / ARTIFACTS[1]
         execute(['objcopy', '--remove-section=.BTF', '--remove-section=.BTF.ext',
                  str(module_source / 'libnvm.ko'), str(libnvm)])
-        for module, name in ((swarmio, 'swarmio'), (libnvm, 'libnvm')):
+        for module, name in ((swarmio, 'swarmio'), (libnvm, 'libnvm'), (out / ARTIFACTS[7], 'gdrdrv')):
             if output(['modinfo', '-F', 'name', str(module)]) != name:
                 raise Error('模块名错误：' + str(module))
             if output(['modinfo', '-F', 'vermagic', str(module)]).split()[0] != env['kernel']:
                 raise Error('模块 vermagic 不匹配当前内核')
         manifest['nvidia_import_crcs'] = audit_libnvm(libnvm,
             read_symvers(Path(env['kernel_build']) / 'Module.symvers'), read_symvers(env['nvidia_symvers']))
-        manifest['ldd'] = check_library(out / ARTIFACTS[3], out / ARTIFACTS[2])
+        manifest['ldd'] = {engine: check_library(out / ARTIFACTS[b], out / ARTIFACTS[l])
+                           for engine, b, l in [('bam', 3, 2), ('copilotio', 5, 4)]}
         manifest['artifacts_sha256'] = {name: digest(out / name) for name in ARTIFACTS}
         manifest['state'] = 'built'
     except BaseException:
@@ -462,6 +495,8 @@ def load(args):
     if module_state():
         raise Error('已有 swarmio/libnvm；load 不自动卸载或替换活动模块')
     verify_gpu(manifest)
+    if (MODULES / 'gdrdrv').exists():
+        raise Error('已有 gdrdrv；请先正常卸载，避免混用驱动版本')
     params = config['module']
     expected = 'memmap=' + str(params['memmap_size']) + '$' + str(params['memmap_start'])
     if expected not in Path('/proc/cmdline').read_text().split():
@@ -489,6 +524,7 @@ def load(args):
         if previous and not (device / 'driver').exists():
             (previous / 'bind').write_text(device.name)
         raise
+    subprocess.run(['insmod', str(args.build_dir / ARTIFACTS[7])], check=True)
     subprocess.run(['udevadm', 'settle'], check=True)
     verify_node(device)
     for name, expected_value in (('skip_io', '0'), ('sq_diag_faulted', 'N')):
@@ -497,7 +533,7 @@ def load(args):
     check_kernel_health(dmesg_text())
     save_json(args.build_dir / 'loaded.json', {'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                'bdf': device.name, 'manifest_sha256': digest(args.build_dir / 'manifest.json'),
-               'run_state': 'not_started'})
+               'run_state': 'not_started', 'gdrdrv_loaded': True})
     print('已就绪：', device.name, '-> /dev/libnvm0；CPU full-I/O；GPU', manifest['environment']['gpu']['name'])
 
 
@@ -571,7 +607,7 @@ def run(args):
     check_no_workload()
     manifest = verify_session(args)
     bench = dict(manifest['config']['benchmark'])
-    for name in ('threads', 'reqs', 'queue_depth', 'num_queues', 'page_size', 'num_blks'):
+    for name in ('threads', 'reqs', 'queue_depth', 'num_queues', 'page_size', 'num_blks', 'pages'):
         if getattr(args, name, None) is not None:
             bench[name] = getattr(args, name)
     if args.random:
@@ -590,15 +626,33 @@ def run(args):
     if bar_latency:
         from swarmio_monitor import bar_latency_mode
         latency_context = bar_latency_mode()
-    check_library(args.build_dir / ARTIFACTS[3], args.build_dir / ARTIFACTS[2])
+    engine = getattr(args, 'engine', 'copilotio')
+    bi, li = (5, 4) if engine == 'copilotio' else (3, 2)
+    if engine == 'copilotio':
+        if not (MODULES / 'gdrdrv').exists() or not Path('/dev/gdrdrv').exists():
+            raise Error('CoPilotIO 需要本次 load 加载的 gdrdrv')
+        base, cores = args.copilot_base_core, min(args.copilot_cores, bench['num_queues'])
+        polling = set(range(base, base + cores))
+        if base < 0 or cores < 1 or base + cores > 1024 or not polling <= set(os.sched_getaffinity(0)):
+            raise Error('CoPilot 轮询 CPU 不在当前允许集合内')
+        if polling & cpu_set(manifest['config']['module']['cpus']):
+            raise Error('CoPilot 轮询 CPU 不能与 SwarmIO 服务 CPU 重叠')
+        huge_needed = bench['num_queues'] * (int(bench['queue_depth'] * 64 > 4096) + int(bench['queue_depth'] * 16 > 4096))
+        meminfo = Path('/proc/meminfo').read_text()
+        free = re.search(r'^HugePages_Free:\s+(\d+)', meminfo, re.M)
+        size = re.search(r'^Hugepagesize:\s+(\d+)', meminfo, re.M)
+        if huge_needed and (not free or not size or int(size[1]) != 2048 or int(free[1]) < huge_needed):
+            raise Error(f'CoPilotIO CPU 连续队列需要至少 {huge_needed} 个空闲 2 MiB hugepages；请先预留')
+        bench.update(copilot_base_core=base, copilot_cores=cores)
+    check_library(args.build_dir / ARTIFACTS[bi], args.build_dir / ARTIFACTS[li])
     directory = ROOT / 'results' / dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
     directory.mkdir(parents=True)
-    command = benchmark_command(args.build_dir / ARTIFACTS[3], bench)
+    command = benchmark_command(args.build_dir / ARTIFACTS[bi], bench)
     child_env = dict(os.environ, CUDA_VISIBLE_DEVICES=manifest['environment']['gpu']['uuid'], CUDA_DEVICE_ORDER='PCI_BUS_ID')
     # 本次 libnvm 优先；保留可能必需的 CUDA/驱动兼容库路径。
-    child_env['LD_LIBRARY_PATH'] = str(args.build_dir / 'bam/lib') + (
+    child_env['LD_LIBRARY_PATH'] = os.pathsep.join([str(args.build_dir / engine / 'lib'), str(args.build_dir / 'gdrcopy/src')]) + (
         os.pathsep + child_env['LD_LIBRARY_PATH'] if child_env.get('LD_LIBRARY_PATH') else '')
-    record = {'command': command, 'gpu': manifest['environment']['gpu'], 'state': 'running',
+    record = {'engine': engine, 'benchmark': bench, 'command': command, 'gpu': manifest['environment']['gpu'], 'state': 'running',
               'build_manifest_sha256': digest(args.build_dir / 'manifest.json'),
               'bar_latency_requested': bar_latency}
     print('输出目录：', directory, flush=True)
@@ -669,10 +723,36 @@ def run(args):
     (directory / 'after.log').write_text(snapshot())
     if record['state'] != 'completed':
         raise Error('本轮没有正常完成；日志位于 ' + str(directory) + '；不自动重跑或卸载')
-    print('本轮吞吐统计已完成；不代表内容校验或随机负载问题已修复。')
+    print('本轮吞吐统计已完成；不包含逐字节内容校验。')
+    return directory
+
+
+def compare(args):
+    # Finite runs share the loaded controller. Stop immediately on any failure.
+    args.random, args.access = True, 'read'
+    for name, value in [('threads', 1024), ('reqs', 8), ('num_queues', 8), ('queue_depth', 512)]:
+        if getattr(args, name, None) is None:
+            setattr(args, name, value)
+    rows = []
+    for engine in ('bam', 'copilotio'):
+        args.engine = engine
+        directory = run(args)
+        log = (directory / 'bench.log').read_text()
+        rate = re.search(r'Ops/sec:\s*([\deE+.-]+)', log)
+        rows.append({'engine': engine, 'ops_per_sec': float(rate[1]), 'result_dir': str(directory)})
+    destination = ROOT / 'results' / ('compare-' + dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+    destination.mkdir(parents=True)
+    with (destination / 'comparison.csv').open('w') as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    save_json(destination / 'comparison.json', {'runs': rows,
+        'copilotio_over_bam': rows[1]['ops_per_sec'] / rows[0]['ops_per_sec'] if rows[0]['ops_per_sec'] else None})
+    print('对比结果：', destination)
 
 
 def unload(args):
+    owned_gdr = False
     linux_only(root=True)
     check_no_workload()
     check_kernel_health(dmesg_text())
@@ -691,11 +771,16 @@ def unload(args):
             refcount = MODULES / name / 'refcnt'
             if refcount.exists() and int(refcount.read_text()) != 0:
                 raise Error(name + ' 仍有引用，拒绝卸载')
+        owned_gdr = session.get('gdrdrv_loaded', False)
+        if owned_gdr:
+            refcount = MODULES / 'gdrdrv/refcnt'
+            if refcount.exists() and int(refcount.read_text()) != 0:
+                raise Error('gdrdrv 仍有引用，拒绝卸载')
         session['run_state'] = 'unloading'
         save_json(args.build_dir / 'loaded.json', session)
     # 有活动文件引用时不尝试卸载；不使用 rmmod -f，不通过超时发送 SIGKILL。
-    for name in ('libnvm', 'swarmio'):
-        if name not in states:
+    for name in ('libnvm', 'swarmio', 'gdrdrv'):
+        if name not in states and not (name == 'gdrdrv' and owned_gdr and (MODULES / name).exists()):
             continue
         process = subprocess.Popen(['rmmod', name])
         try:
@@ -728,11 +813,14 @@ def main():
         p.add_argument('--cuda-root', type=Path, help='CUDA 工具链目录，例如 /usr/local/cuda-12.4；sudo 下也可显式选择')
         if name == 'build':
             p.add_argument('--jobs', type=int, default=8)
-    p = commands.add_parser('load', help='加载两个模块并绑定虚拟控制器')
+    p = commands.add_parser('load', help='加载 SwarmIO、libnvm 和 gdrdrv 并绑定虚拟控制器')
     p.add_argument('--bdf', help='可选；必须属于 SwarmIO 虚拟设备')
-    p = commands.add_parser('run', help='运行单轮读/写检查')
-    for name in ('threads', 'reqs', 'queue-depth', 'num-queues', 'page-size', 'num-blks'):
+    p = commands.add_parser('run', aliases=['compare'], help='单轮读检查；compare 顺序比较 BaM/CoPilotIO')
+    for name in ('threads', 'reqs', 'queue-depth', 'num-queues', 'page-size', 'num-blks', 'pages'):
         p.add_argument('--' + name, type=int)
+    p.add_argument('--engine', choices=('copilotio', 'bam'), default='copilotio')
+    p.add_argument('--copilot-base-core', type=int, default=0)
+    p.add_argument('--copilot-cores', type=int, default=4)
     p.add_argument('--random', action='store_true')
     p.add_argument('--access', choices=('read', 'write'))
     p.add_argument('--monitor-interval', type=interval_value,
@@ -755,7 +843,7 @@ def main():
             else:
                 build(args, config)
         else:
-            {'load': load, 'run': run, 'status': status, 'unload': unload}[args.command](args)
+            {'load': load, 'run': run, 'compare': compare, 'status': status, 'unload': unload}[args.command](args)
         return 0
     except (Error, OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
         print('ERROR:', exc, file=sys.stderr)

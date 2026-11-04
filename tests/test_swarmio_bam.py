@@ -697,9 +697,9 @@ class PipelineTests(unittest.TestCase):
         with patch.object(pipeline, 'output', return_value='cmake version 3.21.4'):
             with self.assertRaises(pipeline.Error):
                 pipeline.cmake_info()
-        for path in [ROOT / 'bam/CMakeLists.txt', *(ROOT / 'bam/benchmarks').glob('*/CMakeLists.txt')]:
+        for path in [ROOT / 'copilotio/bam/CMakeLists.txt', *(ROOT / 'copilotio/bam/benchmarks').glob('*/CMakeLists.txt')]:
             self.assertNotIn('VERSION 3.24', path.read_text())
-        self.assertNotIn('set(CMAKE_CUDA_ARCHITECTURES native)', (ROOT / 'bam/CMakeLists.txt').read_text())
+        self.assertNotIn('set(CMAKE_CUDA_ARCHITECTURES native)', (ROOT / 'copilotio/bam/CMakeLists.txt').read_text())
 
     def test_explicit_cuda_root_does_not_require_nvcc_on_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -865,9 +865,9 @@ class LifecycleTests(unittest.TestCase):
                        'nvidia_symvers': str(nvtable), 'gpu': {'cuda_arch': '70'}}
 
                 def execute(command, **kwargs):
-                    if command[0] == 'make':
+                    if command[0] == 'make' and any(p.startswith('M=') for p in command):
                         source = Path(next(p[2:] for p in command if p.startswith('M=')))
-                        name = 'swarmio' if source.parent.name == 'swarmio' else 'libnvm'
+                        name = 'swarmio' if source.parent.name == 'swarmio' else ('gdrdrv' if source.name == 'gdrdrv' else 'libnvm')
                         (source / (name + '.ko')).write_bytes(name.encode())
                     elif command[0] == 'objcopy':
                         shutil.copy2(command[-2], command[-1])
@@ -882,11 +882,11 @@ class LifecycleTests(unittest.TestCase):
                     if command[0] == 'git':
                         return '' if command[-1] == '--short' else 'fake-commit'
                     if command[0] == 'nm':
-                        return ' U nvidia_p2p_get_pages' if 'libnvm.ko' in command[-1] else ' U memcpy'
+                        return ' U nvidia_p2p_get_pages' if ('libnvm.ko' in command[-1] or 'gdrdrv.ko' in command[-1]) else ' U memcpy'
                     if command[0] == 'modprobe':
                         return ('0xdead' if bad_crc else '0x1234') + ' nvidia_p2p_get_pages'
                     if command[0] == 'ldd':
-                        return 'libnvm.so => ' + str(out / 'bam/lib/libnvm.so')
+                        return 'libnvm.so => ' + str(out / Path(command[-1]).relative_to(out).parts[0] / 'lib/libnvm.so')
                     field = command[2]
                     if field == 'name':
                         return Path(command[-1]).stem
@@ -909,8 +909,9 @@ class LifecycleTests(unittest.TestCase):
                 self.assertTrue(all(c[0] in ('make', 'cmake', 'objcopy') for c in manifest['commands']))
                 self.assertEqual((out / 'swarmio/source/src/dispatcher.c').read_bytes(),
                                  (ROOT / 'src/dispatcher.c').read_bytes())
-                self.assertEqual((out / 'libnvm/source/ctrl.c').read_bytes(),
-                                 (ROOT / 'bam/module/ctrl.c').read_bytes())
+                if not bad_crc:
+                    self.assertEqual((out / 'libnvm/source/ctrl.c').read_bytes(),
+                                     (ROOT / 'copilotio/bam/module/ctrl.c').read_bytes())
 
     def test_run_records_completion_and_selects_gpu_uuid(self):
         config = pipeline.read_config(ROOT / 'configs/bam-cpu.json')
@@ -925,7 +926,7 @@ class LifecycleTests(unittest.TestCase):
                 probe.write_text('import os\nprint(os.environ["CUDA_VISIBLE_DEVICES"])\n' +
                                  ('print("Ops/sec: 1")\n' if finished else 'print("Unexpected error")\n'))
                 manifest = {'config': config, 'environment': {'gpu': {'uuid': 'GPU-12345678'}}}
-                args = SimpleNamespace(build_dir=out, threads=None, reqs=None, queue_depth=None,
+                args = SimpleNamespace(engine='bam', build_dir=out, threads=None, reqs=None, queue_depth=None,
                                        num_queues=None, random=False, access=None, monitor_interval=.1)
                 sampler = Mock()
                 monitoring = SimpleNamespace(ResourceMonitor=Mock(return_value=sampler), interval_value=float)

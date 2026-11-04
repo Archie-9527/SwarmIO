@@ -1,4 +1,4 @@
 [submodule "copilotio"]
 	path = copilotio
-	url = https://github.com/Archie-9527/OSDI26-CoPilotIO.git
+	url = git@github.com:Archie-9527/OSDI26-CoPilotIO
 	branch = master

@@ -5,7 +5,7 @@ set -euo pipefail
 
 usage() {
     echo "用法：sudo bash scripts/run_random_read.sh [build_dir [threads [reqs [queues [depth [monitor_interval]]]]]]"
-    echo "默认：build 1024 8 8 512；512 B 随机读，共 8192 次逻辑操作。"
+    echo "默认：build 1024 8 8 512；CoPilotIO 引擎；512 B 随机读，共 8192 次逻辑操作。"
     echo "可选第六参数启用资源与吞吐采样，例如 0.1 表示每 100 ms 打点；默认不启用。"
 }
 
@@ -18,7 +18,7 @@ if (( $# > 6 )); then
     exit 2
 fi
 if (( EUID != 0 )); then
-    echo "请使用 sudo bash scripts/run_random_read.sh；需要访问 BaM 设备及内核日志。" >&2
+    echo "请使用 sudo bash scripts/run_random_read.sh；需要访问 GPU I/O 设备及内核日志。" >&2
     exit 1
 fi
 
