@@ -1,5 +1,6 @@
 """CPU-side protocol regression; CUDA execution remains a target-machine check."""
 import importlib.util
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -14,6 +15,209 @@ pipeline = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pipeline)
 
 class CoPilotTests(unittest.TestCase):
+    def test_virtual_bar_layout_restored_after_cxl_header_fixup(self):
+        if not shutil.which('cc'):
+            self.skipTest('no C compiler')
+        text = (ROOT / 'nvmev/pci.c').read_text()
+        helper = text[text.index('static int __restore_nvme_bar_resources('):
+                      text.index('static int __create_pci_bus(')]
+        bar_size = next(line for line in (ROOT / 'nvmev/pci.h').read_text().splitlines()
+                        if line.startswith('#define VDEV_PCI_BAR0_SIZE '))
+        unit = r'''
+#include <assert.h>
+#include <errno.h>
+#include <string.h>
+#define PCI_STD_NUM_BARS 6
+#define IORESOURCE_MEM 0x200
+#define IORESOURCE_MEM_64 0x100000
+#define IORESOURCE_PREFETCH 0x2000
+#define SWARMIO_ERROR(...) ((void)0)
+#define SWARMIO_INFO(...) ((void)0)
+struct resource {
+    const char *name;
+    unsigned long long start, end, flags;
+    struct resource *parent, *child, *sibling;
+};
+struct pci_dev { struct resource resource[7]; };
+struct nvme_vdev { struct { unsigned long long memmap_start; } config; };
+static struct nvme_vdev state;
+static struct nvme_vdev *vdev=&state;
+static struct resource iomem_resource;
+static const char* pci_name(struct pci_dev* dev) { (void)dev; return "virtual"; }
+''' + bar_size + '\n' + helper + r'''
+int main(void) {
+    struct pci_dev dev={0}, before;
+    state.config.memmap_start=0x100000000ULL;
+    dev.resource[0].start=0x100000000ULL;
+    dev.resource[0].end=0x10000ffffULL;
+    dev.resource[0].flags=IORESOURCE_MEM|IORESOURCE_MEM_64|IORESOURCE_PREFETCH;
+    dev.resource[2]=dev.resource[0]; dev.resource[2].start+=0x10000;
+    dev.resource[4]=dev.resource[0]; dev.resource[4].start+=0x20000;
+    dev.resource[6].start=123; /* ROM resource must stay untouched. */
+    assert(!__restore_nvme_bar_resources(&dev));
+    assert(dev.resource[0].start==0x100000000ULL);
+    assert(dev.resource[0].end==0x1000fffffULL); /* Includes MSI-X at +0x81000. */
+    assert(dev.resource[0].flags==(IORESOURCE_MEM|IORESOURCE_MEM_64));
+    assert(dev.resource[0].parent==&iomem_resource);
+    for(int i=1;i<6;i++) {
+        struct resource zero={0};
+        assert(!memcmp(&dev.resource[i], &zero, sizeof(zero)));
+    }
+    assert(dev.resource[6].start==123);
+    memset(&dev,0,sizeof(dev));
+    dev.resource[2].parent=&iomem_resource;
+    before=dev;
+    assert(__restore_nvme_bar_resources(&dev)==-EBUSY);
+    assert(!memcmp(&dev,&before,sizeof(dev)));
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            source, binary = Path(d)/'bars.c', Path(d)/'bars'
+            source.write_text(unit)
+            subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', str(source), '-o', str(binary)], check=True)
+            subprocess.run([str(binary)], check=True)
+
+    def test_gdr_audit_rejects_gpl_only_with_proprietary_nvidia(self):
+        kernel = {'__vma_start_write': {'crc': 1, 'export': 'EXPORT_SYMBOL_GPL'}}
+        nvidia = {'nvidia_p2p_get_pages': {'crc': 2, 'export': 'EXPORT_SYMBOL'}}
+        def output(command, **kwargs):
+            return ('U __vma_start_write\nU nvidia_p2p_get_pages' if command[0] == 'nm'
+                    else '0x2 nvidia_p2p_get_pages')
+        with patch.object(pipeline, 'read_symvers', side_effect=[kernel, nvidia]), \
+             patch.object(pipeline, 'output', side_effect=output):
+            with self.assertRaisesRegex(pipeline.Error, '__vma_start_write'):
+                pipeline.audit_gdrdrv(Path('gdrdrv.ko'), {'kernel_build': '/kernel',
+                    'nvidia_symvers': '/nvidia.symvers', 'nvidia_license': 'NVIDIA'})
+        self.assertNotIn(pipeline.ARTIFACTS[7], pipeline.artifacts_for({'notify_memory': 'host'}))
+        self.assertIn(pipeline.ARTIFACTS[7], pipeline.artifacts_for({}))
+
+    def test_host_notification_allocation_alias_and_cleanup(self):
+        if not shutil.which('c++'):
+            self.skipTest('no C++ compiler')
+        include = ROOT / 'copilotio/copilot-io/include'
+        header = (include / 'copilot.h').read_text()
+        cls = header[header.index('class CoPilotNotify {'):header.index('class CoPilotCQTable {')]
+        unit = r'''
+#include <copilot_types.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstddef>
+#include <cassert>
+#include <stdexcept>
+using cudaError_t = int;
+using gdr_t = void*;
+using gdr_mh_t = int;
+struct gdr_info_t { unsigned long va; };
+constexpr int cudaSuccess=0, cudaHostAllocMapped=2;
+constexpr size_t GPU_PAGE_SIZE=65536, GPU_PAGE_MASK=~(GPU_PAGE_SIZE-1);
+static int allocations=0, releases=0;
+static bool pointer_failure=false;
+static cudaError_t cudaHostAlloc(void** p,size_t n,int flags) {
+    assert(flags==cudaHostAllocMapped); *p=malloc(n); ++allocations; return 0;
+}
+static cudaError_t cudaHostGetDevicePointer(void** p,void* host,int) {
+    *p=(char*)host+4096; return pointer_failure ? 1 : 0;
+}
+static int cudaFreeHost(void* p) { free(p); ++releases; return 0; }
+static const char* cudaGetErrorString(int) { return "failure"; }
+static void copilot_sfence() {}
+// No CUDA device allocation or GDR API should be reached in host mode.
+static int cudaMalloc(void**,size_t) { abort(); }
+static int cudaMemset(void*,int,size_t) { abort(); }
+static int cudaFree(void*) { abort(); }
+static int cudaDeviceSynchronize() { abort(); }
+static gdr_t gdr_open() { abort(); }
+static int gdr_pin_buffer(gdr_t,unsigned long,size_t,int,int,gdr_mh_t*) { abort(); }
+static int gdr_map(gdr_t,gdr_mh_t,void**,size_t) { abort(); }
+static int gdr_get_info(gdr_t,gdr_mh_t,gdr_info_t*) { abort(); }
+static int gdr_unmap(gdr_t,gdr_mh_t,void*,size_t) { abort(); }
+static int gdr_unpin_buffer(gdr_t,gdr_mh_t) { abort(); }
+static int gdr_close(gdr_t) { abort(); }
+''' + cls + r'''
+int main() {
+    {
+        CoPilotNotify n; n.init(true);
+        assert((char*)n.gpu_ptr==(char*)n.cpu_ptr+4096);
+        assert(n.cpu_ptr[65535].ready==0);
+        n.cpu_ptr[65535].ready=1;
+        n.destroy(); n.destroy();
+        assert(!n.cpu_ptr && !n.gpu_ptr);
+    }
+    assert(allocations==1 && releases==1);
+    pointer_failure=true;
+    { CoPilotNotify n; try { n.init(true); assert(false); } catch(const std::runtime_error&) {} }
+    assert(allocations==2 && releases==2);
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            source, binary = Path(d)/'host.cpp', Path(d)/'host'
+            source.write_text(unit)
+            subprocess.run(['c++', '-std=c++17', '-I'+str(include), str(source), '-o', str(binary)], check=True)
+            subprocess.run([str(binary)], check=True)
+
+    def test_notification_types_available_before_device_functions(self):
+        if not shutil.which('c++'):
+            self.skipTest('no C++ compiler')
+        include = ROOT / 'copilotio/copilot-io/include'
+        # Compile the real header declaration sections. CUDA function bodies
+        # require nvcc; unrelated SDK dependencies are empty test doubles here.
+        page = (include / 'page_cache.h').read_text().split('#define FREE 2', 1)[0] + '\n#endif\n'
+        agent = (include / 'copilot.h').read_text().split('class CoPilotNotify {', 1)[0] + '\n#endif\n'
+        checks = '''
+#include <cstddef>
+static_assert(sizeof(copilot_notify_entry) == 16);
+static_assert(offsetof(copilot_notify_entry, ready) == 0);
+static_assert(offsetof(copilot_notify_entry, cq_head) == 12);
+static_assert(sizeof(copilot_cq_table_entry) == 4);
+static_assert(sizeof(copilot_cq_table) == COPILOT_CQ_MAX_DEPTH * 8 + 8);
+void access(copilot_notify_entry* notify, copilot_cq_table* table) {
+    notify[1].ready = 1; notify[1].pos = 2; notify[1].loc = 3; notify[1].cq_head = 4;
+    table->entries[0].cid = 1; table->entries[0].sq_head = 2;
+    table->ready[0] = 1; table->drain_lock = 0; table->gpu_head = 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            for name in ('util.h', 'host_util.h', 'nvm_types.h', 'nvm_util.h', 'buffer.h',
+                         'ctrl.h', 'nvm_parallel_queue.h', 'nvm_cmd.h', 'gdrapi.h'):
+                (base / name).write_text('')
+            for prefix in (page, agent, page + agent, agent + page):
+                unit = base / 'types.cpp'
+                unit.write_text(prefix + checks)
+                compiled = subprocess.run(['c++', '-std=c++17', '-fsyntax-only',
+                    '-I' + str(base), '-I' + str(include), str(unit)], capture_output=True, text=True)
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+
+    def test_public_headers_compile_without_cuda_device_qualifiers(self):
+        if not shutil.which('c++'):
+            self.skipTest('no C++ compiler')
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            (base / 'cuda/std').mkdir(parents=True)
+            # Only replace SDK dependencies: compile the actual project headers.
+            # Deliberately do not define __device__ or __forceinline__ here.
+            (base / 'cuda.h').write_text('')
+            (base / 'cuda/atomic').write_text(
+                '#pragma once\n#include <atomic>\nnamespace cuda {\n'
+                'enum thread_scope { thread_scope_system, thread_scope_device };\n'
+                'template<class T, thread_scope S=thread_scope_system> using atomic=::std::atomic<T>;\n'
+                'namespace std=::std;\n}\n')
+            (base / 'cuda/std/atomic').write_text('#include <cuda/atomic>\n')
+            unit = base / 'host.cpp'
+            unit.write_text('#include <nvm_util.h>\n#include <nvm_queue.h>\n#include <nvm_cmd.h>\n')
+            for engine in ('bam', 'copilot-io'):
+                includes = ['-I' + str(base), '-I' + str(ROOT / 'copilotio' / engine / 'include')]
+                command = ['c++', '-std=c++17', '-D_CUDA', '-D__CUDA__', *includes]
+                compiled = subprocess.run(command + ['-c', str(unit), '-o', str(base / 'host.o')],
+                                          capture_output=True, text=True)
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                # Also check the device branch stays available to CUDA compilation.
+                for defines, expected in [([], False), (['-D__CUDACC__'], True)]:
+                    preprocessed = subprocess.check_output(command + defines + ['-E', str(unit)], text=True)
+                    for helper in ('lane_id()', 'warp_id()', 'get_smid()'):
+                        self.assertEqual(helper in preprocessed, expected)
+
     def test_empty_btf_override_disables_kbuild_ifdef(self):
         if not shutil.which('make'):
             self.skipTest('no make')
@@ -48,9 +252,7 @@ struct cpu_set_t { int unused; };
 static int pthread_setaffinity_np(pthread_t,size_t,const cpu_set_t*) { return 0; }
 #endif
 struct nvm_cpl_t { uint32_t dword[4]; };
-struct copilot_notify_entry { volatile uint32_t ready; uint32_t pos,loc,cq_head; };
-struct copilot_cq_table_entry { uint16_t cid,sq_head; };
-struct copilot_cq_table { volatile uint32_t ready[4096]; copilot_cq_table_entry entries[4096]; };
+#include <copilot_types.h>
 static void copilot_sfence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
 static void copilot_pause() {}
 ''' + poll + r'''
@@ -78,7 +280,8 @@ int main() {
         with tempfile.TemporaryDirectory() as d:
             source, binary = Path(d)/'poll.cpp', Path(d)/'poll'
             source.write_text(unit)
-            subprocess.run(['c++','-std=c++17','-pthread',str(source),'-o',str(binary)],check=True)
+            subprocess.run(['c++','-std=c++17','-pthread',
+                            '-I'+str(ROOT/'copilotio/copilot-io/include'),str(source),'-o',str(binary)],check=True)
             subprocess.run([str(binary)],check=True,timeout=10)
 
     def test_compare_pairs_same_workload_and_stops_on_failure(self):
@@ -88,13 +291,15 @@ int main() {
             def run(args):
                 calls.append((args.engine,args.threads,args.reqs,args.random,args.queue_depth))
                 p=base/args.engine; p.mkdir()
-                (p/'bench.log').write_text('Ops/sec: '+('100' if args.engine=='bam' else '200'))
+                (p/'bench.log').write_text('Ops/sec: '+('100' if args.engine=='bam' else '200\nNotification memory: host'))
                 return p
             args=SimpleNamespace(threads=None,reqs=None,num_queues=None,queue_depth=None)
             with patch.object(pipeline,'ROOT',base), patch.object(pipeline,'run',side_effect=run):
                 pipeline.compare(args)
             self.assertEqual(calls,[('bam',1024,8,True,512),('copilotio',1024,8,True,512)])
             self.assertEqual(len(list((base/'results').glob('compare-*/comparison.csv'))),1)
+            summary = json.loads(next((base/'results').glob('compare-*/comparison.json')).read_text())
+            self.assertEqual([row['notify_memory'] for row in summary['runs']], ['none', 'host'])
             with patch.object(pipeline,'run',side_effect=pipeline.Error('failed')) as failed:
                 with self.assertRaises(pipeline.Error): pipeline.compare(args)
                 self.assertEqual(failed.call_count,1)

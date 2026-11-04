@@ -184,6 +184,37 @@ static int __init_nvme_ctrl_regs(struct pci_dev *dev)
 	return 0;
 }
 
+static int __restore_nvme_bar_resources(struct pci_dev *dev)
+{
+	struct resource *res;
+	int i;
+
+	/* pci_scan_bus runs header fixups. A custom kernel can match our PCI ID
+	 * with its NVMeVirt CXL fixup, shrink BAR0 and invent BAR2/BAR4. This
+	 * private virtual bus implements only a 1 MiB BAR0 (including MSI-X).
+	 * Restore that layout before pci_bus_add_devices can bind any driver.
+	 */
+	for (i = 0; i < PCI_STD_NUM_BARS; i++) {
+		res = &dev->resource[i];
+		if (res->parent || res->child || res->sibling) {
+			SWARMIO_ERROR("BAR%d already claimed before virtual device setup\n", i);
+			return -EBUSY;
+		}
+	}
+	for (i = 0; i < PCI_STD_NUM_BARS; i++)
+		memset(&dev->resource[i], 0, sizeof(struct resource));
+	res = &dev->resource[0];
+	res->name = pci_name(dev);
+	res->start = vdev->config.memmap_start;
+	res->end = res->start + VDEV_PCI_BAR0_SIZE - 1;
+	res->flags = IORESOURCE_MEM | IORESOURCE_MEM_64;
+	/* Keep the existing private-bus parent convention for reserved RAM. */
+	res->parent = &iomem_resource;
+	SWARMIO_INFO("Restored NVMe BAR0 [%#llx-%#llx]; BAR2/BAR4 disabled\n",
+		     (unsigned long long)res->start, (unsigned long long)res->end);
+	return 0;
+}
+
 static int __create_pci_bus(struct nvme_vdev *vdev)
 {
 	struct pci_bus *bus = NULL;
@@ -202,8 +233,9 @@ static int __create_pci_bus(struct nvme_vdev *vdev)
 	}
 
 	list_for_each_entry(dev, &bus->devices, bus_list) {
-		struct resource *res = &dev->resource[0];
-		res->parent = &iomem_resource;
+		ret = __restore_nvme_bar_resources(dev);
+		if (ret)
+			goto err_bus;
 
 		vdev->pdev = dev;
 		dev->irq = vdev->pcihdr->intr.iline;

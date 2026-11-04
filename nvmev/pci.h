@@ -552,6 +552,7 @@ struct nvme_ctrl_regs {
 
 #define VDEV_PCI_DOMAIN_NUM 0x0001
 #define VDEV_PCI_BUS_NUM 0x10
+#define VDEV_PCI_BAR0_SIZE 0x100000UL
 #define VDEV_PCI_MSIX_TO 0x81000
 #define VDEV_PCI_MSIX_TS 128
 #define VDEV_PCI_INTX_IRQ 15

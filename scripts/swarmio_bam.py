@@ -32,6 +32,18 @@ class Error(RuntimeError):
     pass
 
 
+def notification_memory(config):
+    # Old builds used GPU/GDR notifications. Never relabel them as host mode.
+    mode = config.get('notify_memory', 'gdr')
+    if mode not in ('host', 'gdr'):
+        raise Error('notify_memory 必须是 host 或 gdr')
+    return mode
+
+
+def artifacts_for(config):
+    return ARTIFACTS if notification_memory(config) == 'gdr' else ARTIFACTS[:-1]
+
+
 def output(command, **kwargs):
     return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT, **kwargs).strip()
 
@@ -113,6 +125,7 @@ def validate_benchmark(bench, config):
 
 def read_config(path):
     config = json.loads(Path(path).read_text())
+    notification_memory(config)
     build, params = config['build'], config['module']
     required = {'CONFIG_SWARMIO_WORKER_SKIP_IO': 'n', 'CONFIG_SWARMIO_DMA_DISPATCHER': 'n',
                 'CONFIG_SWARMIO_DMA_WORKER': 'n', 'CONFIG_SWARMIO_COMMIT': 'n',
@@ -158,7 +171,7 @@ def find_nvcc(cuda_root=None):
     for path in candidates:
         if path.is_file() and os.access(path, os.X_OK):
             return path.resolve()
-    raise Error('找不到可执行 nvcc；请在 doctor/build 后传入 --cuda-root /usr/local/cuda-13.0（按实际版本替换）')
+    raise Error('找不到可执行 nvcc；请在 doctor/build 后传入 --cuda-root /usr/local/cuda-12.4（按实际版本替换）')
 
 
 def require_readable_file(path):
@@ -230,6 +243,7 @@ def environment(args, config):
             raise Error('构建路径不能包含空格或 Makefile 特殊字符：' + str(path))
     if output(['modinfo', '-F', 'version', 'nvidia']) != version:
         raise Error('磁盘上的 NVIDIA 驱动版本与已加载版本不同，请先完成驱动切换')
+    nvidia_license = output(['modinfo', '-F', 'license', 'nvidia'])
     gpu = gpu_info(args.gpu or config['gpu'])
     if int(gpu['cuda_arch']) < 70:
         raise Error('CoPilotIO 随机读基准要求 GPU compute capability >= 7.0')
@@ -247,6 +261,7 @@ def environment(args, config):
     expected = 'memmap=' + str(config['module']['memmap_size']) + '$' + str(config['module']['memmap_start'])
     online = cpu_set(Path('/sys/devices/system/cpu/online').read_text().strip())
     return {'kernel': release, 'kernel_build': str(kernel.resolve()), 'nvidia_version': version,
+            'nvidia_license': nvidia_license,
             'nvidia_symvers': str(symvers), 'nvidia_include': str(include),
             'nvidia_symvers_sha256': digest(symvers), 'gpu': gpu,
             'boot_reservation': expected, 'boot_reservation_ready': expected in Path('/proc/cmdline').read_text().split(),
@@ -266,7 +281,8 @@ def audit_libnvm(module, kernel_symbols, nvidia_symbols, allow_gpl=False):
     undefined = {line.split()[-1] for line in output(['nm', '-u', str(module)]).splitlines() if line.split()}
     forbidden = sorted(name for name in undefined if 'GPL' in kernel_symbols.get(name, {}).get('export', ''))
     if forbidden and not allow_gpl:
-        raise Error('libnvm 仍引用 GPL-only 符号：' + ', '.join(forbidden))
+        raise Error(module.name + ' 仍引用 GPL-only 符号：' + ', '.join(forbidden) +
+                    '；引用 NVIDIA 专有模块后不能使用这些符号，不能通过修改模块 license 解决')
     imported = {}
     for line in output(['modprobe', '--show-modversions', str(module)]).splitlines():
         fields = line.split()
@@ -279,6 +295,15 @@ def audit_libnvm(module, kernel_symbols, nvidia_symbols, allow_gpl=False):
         if name not in nvidia_symbols or imported.get(name) != nvidia_symbols[name]['crc']:
             raise Error('NVIDIA P2P 导入 CRC 不匹配：' + name)
     return {name: hex(imported[name]) for name in names}
+
+
+def audit_gdrdrv(module, env):
+    # A GPL-compatible gdrdrv inherits proprietary taint from nvidia.ko.
+    # Its own MODULE_LICENSE does not make GPL-only kernel imports loadable.
+    license = env.get('nvidia_license') or output(['modinfo', '-F', 'license', 'nvidia'])
+    return audit_libnvm(module,
+        read_symvers(Path(env['kernel_build']) / 'Module.symvers'),
+        read_symvers(env['nvidia_symvers']), allow_gpl='GPL' in license)
 
 
 def check_library(binary, library):
@@ -352,13 +377,14 @@ def build(args, config):
         gdr_makefile.write_text(gdr_makefile.read_text().replace(
             'obj-m := nv-p2p-dummy.o\nobj-m += gdrdrv.o', 'obj-m := gdrdrv.o'))
         execute(['make', '-C', str(gdr / 'src'), '-j' + str(args.jobs)])
-        execute(['make', '-C', env['kernel_build'], 'M=' + str(gdr / 'src/gdrdrv'),
-                 'NVIDIA_SRC_DIR=' + env['nvidia_include'],
-                 'KBUILD_EXTRA_SYMBOLS=' + env['nvidia_symvers'],
-                 'HAVE_VM_FLAGS_SET=y', 'HAVE_PROC_OPS=y', 'CONFIG_DEBUG_INFO_BTF_MODULES=',
-                 '-j' + str(args.jobs), 'modules'])
-        manifest['gdrdrv_nvidia_import_crcs'] = audit_libnvm(out / ARTIFACTS[7], read_symvers(Path(env['kernel_build']) / 'Module.symvers'),
-                     read_symvers(env['nvidia_symvers']), allow_gpl=True)
+        if notification_memory(config) == 'gdr':
+            execute(['make', '-C', env['kernel_build'], 'M=' + str(gdr / 'src/gdrdrv'),
+                     'NVIDIA_SRC_DIR=' + env['nvidia_include'],
+                     'NVIDIA_IS_OPENSOURCE=' + ('y' if 'GPL' in env['nvidia_license'] else 'n'),
+                     'KBUILD_EXTRA_SYMBOLS=' + env['nvidia_symvers'],
+                     'HAVE_VM_FLAGS_SET=y', 'HAVE_PROC_OPS=y', 'CONFIG_DEBUG_INFO_BTF_MODULES=',
+                     '-j' + str(args.jobs), 'modules'])
+            manifest['gdrdrv_nvidia_import_crcs'] = audit_gdrdrv(out / ARTIFACTS[7], env)
         bench_source = out / 'benchmark-source'
         bench_source.mkdir()
         shutil.copy2(ROOT / 'copilotio/microbenchmark/swarmio-CMakeLists.txt', bench_source / 'CMakeLists.txt')
@@ -368,7 +394,8 @@ def build(args, config):
                      '-DCMAKE_CUDA_COMPILER=' + env['nvcc_path'], '-DENGINE=' + engine,
                      '-DENGINE_SOURCE=' + str(ROOT / 'copilotio' / source_name),
                      '-DBENCH_SOURCE=' + str(ROOT / 'copilotio/microbenchmark/swarmio_read.cu'),
-                     '-DGDRCOPY_SOURCE=' + str(gdr), '-DGDRCOPY_LIBRARY=' + str(out / ARTIFACTS[6])])
+                     *(['-DGDRCOPY_SOURCE=' + str(gdr), '-DGDRCOPY_LIBRARY=' + str(out / ARTIFACTS[6])]
+                       if engine == 'copilotio' else [])])
             execute(['cmake', '--build', str(out / engine), '--target', 'block-benchmark-module', '--parallel', str(args.jobs)])
         module_source = out / 'libnvm/source'
         module_source.mkdir(parents=True)
@@ -385,7 +412,8 @@ def build(args, config):
         libnvm = out / ARTIFACTS[1]
         execute(['objcopy', '--remove-section=.BTF', '--remove-section=.BTF.ext',
                  str(module_source / 'libnvm.ko'), str(libnvm)])
-        for module, name in ((swarmio, 'swarmio'), (libnvm, 'libnvm'), (out / ARTIFACTS[7], 'gdrdrv')):
+        for module, name in ([(swarmio, 'swarmio'), (libnvm, 'libnvm')] +
+                             ([(out / ARTIFACTS[7], 'gdrdrv')] if notification_memory(config) == 'gdr' else [])):
             if output(['modinfo', '-F', 'name', str(module)]) != name:
                 raise Error('模块名错误：' + str(module))
             if output(['modinfo', '-F', 'vermagic', str(module)]).split()[0] != env['kernel']:
@@ -394,7 +422,7 @@ def build(args, config):
             read_symvers(Path(env['kernel_build']) / 'Module.symvers'), read_symvers(env['nvidia_symvers']))
         manifest['ldd'] = {engine: check_library(out / ARTIFACTS[b], out / ARTIFACTS[l])
                            for engine, b, l in [('bam', 3, 2), ('copilotio', 5, 4)]}
-        manifest['artifacts_sha256'] = {name: digest(out / name) for name in ARTIFACTS}
+        manifest['artifacts_sha256'] = {name: digest(out / name) for name in artifacts_for(config)}
         manifest['state'] = 'built'
     except BaseException:
         manifest['state'] = 'failed'
@@ -410,7 +438,7 @@ def manifest_for(args):
         raise Error('构建未成功完成，不能加载或运行')
     if manifest['environment']['kernel'] != os.uname().release:
         raise Error('当前内核与构建内核不同')
-    if set(manifest['artifacts_sha256']) != set(ARTIFACTS):
+    if set(manifest['artifacts_sha256']) != set(artifacts_for(manifest['config'])):
         raise Error('构建记录缺少必要产物')
     for name, expected in manifest['artifacts_sha256'].items():
         if digest(args.build_dir / name) != expected:
@@ -497,17 +525,25 @@ def load(args):
     if module_state():
         raise Error('已有 swarmio/libnvm；load 不自动卸载或替换活动模块')
     verify_gpu(manifest)
-    if (MODULES / 'gdrdrv').exists():
+    needs_gdr = notification_memory(config) == 'gdr'
+    if needs_gdr and (MODULES / 'gdrdrv').exists():
         raise Error('已有 gdrdrv；请先正常卸载，避免混用驱动版本')
+    # Also audit existing builds: old manifests may have allowed GPL-only imports.
+    if needs_gdr:
+        audit_gdrdrv(args.build_dir / ARTIFACTS[7], manifest['environment'])
     params = config['module']
     expected = 'memmap=' + str(params['memmap_size']) + '$' + str(params['memmap_start'])
     if expected not in Path('/proc/cmdline').read_text().split():
         raise Error('未发现配置要求的启动预留：' + expected)
     if not cpu_set(params['cpus']) <= cpu_set(Path('/sys/devices/system/cpu/online').read_text().strip()):
         raise Error('配置中的服务 CPU 不全在线')
-    for module in (args.build_dir / ARTIFACTS[0], args.build_dir / ARTIFACTS[1]):
+    modules = [args.build_dir / ARTIFACTS[i] for i in ([0, 1, 7] if needs_gdr else [0, 1])]
+    for module in modules:
         for dependency in filter(None, output(['modinfo', '-F', 'depends', str(module)]).split(',')):
             subprocess.run(['modprobe', dependency], check=True)
+    # Fail GDRCopy insertion before creating or binding a virtual controller.
+    if needs_gdr:
+        subprocess.run(['insmod', str(args.build_dir / ARTIFACTS[7])], check=True)
     subprocess.run(['insmod', str(args.build_dir / ARTIFACTS[0])] +
                    [key + '=' + str(value) for key, value in params.items()], check=True)
     device = virtual_device(args.bdf)
@@ -526,7 +562,6 @@ def load(args):
         if previous and not (device / 'driver').exists():
             (previous / 'bind').write_text(device.name)
         raise
-    subprocess.run(['insmod', str(args.build_dir / ARTIFACTS[7])], check=True)
     subprocess.run(['udevadm', 'settle'], check=True)
     verify_node(device)
     for name, expected_value in (('skip_io', '0'), ('sq_diag_faulted', 'N')):
@@ -535,8 +570,16 @@ def load(args):
     check_kernel_health(dmesg_text())
     save_json(args.build_dir / 'loaded.json', {'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                'bdf': device.name, 'manifest_sha256': digest(args.build_dir / 'manifest.json'),
-               'run_state': 'not_started', 'gdrdrv_loaded': True})
-    print('已就绪：', device.name, '-> /dev/libnvm0；CPU full-I/O；GPU', manifest['environment']['gpu']['name'])
+               'run_state': 'not_started', 'gdrdrv_loaded': needs_gdr})
+    print('已就绪：', device.name, '-> /dev/libnvm0；CPU full-I/O；GPU', manifest['environment']['gpu']['name'], '；通知模式', notification_memory(config))
+
+
+def record_load_failure(args, exc):
+    directory = ROOT / 'results' / ('load-failed-' + dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+    directory.mkdir(parents=True)
+    (directory / 'error.log').write_text(str(exc) + '\n')
+    (directory / 'state.log').write_text(snapshot())
+    print('加载失败现场已保存：', directory, file=sys.stderr)
 
 
 def verify_session(args):
@@ -631,7 +674,9 @@ def run(args):
     engine = getattr(args, 'engine', 'copilotio')
     bi, li = (5, 4) if engine == 'copilotio' else (3, 2)
     if engine == 'copilotio':
-        if not (MODULES / 'gdrdrv').exists() or not Path('/dev/gdrdrv').exists():
+        mode = notification_memory(manifest['config'])
+        bench['notify_memory'] = mode
+        if mode == 'gdr' and (not (MODULES / 'gdrdrv').exists() or not Path('/dev/gdrdrv').exists()):
             raise Error('CoPilotIO 需要本次 load 加载的 gdrdrv')
         base, cores = args.copilot_base_core, min(args.copilot_cores, bench['num_queues'])
         polling = set(range(base, base + cores))
@@ -654,7 +699,7 @@ def run(args):
     # 本次 libnvm 优先；保留可能必需的 CUDA/驱动兼容库路径。
     child_env['LD_LIBRARY_PATH'] = os.pathsep.join([str(args.build_dir / engine / 'lib'), str(args.build_dir / 'gdrcopy/src')]) + (
         os.pathsep + child_env['LD_LIBRARY_PATH'] if child_env.get('LD_LIBRARY_PATH') else '')
-    record = {'engine': engine, 'benchmark': bench, 'command': command, 'gpu': manifest['environment']['gpu'], 'state': 'running',
+    record = {'notify_memory': bench.get('notify_memory', 'none'), 'engine': engine, 'benchmark': bench, 'command': command, 'gpu': manifest['environment']['gpu'], 'state': 'running',
               'build_manifest_sha256': digest(args.build_dir / 'manifest.json'),
               'bar_latency_requested': bar_latency}
     print('输出目录：', directory, flush=True)
@@ -741,7 +786,10 @@ def compare(args):
         directory = run(args)
         log = (directory / 'bench.log').read_text()
         rate = re.search(r'Ops/sec:\s*([\deE+.-]+)', log)
-        rows.append({'engine': engine, 'ops_per_sec': float(rate[1]), 'result_dir': str(directory)})
+        mode = re.search(r'Notification memory:\s*(host|gdr)\b', log)
+        if engine == 'copilotio' and not mode:
+            raise Error('CoPilotIO 日志缺少通知模式，不能输出未标记的性能对比')
+        rows.append({'notify_memory': mode[1] if mode else 'none', 'engine': engine, 'ops_per_sec': float(rate[1]), 'result_dir': str(directory)})
     destination = ROOT / 'results' / ('compare-' + dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
     destination.mkdir(parents=True)
     with (destination / 'comparison.csv').open('w') as stream:
@@ -812,7 +860,7 @@ def main():
         p.add_argument('--gpu', help='nvidia-smi 的目标 index/UUID，默认使用配置中的 GPU')
         p.add_argument('--nvidia-symvers', type=Path)
         p.add_argument('--nvidia-include', type=Path)
-        p.add_argument('--cuda-root', type=Path, help='CUDA 工具链目录，例如 /usr/local/cuda-13.0；sudo 下也可显式选择')
+        p.add_argument('--cuda-root', type=Path, help='CUDA 工具链目录，例如 /usr/local/cuda-12.4；sudo 下也可显式选择')
         if name == 'build':
             p.add_argument('--jobs', type=int, default=8)
     p = commands.add_parser('load', help='加载 SwarmIO、libnvm 和 gdrdrv 并绑定虚拟控制器')
@@ -850,6 +898,10 @@ def main():
     except (Error, OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
         print('ERROR:', exc, file=sys.stderr)
         if args.command == 'load':
+            try:
+                record_load_failure(args, exc)
+            except Exception as diagnostic_error:
+                print('现场保存失败：', diagnostic_error, file=sys.stderr)
             print('加载失败后不自动卸载已成功加载的模块；先用 status 保存现场。', file=sys.stderr)
         return 1
     except KeyboardInterrupt:

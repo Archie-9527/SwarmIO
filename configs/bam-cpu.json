@@ -1,6 +1,7 @@
 {
   "description": "当前 7950X 实验机：CPU 实际复制、512 B 读写、保留内核诊断，不启用 DSA",
   "gpu": "0",
+  "notify_memory": "host",
   "build": {
     "NR_MAX_IO_QUEUE": "64",
     "NR_MAX_FETCH_SQE": "1024",

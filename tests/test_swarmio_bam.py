@@ -784,7 +784,7 @@ class PipelineTests(unittest.TestCase):
                 p = base / name
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_bytes(name.encode())
-            manifest = {"state": "built", "environment": {"kernel": "test-kernel"},
+            manifest = {"state": "built", "config": {}, "environment": {"kernel": "test-kernel"},
                         "artifacts_sha256": {name: pipeline.digest(base / name) for name in pipeline.ARTIFACTS}}
             pipeline.save_json(base / "manifest.json", manifest)
             args = SimpleNamespace(build_dir=base)
@@ -821,7 +821,7 @@ class LifecycleTests(unittest.TestCase):
             (device / 'driver').symlink_to(driver)
             (base / 'cmdline').write_text('memmap=24G$4G')
             (base / 'online').write_text('0-31')
-            manifest = {'config': config}
+            manifest = {'config': config, 'environment': {}}
             commands = []
 
             def path(value):
@@ -838,6 +838,7 @@ class LifecycleTests(unittest.TestCase):
             with patch.object(pipeline, 'Path', side_effect=path), patch.object(pipeline, 'PCI', devices), \
                  patch.object(pipeline, 'linux_only'), patch.object(pipeline, 'manifest_for', return_value=manifest), \
                  patch.object(pipeline, 'check_no_workload'), patch.object(pipeline, 'verify_gpu'), \
+                 patch.object(pipeline, 'audit_gdrdrv') as gdr_audit, \
                  patch.object(pipeline, 'dmesg_text', return_value=''), \
                  patch.object(pipeline, 'module_state', return_value={}), \
                  patch.object(pipeline, 'virtual_device', return_value=device), \
@@ -845,6 +846,8 @@ class LifecycleTests(unittest.TestCase):
                  patch.object(pipeline.subprocess, 'run', side_effect=execute):
                 with self.assertRaises(subprocess.CalledProcessError):
                     pipeline.load(SimpleNamespace(build_dir=base / 'build', bdf=None))
+            gdr_audit.assert_not_called()
+            self.assertFalse(any('gdrdrv' in ' '.join(c) for c in commands))
             self.assertEqual((driver / 'unbind').read_text(), device.name)
             self.assertEqual((driver / 'bind').read_text(), device.name)
             self.assertTrue(all(c[0] != 'rmmod' for c in commands))
@@ -861,6 +864,7 @@ class LifecycleTests(unittest.TestCase):
                 nvtable.write_text('0x1234 nvidia_p2p_get_pages nvidia EXPORT_SYMBOL\n')
                 out = base / 'build'
                 env = {'kernel': 'fake-kernel', 'kernel_build': str(kernel), 'nvidia_include': '/fake/nvidia',
+                       'nvidia_license': 'NVIDIA',
                        'nvcc_path': '/fake/cuda/bin/nvcc', 'cuda_root': '/fake/cuda',
                        'nvidia_symvers': str(nvtable), 'gpu': {'cuda_arch': '70'}}
 
@@ -909,7 +913,10 @@ class LifecycleTests(unittest.TestCase):
                 self.assertTrue(all(c[0] in ('make', 'cmake', 'objcopy') for c in manifest['commands']))
                 module_builds = [c for c in manifest['commands'] if c[0] == 'make'
                                  and any(arg.startswith('M=') for arg in c)]
-                self.assertEqual(len(module_builds), 2 if bad_crc else 3)
+                self.assertEqual(len(module_builds), 2)
+                self.assertFalse(any(c[0] == "insmod" for c in manifest["commands"]))
+                if not bad_crc:
+                    self.assertNotIn(pipeline.ARTIFACTS[7], manifest["artifacts_sha256"])
                 for command in module_builds:
                     self.assertIn('CONFIG_DEBUG_INFO_BTF_MODULES=', command)
                     self.assertNotIn('CONFIG_DEBUG_INFO_BTF_MODULES=n', command)
