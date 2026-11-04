@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SwarmIO + CoPilotIO/BaM 的统一入口：doctor/build/load/run/status/unload。
+"""SwarmIO + CoPilotIO/BaM 的统一入口：doctor/build/load/probe/run/compare/status/unload。
 
 支持当前 CPU full-I/O 的 512 B/4 KiB 请求。所有实现来自仓库源码，不生成源码补丁。
 """
@@ -89,7 +89,7 @@ def validate_sources(root):
     """兼容实现必须已在 BaM 源文件中；此处不改写源码或符号表。"""
     root = Path(root)
     files = {name: (root / 'copilotio/bam/module' / name).read_text()
-             for name in ('ctrl.h', 'ctrl.c', 'pci.c')}
+             for name in ('ctrl.h', 'ctrl.c', 'pci.c', 'map.h', 'map.c')}
     if 'struct miscdevice' not in files['ctrl.h'] or 'misc_register(' not in files['ctrl.c']:
         raise Error('BaM 子模块尚未包含 miscdevice 兼容，请检查其提交版本')
     forbidden = r'\b(?:class_create|class_destroy|device_create|device_destroy|cdev_add|cdev_del|cdev_init)\s*\('
@@ -261,7 +261,7 @@ def environment(args, config):
     expected = 'memmap=' + str(config['module']['memmap_size']) + '$' + str(config['module']['memmap_start'])
     online = cpu_set(Path('/sys/devices/system/cpu/online').read_text().strip())
     return {'kernel': release, 'kernel_build': str(kernel.resolve()), 'nvidia_version': version,
-            'nvidia_license': nvidia_license,
+            'nvidia_license': nvidia_license, 'notify_memory': notification_memory(config),
             'nvidia_symvers': str(symvers), 'nvidia_include': str(include),
             'nvidia_symvers_sha256': digest(symvers), 'gpu': gpu,
             'boot_reservation': expected, 'boot_reservation_ready': expected in Path('/proc/cmdline').read_text().split(),
@@ -391,7 +391,8 @@ def build(args, config):
         for engine, source_name in (('bam', 'bam'), ('copilotio', 'copilot-io')):
             execute(['cmake', '-S', str(bench_source), '-B', str(out / engine),
                      '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CUDA_ARCHITECTURES=' + env['gpu']['cuda_arch'],
-                     '-DCMAKE_CUDA_COMPILER=' + env['nvcc_path'], '-DENGINE=' + engine,
+                     '-DCMAKE_CUDA_COMPILER=' + env['nvcc_path'],
+                     '-DCUDAToolkit_ROOT=' + env['cuda_root'], '-DENGINE=' + engine,
                      '-DENGINE_SOURCE=' + str(ROOT / 'copilotio' / source_name),
                      '-DBENCH_SOURCE=' + str(ROOT / 'copilotio/microbenchmark/swarmio_read.cu'),
                      *(['-DGDRCOPY_SOURCE=' + str(gdr), '-DGDRCOPY_LIBRARY=' + str(out / ARTIFACTS[6])]
@@ -472,7 +473,7 @@ def dmesg_text():
 def check_kernel_health(text):
     lines = text.splitlines()
     for i, line in enumerate(lines):
-        if re.search(r'BUG:|Oops:|exited with irqs disabled', line):
+        if re.search(r'BUG:|Oops:|UBSAN:|KASAN:|exited with irqs disabled', line):
             context = '\n'.join(lines[max(0, i - 20):i + 90])
             if re.search(r'swarmio|libnvm', context, re.I):
                 raise Error('本次启动已记录 SwarmIO/BaM 内核异常；保存 status 后正常重启，不继续加载/运行/卸载')
@@ -660,6 +661,10 @@ def run(args):
     if args.access:
         bench['access_type'] = {'read': 0, 'write': 1}[args.access]
     validate_benchmark(bench, manifest['config'])
+    bench['doorbell_mode'] = getattr(args, 'doorbell_mode', 'mmio')
+    is_probe = getattr(args, 'probe_only', False)
+    if is_probe:
+        bench['probe_only'] = True
     monitor_interval = getattr(args, 'monitor_interval', None)
     bar_latency = getattr(args, 'bar_latency', False)
     if bar_latency and monitor_interval is None:
@@ -678,19 +683,20 @@ def run(args):
         bench['notify_memory'] = mode
         if mode == 'gdr' and (not (MODULES / 'gdrdrv').exists() or not Path('/dev/gdrdrv').exists()):
             raise Error('CoPilotIO 需要本次 load 加载的 gdrdrv')
-        base, cores = args.copilot_base_core, min(args.copilot_cores, bench['num_queues'])
-        polling = set(range(base, base + cores))
-        if base < 0 or cores < 1 or base + cores > 1024 or not polling <= set(os.sched_getaffinity(0)):
-            raise Error('CoPilot 轮询 CPU 不在当前允许集合内')
-        if polling & cpu_set(manifest['config']['module']['cpus']):
-            raise Error('CoPilot 轮询 CPU 不能与 SwarmIO 服务 CPU 重叠')
-        huge_needed = bench['num_queues'] * (int(bench['queue_depth'] * 64 > 4096) + int(bench['queue_depth'] * 16 > 4096))
-        meminfo = Path('/proc/meminfo').read_text()
-        free = re.search(r'^HugePages_Free:\s+(\d+)', meminfo, re.M)
-        size = re.search(r'^Hugepagesize:\s+(\d+)', meminfo, re.M)
-        if huge_needed and (not free or not size or int(size[1]) != 2048 or int(free[1]) < huge_needed):
-            raise Error(f'CoPilotIO CPU 连续队列需要至少 {huge_needed} 个空闲 2 MiB hugepages；请先预留')
-        bench.update(copilot_base_core=base, copilot_cores=cores)
+        if not is_probe:
+            base, cores = args.copilot_base_core, min(args.copilot_cores, bench['num_queues'])
+            polling = set(range(base, base + cores))
+            if base < 0 or cores < 1 or base + cores > 1024 or not polling <= set(os.sched_getaffinity(0)):
+                raise Error('CoPilot 轮询 CPU 不在当前允许集合内')
+            if polling & cpu_set(manifest['config']['module']['cpus']):
+                raise Error('CoPilot 轮询 CPU 不能与 SwarmIO 服务 CPU 重叠')
+            huge_needed = bench['num_queues'] * (int(bench['queue_depth'] * 64 > 4096) + int(bench['queue_depth'] * 16 > 4096))
+            meminfo = Path('/proc/meminfo').read_text()
+            free = re.search(r'^HugePages_Free:\s+(\d+)', meminfo, re.M)
+            size = re.search(r'^Hugepagesize:\s+(\d+)', meminfo, re.M)
+            if huge_needed and (not free or not size or int(size[1]) != 2048 or int(free[1]) < huge_needed):
+                raise Error(f'CoPilotIO CPU 连续队列需要至少 {huge_needed} 个空闲 2 MiB hugepages；请先预留')
+            bench.update(copilot_base_core=base, copilot_cores=cores)
     check_library(args.build_dir / ARTIFACTS[bi], args.build_dir / ARTIFACTS[li])
     directory = ROOT / 'results' / dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
     directory.mkdir(parents=True)
@@ -699,7 +705,7 @@ def run(args):
     # 本次 libnvm 优先；保留可能必需的 CUDA/驱动兼容库路径。
     child_env['LD_LIBRARY_PATH'] = os.pathsep.join([str(args.build_dir / engine / 'lib'), str(args.build_dir / 'gdrcopy/src')]) + (
         os.pathsep + child_env['LD_LIBRARY_PATH'] if child_env.get('LD_LIBRARY_PATH') else '')
-    record = {'notify_memory': bench.get('notify_memory', 'none'), 'engine': engine, 'benchmark': bench, 'command': command, 'gpu': manifest['environment']['gpu'], 'state': 'running',
+    record = {'operation': 'probe' if is_probe else 'read', 'doorbell_mode': bench['doorbell_mode'], 'notify_memory': bench.get('notify_memory', 'none'), 'engine': engine, 'benchmark': bench, 'command': command, 'gpu': manifest['environment']['gpu'], 'state': 'running',
               'build_manifest_sha256': digest(args.build_dir / 'manifest.json'),
               'bar_latency_requested': bar_latency}
     print('输出目录：', directory, flush=True)
@@ -754,7 +760,8 @@ def run(args):
                 except Exception as exc:
                     print('监控报告生成失败，保留原始 CSV：', exc, flush=True)
     text = (directory / 'bench.log').read_text(errors='replace')
-    record.update(returncode=code, state='completed' if code == 0 and 'Ops/sec:' in text else 'incomplete')
+    marker = 'Probe OK:' if is_probe else 'Ops/sec:'
+    record.update(returncode=code, state='completed' if code == 0 and marker in text else 'incomplete')
     try:
         check_kernel_health(dmesg_text())
     except Error:
@@ -770,12 +777,18 @@ def run(args):
     (directory / 'after.log').write_text(snapshot())
     if record['state'] != 'completed':
         raise Error('本轮没有正常完成；日志位于 ' + str(directory) + '；不自动重跑或卸载')
-    print('本轮吞吐统计已完成；不包含逐字节内容校验。')
+    print('映射检查通过，未执行 NVMe I/O。' if is_probe else '本轮吞吐统计已完成；不包含逐字节内容校验。')
     return directory
+
+
+def probe(args):
+    args.probe_only = True
+    return run(args)
 
 
 def compare(args):
     # Finite runs share the loaded controller. Stop immediately on any failure.
+    args.probe_only = False
     args.random, args.access = True, 'read'
     for name, value in [('threads', 1024), ('reqs', 8), ('num_queues', 8), ('queue_depth', 512)]:
         if getattr(args, name, None) is None:
@@ -789,7 +802,10 @@ def compare(args):
         mode = re.search(r'Notification memory:\s*(host|gdr)\b', log)
         if engine == 'copilotio' and not mode:
             raise Error('CoPilotIO 日志缺少通知模式，不能输出未标记的性能对比')
-        rows.append({'notify_memory': mode[1] if mode else 'none', 'engine': engine, 'ops_per_sec': float(rate[1]), 'result_dir': str(directory)})
+        doorbells = re.search(r'Doorbell mode:\s*(mmio|relay)\b', log)
+        if not doorbells or doorbells[1] != getattr(args, 'doorbell_mode', 'mmio'):
+            raise Error('日志缺少匹配的 doorbell 模式，拒绝输出混合传输模式的对比')
+        rows.append({'doorbell_mode': doorbells[1], 'notify_memory': mode[1] if mode else 'none', 'engine': engine, 'ops_per_sec': float(rate[1]), 'result_dir': str(directory)})
     destination = ROOT / 'results' / ('compare-' + dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
     destination.mkdir(parents=True)
     with (destination / 'comparison.csv').open('w') as stream:
@@ -857,6 +873,8 @@ def main():
     commands = parser.add_subparsers(dest='command', required=True)
     for name in ('doctor', 'build'):
         p = commands.add_parser(name, help='检查环境' if name == 'doctor' else '编译全部产物')
+        p.add_argument('--notify-memory', choices=('host', 'gdr'),
+                       help='覆盖配置中的 CoPilotIO 通知位置；默认保留配置值，写入本次构建记录')
         p.add_argument('--gpu', help='nvidia-smi 的目标 index/UUID，默认使用配置中的 GPU')
         p.add_argument('--nvidia-symvers', type=Path)
         p.add_argument('--nvidia-include', type=Path)
@@ -865,9 +883,11 @@ def main():
             p.add_argument('--jobs', type=int, default=8)
     p = commands.add_parser('load', help='加载 SwarmIO、libnvm 和 gdrdrv 并绑定虚拟控制器')
     p.add_argument('--bdf', help='可选；必须属于 SwarmIO 虚拟设备')
-    p = commands.add_parser('run', aliases=['compare'], help='单轮读检查；compare 顺序比较 BaM/CoPilotIO')
+    p = commands.add_parser('run', aliases=['compare', 'probe'], help='run 单轮读；compare 两引擎随机读对比；probe 仅检查映射')
     for name in ('threads', 'reqs', 'queue-depth', 'num-queues', 'page-size', 'num-blks', 'pages'):
         p.add_argument('--' + name, type=int)
+    p.add_argument('--doorbell-mode', choices=('mmio', 'relay'), default='mmio',
+                   help='mmio 由 GPU 直接访问 BAR；relay 使用 CPU 转发虚拟 SSD doorbell，结果会单独标记')
     p.add_argument('--engine', choices=('copilotio', 'bam'), default='copilotio')
     p.add_argument('--copilot-base-core', type=int, default=0)
     p.add_argument('--copilot-cores', type=int, default=4)
@@ -885,6 +905,8 @@ def main():
     try:
         if args.command in ('doctor', 'build'):
             config = read_config(args.config)
+            if args.notify_memory is not None:
+                config['notify_memory'] = args.notify_memory
             if args.command == 'doctor':
                 report = environment(args, config)
                 print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -893,7 +915,7 @@ def main():
             else:
                 build(args, config)
         else:
-            {'load': load, 'run': run, 'compare': compare, 'status': status, 'unload': unload}[args.command](args)
+            {'load': load, 'run': run, 'compare': compare, 'probe': probe, 'status': status, 'unload': unload}[args.command](args)
         return 0
     except (Error, OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
         print('ERROR:', exc, file=sys.stderr)

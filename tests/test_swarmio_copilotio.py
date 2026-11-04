@@ -15,6 +15,152 @@ pipeline = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pipeline)
 
 class CoPilotTests(unittest.TestCase):
+    def test_probe_only_maps_and_releases_without_queue_apis(self):
+        if not shutil.which('c++'):
+            self.skipTest('no C++ compiler')
+        source=(ROOT/'copilotio/microbenchmark/swarmio_read.cu').read_text()
+        probe=source[source.index('static int probe_mapping('):source.index('__global__ void read_kernel(')]
+        prelude=r'''
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <cstdio>
+#include <cassert>
+#include <cstdint>
+#include <cstddef>
+using error=std::runtime_error;
+constexpr int O_RDWR=2,cudaSuccess=0;
+static int bar[2048];
+static int controls=0,dmas=0,aliases=0,notifications=0,doorbells_active=0;
+static bool gpu_failure=false;
+struct Config { bool relay_doorbells=false,host_notify=true; size_t num_queues=1; int gpu=0; };
+struct nvm_ctrl_t { void* mm_ptr=bar; };
+struct dma { unsigned n_ioaddrs=16; };
+static int open(const char*,int) { return 42; }
+static int close(int fd) { assert(fd==42); return 0; }
+static int nvm_ctrl_init(nvm_ctrl_t** p,int fd) { assert(fd==42); *p=new nvm_ctrl_t; ++controls; return 0; }
+static void nvm_ctrl_free(nvm_ctrl_t* p) { delete p; --controls; }
+static bool nvm_ok(int s) { return s==0; }
+static const char* nvm_strerror(int) { return "error"; }
+static int cudaHostGetDevicePointer(void** d,void* h,int) { *d=h; ++aliases; return 0; }
+static const char* cudaGetErrorString(int) { return "error"; }
+static int cudaDeviceSynchronize() { return 0; }
+#define cuda_err_chk(s) assert((s)==0)
+class DoorbellMapping {
+public:
+    void init(nvm_ctrl_t*,size_t n,bool) { assert(n==1); ++doorbells_active; }
+    ~DoorbellMapping() { --doorbells_active; }
+};
+class CoPilotNotify {
+    bool initialized=false;
+public:
+    void init(bool host) { assert(host); initialized=true; ++notifications; }
+    ~CoPilotNotify() { if(initialized) --notifications; }
+};
+static std::shared_ptr<dma> createDma(nvm_ctrl_t*,size_t n,int gpu=-1) {
+    assert(n==65536);
+    if(gpu>=0 && gpu_failure) throw error("P2P failure");
+    ++dmas; return std::shared_ptr<dma>(new dma,[](dma* p){ delete p; --dmas; });
+}
+// Deliberately provide no reset, admin queue, read/write, or CPU agent APIs.
+'''
+        checks=r'''
+int main() {
+    Config c;
+    assert(probe_mapping(c)==0);
+    assert(aliases==1 && !controls && !dmas && !notifications && !doorbells_active);
+    c.relay_doorbells=true;
+    assert(probe_mapping(c)==0);
+    assert(aliases==1 && !controls && !dmas && !notifications && !doorbells_active);
+    gpu_failure=true;
+    try { probe_mapping(c); assert(false); } catch(const std::runtime_error&) {}
+    assert(!controls && !dmas && !notifications && !doorbells_active);
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            unit,binary=Path(d)/'probe.cpp',Path(d)/'probe'
+            unit.write_text(prelude+probe+checks)
+            for defines in ([], ['-DSWARMIO_COPILOT']):
+                subprocess.run(['c++','-std=c++17',*defines,str(unit),'-o',str(binary)],check=True)
+                subprocess.run([str(binary)],check=True,stdout=subprocess.DEVNULL,timeout=10)
+
+    def test_doorbell_relay_stride_admin_isolation_and_cleanup(self):
+        if not shutil.which('c++'):
+            self.skipTest('no C++ compiler')
+        runtime = r'''
+#pragma once
+#include <cstdlib>
+#include <cstddef>
+using cudaError_t=int;
+constexpr int cudaSuccess=0,cudaHostAllocMapped=2,cudaHostRegisterMapped=2,cudaHostRegisterIoMemory=4;
+inline int allocations=0,frees=0,registrations=0,unregistrations=0;
+inline bool fail_register=false,fail_alias=false;
+inline unsigned last_flags=0;
+inline int cudaHostAlloc(void** p,size_t n,unsigned flags) {
+    if(flags!=cudaHostAllocMapped) abort();
+    *p=calloc(1,n); ++allocations; return 0;
+}
+inline int cudaHostGetDevicePointer(void** d,void* h,unsigned) { *d=h; return fail_alias ? 1 : 0; }
+inline int cudaFreeHost(void* p) { free(p); ++frees; return 0; }
+inline int cudaHostRegister(void*,size_t,unsigned flags) { ++registrations; last_flags=flags; return fail_register?1:0; }
+inline int cudaHostUnregister(void*) { ++unregistrations; return 0; }
+inline const char* cudaGetErrorString(int) { return "invalid argument"; }
+'''
+        unit = r'''
+#include <cstdint>
+#include <cassert>
+#include <string>
+#define __NVM_TYPES_H__
+struct nvm_ctrl_t { volatile void* mm_ptr; size_t mm_size; uint8_t dstrd; };
+#include <doorbell_mapping.h>
+int main() {
+    uint32_t bar[2048]={};
+    nvm_ctrl_t ctrl{bar,sizeof(bar),2};
+    auto real=bar+0x1000/4;
+    real[0]=71; real[4]=72; // Preserve both CPU admin doorbells.
+    {
+        DoorbellMapping d; d.init(&ctrl,2,true);
+        assert(registrations==0);
+        auto shadow=d.device_doorbells();
+        for(int i=0;i<6;i++) shadow[i]=i+10;
+        d.poll_once();
+        assert(real[0]==71 && real[4]==72);
+        for(int i=2;i<6;i++) assert(real[i*4]==uint32_t(i+10));
+        real[8]=99; d.poll_once(); assert(real[8]==99); // No repeated writes.
+        shadow[2]=0; d.poll_once(); assert(real[8]==0); // Ring wrap to zero.
+        d.start(); d.destroy(); d.destroy();
+    }
+    assert(allocations==1 && frees==1 && unregistrations==0);
+    { DoorbellMapping d; d.init(&ctrl,2,true); d.device_doorbells()[5]=77; }
+    assert(real[20]==77);
+    assert(allocations==2 && frees==2);
+    { DoorbellMapping d; d.init(&ctrl,2,false); assert(!d.device_doorbells()); }
+    assert(registrations==1 && last_flags==6 && unregistrations==1);
+    fail_register=true;
+    try { DoorbellMapping d; d.init(&ctrl,2,false); assert(false); }
+    catch(const std::runtime_error& e) { assert(std::string(e.what()).find("--doorbell-mode relay")!=std::string::npos); }
+    assert(unregistrations==1);
+    fail_alias=true;
+    try { DoorbellMapping d; d.init(&ctrl,2,true); assert(false); }
+    catch(const std::runtime_error&) {}
+    assert(allocations==3 && frees==3);
+    ctrl.mm_size=0x1004;
+    try { DoorbellMapping d; d.init(&ctrl,2,true); assert(false); }
+    catch(const std::runtime_error&) {}
+    assert(allocations==3);
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            base=Path(d)
+            (base/'cuda_runtime.h').write_text(runtime)
+            source=base/'relay.cpp'
+            source.write_text('#include <cstddef>\n'+unit)
+            for engine in ('bam','copilot-io'):
+                binary=base/'relay'
+                subprocess.run(['c++','-std=c++17','-pthread','-I'+str(base),
+                    '-I'+str(ROOT/'copilotio'/engine/'include'),str(source),'-o',str(binary)],check=True)
+                subprocess.run([str(binary)],check=True,timeout=10)
+
     def test_virtual_bar_layout_restored_after_cxl_header_fixup(self):
         if not shutil.which('cc'):
             self.skipTest('no C compiler')
@@ -291,18 +437,35 @@ int main() {
             def run(args):
                 calls.append((args.engine,args.threads,args.reqs,args.random,args.queue_depth))
                 p=base/args.engine; p.mkdir()
-                (p/'bench.log').write_text('Ops/sec: '+('100' if args.engine=='bam' else '200\nNotification memory: host'))
+                (p/'bench.log').write_text('Doorbell mode: relay\nOps/sec: '+('100' if args.engine=='bam' else '200\nNotification memory: host'))
                 return p
-            args=SimpleNamespace(threads=None,reqs=None,num_queues=None,queue_depth=None)
+            args=SimpleNamespace(threads=None,reqs=None,num_queues=None,queue_depth=None,doorbell_mode='relay')
             with patch.object(pipeline,'ROOT',base), patch.object(pipeline,'run',side_effect=run):
                 pipeline.compare(args)
             self.assertEqual(calls,[('bam',1024,8,True,512),('copilotio',1024,8,True,512)])
             self.assertEqual(len(list((base/'results').glob('compare-*/comparison.csv'))),1)
             summary = json.loads(next((base/'results').glob('compare-*/comparison.json')).read_text())
             self.assertEqual([row['notify_memory'] for row in summary['runs']], ['none', 'host'])
+            self.assertEqual([row['doorbell_mode'] for row in summary['runs']], ['relay', 'relay'])
             with patch.object(pipeline,'run',side_effect=pipeline.Error('failed')) as failed:
                 with self.assertRaises(pipeline.Error): pipeline.compare(args)
                 self.assertEqual(failed.call_count,1)
+
+    def test_compare_rejects_mixed_doorbell_modes(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            for engine, mode in [('bam', 'relay'), ('copilotio', 'mmio')]:
+                directory = base / engine
+                directory.mkdir()
+                (directory / 'bench.log').write_text(
+                    f'Doorbell mode: {mode}\nNotification memory: host\nOps/sec: 100\n')
+            args = SimpleNamespace(threads=1024, reqs=8, num_queues=8,
+                                   queue_depth=512, doorbell_mode='relay')
+            with patch.object(pipeline, 'ROOT', base), \
+                 patch.object(pipeline, 'run', side_effect=lambda a: base / a.engine):
+                with self.assertRaisesRegex(pipeline.Error, 'doorbell'):
+                    pipeline.compare(args)
+            self.assertFalse((base / 'results').exists())
 
     def test_exclusive_buffer_pages(self):
         c=pipeline.read_config(ROOT/'configs/bam-cpu.json')

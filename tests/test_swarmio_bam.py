@@ -797,6 +797,8 @@ class PipelineTests(unittest.TestCase):
     def test_fault_detection_and_command_arguments(self):
         with self.assertRaises(pipeline.Error):
             pipeline.check_kernel_health("BUG: kernel NULL pointer\nRIP: __fill_cq_result [swarmio]\nOops: 0000")
+        with self.assertRaises(pipeline.Error):
+            pipeline.check_kernel_health("UBSAN: array-index-out-of-bounds in map.c:177:51\nmap_userspace [libnvm]")
         pipeline.check_kernel_health("SwarmIO: controller enabled")
         bench = pipeline.read_config(ROOT / "configs/bam-cpu.json")["benchmark"]
         command = pipeline.benchmark_command(Path("/tmp/nvm-block-bench"), bench)
@@ -928,8 +930,8 @@ class LifecycleTests(unittest.TestCase):
 
     def test_run_records_completion_and_selects_gpu_uuid(self):
         config = pipeline.read_config(ROOT / 'configs/bam-cpu.json')
-        for finished in (False, True):
-            with self.subTest(finished=finished), tempfile.TemporaryDirectory() as directory:
+        for finished, probe_only in ((False, False), (True, False), (True, True), (False, True)):
+            with self.subTest(finished=finished, probe_only=probe_only), tempfile.TemporaryDirectory() as directory:
                 base = Path(directory)
                 out = base / 'build'
                 out.mkdir()
@@ -937,10 +939,11 @@ class LifecycleTests(unittest.TestCase):
                 pipeline.save_json(out / 'loaded.json', {'run_state': 'not_started'})
                 probe = base / 'probe.py'
                 probe.write_text('import os\nprint(os.environ["CUDA_VISIBLE_DEVICES"])\n' +
-                                 ('print("Ops/sec: 1")\n' if finished else 'print("Unexpected error")\n'))
+                                 (('print("Probe OK: mappings only")\n' if probe_only else 'print("Ops/sec: 1")\n')
+                                  if finished else 'print("Unexpected error")\n'))
                 manifest = {'config': config, 'environment': {'gpu': {'uuid': 'GPU-12345678'}}}
                 args = SimpleNamespace(engine='bam', build_dir=out, threads=None, reqs=None, queue_depth=None,
-                                       num_queues=None, random=False, access=None, monitor_interval=.1)
+                                       num_queues=None, random=False, access=None, monitor_interval=.1, probe_only=probe_only)
                 sampler = Mock()
                 monitoring = SimpleNamespace(ResourceMonitor=Mock(return_value=sampler), interval_value=float)
                 with patch.object(pipeline, 'ROOT', base), \
@@ -961,6 +964,10 @@ class LifecycleTests(unittest.TestCase):
                 result = next((base / 'results').iterdir())
                 self.assertIn('GPU-12345678', (result / 'bench.log').read_text())
                 expected = 'completed' if finished else 'incomplete'
+                result_record=json.loads((result / 'run.json').read_text())
+                self.assertEqual(result_record['operation'], 'probe' if probe_only else 'read')
+                if probe_only:
+                    self.assertTrue(result_record['benchmark']['probe_only'])
                 sampler.start.assert_called_once()
                 sampler.stop.assert_called_once()
                 self.assertEqual(sampler.report.call_args.args[0]['state'], expected)

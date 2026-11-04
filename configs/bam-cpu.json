@@ -1,5 +1,5 @@
 {
-  "description": "当前 7950X 实验机：CPU 实际复制、512 B 读写、保留内核诊断，不启用 DSA",
+  "description": "目标 Linux 6.8.x / NVIDIA 580.196.07：7950X CPU full-I/O，保留诊断，不启用 DSA",
   "gpu": "0",
   "notify_memory": "host",
   "build": {
