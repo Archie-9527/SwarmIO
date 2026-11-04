@@ -12,7 +12,7 @@
 
 - 入口从已移除的 `bam/` 改为 `copilotio/`，一次构建两套隔离库与可执行文件，
   并构建随附 GDRCopy 用户库、`gdrdrv.ko`。不构建或加载 `nv-p2p-dummy`，使用实际 NVIDIA DKMS CRC。
-- 两套 libnvm 继承原先的 miscdevice、Linux 6.8/NVIDIA 550 P2P 兼容实现。
+- 两套 libnvm 继承原先的 miscdevice、Linux 6.5+ get_user_pages 和 NVIDIA P2P 兼容实现。
   两份内核源码必须一致，否则 doctor 拒绝共用驱动。
 - 用 CUDA/CCCL 原子操作替换旧 freestanding libc++；显式选择架构，CUDA C++17、CMake >= 3.22。
 - 统一有限次读基准 `copilotio/microbenchmark/swarmio_read.cu` 编译两次。
@@ -27,8 +27,10 @@
 
 ## 目标机准备
 
-沿用原目标：Linux `6.8.0-multistream`、NVIDIA 专有驱动 `550.163.01`、CUDA/CCCL、
-支持 P2P 的 Tesla/数据中心 GPU（计算能力 >= 7.0），Python >= 3.9。
+当前目标环境：Linux `6.18.5`、NVIDIA 驱动 `580.196.07`、CUDA `13.0`/CCCL、
+支持 P2P 的 Tesla/数据中心 GPU，Python >= 3.9。
+CUDA 13.0 已移除 Volta 及更早架构的离线编译支持；doctor 通过 `nvcc --list-gpu-code`
+核对目标 GPU，不会强行使用已移除的架构。该环境仍需目标机编译和运行验证。
 需要当前内核构建树和对应 NVIDIA DKMS `Module.symvers`、`nv-p2p.h`。
 不需要额外安装 GDRCopy，构建会使用子仓库内的版本。
 
@@ -67,6 +69,24 @@ sudo bash scripts/run_random_read.sh build-copilotio 1024 8 8 512
 `bam/{lib/libnvm.so,bin/nvm-block-bench}`、
 `copilotio/{lib/libnvm.so,bin/nvm-block-bench}` 和 `gdrcopy/src/` 下的库/驱动。
 `manifest.json` 记录源码、Git 状态、命令、环境和全部产物哈希。
+内核、驱动版本和 DKMS 输入路径从运行环境读取，不固定为旧版本。
+
+### 内核 6.18.5 的 BTF 构建失败
+
+若出现 `failed to find '.BTF' ELF section ... vmlinux`，说明模块的 BTF 生成阶段
+使用了缺少 `.BTF` 段的内核镜像。统一入口对 SwarmIO、libnvm、gdrdrv 均传入
+`CONFIG_DEBUG_INFO_BTF_MODULES=`，在构建阶段关闭模块 BTF，无需重编内核或更换驱动。
+不能写成 `CONFIG_DEBUG_INFO_BTF_MODULES=n`：Kbuild 使用 `ifdef` 判断，非空的 `n`
+仍会开启该步骤；事后 objcopy 去除 BTF 无法挽救此前已经失败的构建。
+
+更新源码后用新目录重建，保留旧失败日志：
+
+```bash
+python3 scripts/swarmio_bam.py --build-dir build-copilotio-6185 build \
+  --jobs 8 --cuda-root /usr/local/cuda-13.0
+```
+
+后续 `load/run/compare/unload` 也必须指定 `--build-dir build-copilotio-6185`。
 
 加载仍只绑定 vendor/device=`0c51:0110` 的 SwarmIO 虚拟控制器，不接管物理 SSD。
 已有 swarmio/libnvm/gdrdrv 时拒绝自动替换。`status`、失败保留现场、SIGINT 和正常

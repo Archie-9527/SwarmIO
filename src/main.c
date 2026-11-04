@@ -472,6 +472,7 @@ static void swarmio_exit(void)
 }
 
 MODULE_LICENSE("GPL v2");
+MODULE_DESCRIPTION("SwarmIO virtual NVMe SSD simulator");
 
 
 /* SWARMIO_FULLIO_BUILD_STATUS：读取 worker 的实际编译模式，禁止运行时写入。 */

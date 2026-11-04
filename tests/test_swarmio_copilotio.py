@@ -14,6 +14,21 @@ pipeline = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pipeline)
 
 class CoPilotTests(unittest.TestCase):
+    def test_empty_btf_override_disables_kbuild_ifdef(self):
+        if not shutil.which('make'):
+            self.skipTest('no make')
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            (base / 'auto.conf').write_text('CONFIG_DEBUG_INFO_BTF_MODULES=y\n')
+            # Match Makefile.modfinal: include the kernel config, then use ifdef.
+            (base / 'Makefile').write_text(
+                'include auto.conf\nifdef CONFIG_DEBUG_INFO_BTF_MODULES\n'
+                '$(error BTF enabled with missing base BTF)\nendif\nall:\n\t@:\n')
+            for value, expected in [('n', False), ('', True)]:
+                result = subprocess.run(['make', 'CONFIG_DEBUG_INFO_BTF_MODULES=' + value],
+                                        cwd=base, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, expected, result.stderr)
+
     def test_poll_phase_wrap_and_metadata(self):
         if not shutil.which('c++'):
             self.skipTest('no C++ compiler')

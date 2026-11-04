@@ -158,7 +158,7 @@ def find_nvcc(cuda_root=None):
     for path in candidates:
         if path.is_file() and os.access(path, os.X_OK):
             return path.resolve()
-    raise Error('找不到可执行 nvcc；请在 doctor/build 后传入 --cuda-root /usr/local/cuda-12.4（按实际版本替换）')
+    raise Error('找不到可执行 nvcc；请在 doctor/build 后传入 --cuda-root /usr/local/cuda-13.0（按实际版本替换）')
 
 
 def require_readable_file(path):
@@ -330,8 +330,10 @@ def build(args, config):
                 if p.suffix in ('.c', '.h'):
                     shutil.copy2(p, destination / p.name)
         shutil.copy2(ROOT / 'Kbuild', source / 'Kbuild')
+        # Kbuild uses ifdef: even "n" enables module BTF. An empty command-line
+        # assignment overrides auto.conf and skips BTF before the final link.
         command = ['make', '-C', env['kernel_build'], 'M=' + str(source), '-j' + str(args.jobs),
-                   'CONFIG_DEBUG_INFO_BTF_MODULES=n', 'KBUILD_EXTRA_SYMBOLS=']
+                   'CONFIG_DEBUG_INFO_BTF_MODULES=', 'KBUILD_EXTRA_SYMBOLS=']
         command += [key + '=' + str(value) for key, value in config['build'].items()]
         execute(command + ['modules'])
         swarmio = out / ARTIFACTS[0]
@@ -353,7 +355,7 @@ def build(args, config):
         execute(['make', '-C', env['kernel_build'], 'M=' + str(gdr / 'src/gdrdrv'),
                  'NVIDIA_SRC_DIR=' + env['nvidia_include'],
                  'KBUILD_EXTRA_SYMBOLS=' + env['nvidia_symvers'],
-                 'HAVE_VM_FLAGS_SET=y', 'HAVE_PROC_OPS=y', 'CONFIG_DEBUG_INFO_BTF_MODULES=n',
+                 'HAVE_VM_FLAGS_SET=y', 'HAVE_PROC_OPS=y', 'CONFIG_DEBUG_INFO_BTF_MODULES=',
                  '-j' + str(args.jobs), 'modules'])
         manifest['gdrdrv_nvidia_import_crcs'] = audit_libnvm(out / ARTIFACTS[7], read_symvers(Path(env['kernel_build']) / 'Module.symvers'),
                      read_symvers(env['nvidia_symvers']), allow_gpl=True)
@@ -378,7 +380,7 @@ def build(args, config):
         (module_source / 'Makefile').write_text('obj-m := libnvm.o\nlibnvm-objs := pci.o list.o ctrl.o map.o\n'
                                                'ccflags-y += -D_CUDA -I' + env['nvidia_include'] + '\n')
         execute(['make', '-C', env['kernel_build'], 'M=' + str(module_source),
-                 'KBUILD_EXTRA_SYMBOLS=' + env['nvidia_symvers'], 'CONFIG_DEBUG_INFO_BTF_MODULES=n',
+                 'KBUILD_EXTRA_SYMBOLS=' + env['nvidia_symvers'], 'CONFIG_DEBUG_INFO_BTF_MODULES=',
                  '-j' + str(args.jobs), 'modules'])
         libnvm = out / ARTIFACTS[1]
         execute(['objcopy', '--remove-section=.BTF', '--remove-section=.BTF.ext',
@@ -810,7 +812,7 @@ def main():
         p.add_argument('--gpu', help='nvidia-smi 的目标 index/UUID，默认使用配置中的 GPU')
         p.add_argument('--nvidia-symvers', type=Path)
         p.add_argument('--nvidia-include', type=Path)
-        p.add_argument('--cuda-root', type=Path, help='CUDA 工具链目录，例如 /usr/local/cuda-12.4；sudo 下也可显式选择')
+        p.add_argument('--cuda-root', type=Path, help='CUDA 工具链目录，例如 /usr/local/cuda-13.0；sudo 下也可显式选择')
         if name == 'build':
             p.add_argument('--jobs', type=int, default=8)
     p = commands.add_parser('load', help='加载 SwarmIO、libnvm 和 gdrdrv 并绑定虚拟控制器')

@@ -907,6 +907,12 @@ class LifecycleTests(unittest.TestCase):
                 manifest = json.loads((out / 'manifest.json').read_text())
                 self.assertEqual(manifest['state'], 'failed' if bad_crc else 'built')
                 self.assertTrue(all(c[0] in ('make', 'cmake', 'objcopy') for c in manifest['commands']))
+                module_builds = [c for c in manifest['commands'] if c[0] == 'make'
+                                 and any(arg.startswith('M=') for arg in c)]
+                self.assertEqual(len(module_builds), 2 if bad_crc else 3)
+                for command in module_builds:
+                    self.assertIn('CONFIG_DEBUG_INFO_BTF_MODULES=', command)
+                    self.assertNotIn('CONFIG_DEBUG_INFO_BTF_MODULES=n', command)
                 self.assertEqual((out / 'swarmio/source/src/dispatcher.c').read_bytes(),
                                  (ROOT / 'src/dispatcher.c').read_bytes())
                 if not bad_crc:
