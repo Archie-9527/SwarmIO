@@ -1,4 +1,4 @@
-[submodule "bam"]
-	path = bam
-	url = https://github.com/Archie-9527/bam.git
-	branch = bam_lab
+[submodule "copilotio"]
+	path = copilotio
+	url = https://github.com/Archie-9527/OSDI26-CoPilotIO.git
+	branch = master
