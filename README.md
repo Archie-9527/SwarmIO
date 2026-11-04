@@ -122,21 +122,67 @@ sudo python3 scripts/swarmio_bam.py --build-dir build-68 compare \
 sudo bash scripts/run_random_read.sh build-68 1024 8 8 512
 ```
 
-4 KiB、1 GiB 地址范围和资源监控示例：
+上面的旧入口省略 `--batch-size` 时保持每线程一次提交、一次等待，供同步回归。
+性能对比使用新的批量微基准入口：**BaM 每线程同步，CoPilotIO 先提交一批，再等待这一批完成**。
+这项对比同时改变了提交方式，结果不能解释为仅更换 CQ 轮询者带来的收益。
+
+更新源码后需重新构建；旧二进制不支持批量参数。使用新目录，例如：
 
 ```bash
-sudo python3 scripts/swarmio_bam.py --build-dir build-68 compare \
-  --threads 4096 --reqs 256 --pages 4096 --num-queues 16 --queue-depth 512 \
+python3 scripts/swarmio_bam.py --build-dir build-68-batch build \
+  --jobs 8 --cuda-root /usr/local/cuda-12.4 --notify-memory host
+# 如果旧 build-68 的模块仍已加载，先在无负载时正常卸载；失败则保留现场。
+sudo python3 scripts/swarmio_bam.py --build-dir build-68 unload
+sudo python3 scripts/swarmio_bam.py --build-dir build-68-batch load
+sudo python3 scripts/swarmio_bam.py --build-dir build-68-batch probe --engine bam
+sudo python3 scripts/swarmio_bam.py --build-dir build-68-batch probe --engine copilotio
+```
+
+512 B、1 GiB 地址范围和资源监控示例（两轮各 1,048,576 次 READ）：
+
+```bash
+sudo python3 scripts/swarmio_microbench.py --build-dir build-68-batch \
+  --threads 512 --reqs 2048 --batch-size 8 --pages 4096 \
+  --num-queues 16 --queue-depth 512 --page-size 512 --num-blks 2097152 \
+  --monitor-interval 0.1
+```
+
+4 KiB 对比只需改请求大小及地址范围计数：
+
+```bash
+sudo python3 scripts/swarmio_microbench.py --build-dir build-68-batch \
+  --threads 512 --reqs 2048 --batch-size 8 --pages 4096 --num-queues 16 --queue-depth 512 \
   --page-size 4096 --num-blks 262144 --monitor-interval 0.1
 ```
 
-两套基准使用相同随机序列和参数，每个线程独占缓冲页，`pages >= threads`。
+`swarmio_microbench.py` 默认就是上述 512 B 负载（默认不开监控）；`--dry-run` 只检查参数并显示命令。
+它复用统一入口的环境检查、运行记录和监控，不加载模块、不更改 hugepages。
+也可以直接使用 `swarmio_bam.py ... compare --batch-size 8`，其他负载参数需按下面的容量约束设置。
+
+批量大小支持 1..32；`--reqs` 始终是每线程总请求数，最后一批不足时按实际剩余数提交。
+两套基准使用相同的每线程随机序列、总请求数、地址范围及缓冲池大小。
+令 `window = min(batch_size, reqs)`，CoPilotIO 每条未完成请求独占缓冲页，要求：
+
+```text
+pages >= threads * window
+ceil(threads / num_queues) * window < queue_depth
+```
+
+第二项为保守的队列容量约束，避免所有线程尚在提交时占满队列、无法进入完成回收。
+例如原来的 4096 线程、16 队列、QD=512 不能直接设 batch=8；示例改用 512 线程，
+每队列最多 32×8=256 条未完成请求。增加每线程 reqs 到 2048 后，总操作数仍为 1048576。
+BaM 每线程只使用一个缓冲页；CoPilotIO 每线程复用自己的 window 个缓冲页，完成一批后才复用。
+CoPilotIO 由 CPU 轮询 CQ、发布状态与队列回收表，GPU 等待 CID 通知并独立推进 CQ/SQ，
+无需按请求提交顺序等待 CQ 槽位回收；host 模式下回收表也使用 CPU 映射内存，不依赖 gdrdrv。
+
 每次逻辑操作一条 NVMe READ，不含旧版 `read_data` 的额外读取，所以不直接对比旧历史 IOPS。
 当前基准仅支持读；检查 NVMe 完成状态，不做逐字节内容校验。8192 次请求是短路径检查，
 性能测量应使用更长负载和重复测量，且不能把采样开销忽略。
 
 每轮有 `run.json`、`bench.log`、运行前后现场。compare 另生成 `comparison.csv/json`，
-标注 `notify_memory` 与 `doorbell_mode`；probe 的日志标记为 `operation=probe`，不产生 IOPS 对比。
+标注 `notify_memory`、`doorbell_mode`、`submission_mode`、`batch_size` 和 `effective_batch_size`；
+日志应显示 BaM 的 `Submission mode: sync / Batch size: 1`，CoPilotIO 的 `batch / 8`。
+probe 的日志标记为 `operation=probe`，不产生 IOPS 对比。
 监控可生成资源 CSV、HTML/SVG；`--bar-latency` 需与 `--monitor-interval` 配合。
 
 ## 5. 显式兼容模式与清理

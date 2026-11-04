@@ -57,6 +57,7 @@ public:
     void init(bool host) { assert(host); initialized=true; ++notifications; }
     ~CoPilotNotify() { if(initialized) --notifications; }
 };
+using CoPilotCQTable=CoPilotNotify;
 static std::shared_ptr<dma> createDma(nvm_ctrl_t*,size_t n,int gpu=-1) {
     assert(n==65536);
     if(gpu>=0 && gpu_failure) throw error("P2P failure");
@@ -242,7 +243,7 @@ int main(void) {
             self.skipTest('no C++ compiler')
         include = ROOT / 'copilotio/copilot-io/include'
         header = (include / 'copilot.h').read_text()
-        cls = header[header.index('class CoPilotNotify {'):header.index('class CoPilotCQTable {')]
+        cls = header[header.index('class CoPilotNotify {'):header.index('struct copilot_cq_info')]
         unit = r'''
 #include <copilot_types.h>
 #include <cstdio>
@@ -294,6 +295,18 @@ int main() {
     pointer_failure=true;
     { CoPilotNotify n; try { n.init(true); assert(false); } catch(const std::runtime_error&) {} }
     assert(allocations==2 && releases==2);
+    pointer_failure=false;
+    {
+        CoPilotCQTable t; t.init(true);
+        assert((char*)t.gpu_ptr==(char*)t.cpu_ptr+4096);
+        assert(t.cpu_ptr->ready[4095]==0);
+        t.destroy(); t.destroy();
+        assert(!t.cpu_ptr && !t.gpu_ptr);
+    }
+    assert(allocations==3 && releases==3);
+    pointer_failure=true;
+    { CoPilotCQTable t; try { t.init(true); assert(false); } catch(const std::runtime_error&) {} }
+    assert(allocations==4 && releases==4);
 }
 '''
         with tempfile.TemporaryDirectory() as d:
@@ -312,9 +325,10 @@ int main() {
         agent = (include / 'copilot.h').read_text().split('class CoPilotNotify {', 1)[0] + '\n#endif\n'
         checks = '''
 #include <cstddef>
-static_assert(sizeof(copilot_notify_entry) == 16);
+static_assert(sizeof(copilot_notify_entry) == 20);
 static_assert(offsetof(copilot_notify_entry, ready) == 0);
 static_assert(offsetof(copilot_notify_entry, cq_head) == 12);
+static_assert(offsetof(copilot_notify_entry, status) == 16);
 static_assert(sizeof(copilot_cq_table_entry) == 4);
 static_assert(sizeof(copilot_cq_table) == COPILOT_CQ_MAX_DEPTH * 8 + 8);
 void access(copilot_notify_entry* notify, copilot_cq_table* table) {
@@ -405,17 +419,22 @@ static void copilot_pause() {}
 int main() {
     nvm_cpl_t cq[4] = {};
     copilot_notify_entry notices[8] = {};
-    copilot_cq_info ci = {cq,3,2,notices,nullptr,0,0};
+    copilot_cq_table table = {};
+    copilot_cq_info ci = {cq,3,2,notices,&table,0,0};
     std::atomic<bool> stop(false);
     copilot_thread_args args = {&ci,1,0,&stop};
     pthread_t thread;
     assert(!pthread_create(&thread,nullptr,copilot_poll_thread,&args));
     for (uint32_t h=0;h<100;h++) {
         uint32_t cid=h%8,pos=h%4,phase=(~(h>>2))&1;
-        static_cast<volatile nvm_cpl_t*>(cq)[pos].dword[3]=cid|(phase<<16);
+        static_cast<volatile nvm_cpl_t*>(cq)[pos].dword[2]=(h+1)%4;
+        static_cast<volatile nvm_cpl_t*>(cq)[pos].dword[3]=cid|(phase<<16)|((h%3)<<17);
         while(!notices[cid].ready) {}
         copilot_sfence();
         assert(notices[cid].pos==pos && notices[cid].loc==h && notices[cid].cq_head==h);
+        assert(notices[cid].status==h%3);
+        assert(table.ready[pos]==1 && table.entries[pos].cid==cid && table.entries[pos].sq_head==(h+1)%4);
+        table.ready[pos]=0;
         notices[cid].ready=0;
     }
     stop.store(true);
@@ -440,14 +459,17 @@ int main() {
                 (p/'bench.log').write_text('Doorbell mode: relay\nOps/sec: '+('100' if args.engine=='bam' else '200\nNotification memory: host'))
                 return p
             args=SimpleNamespace(threads=None,reqs=None,num_queues=None,queue_depth=None,doorbell_mode='relay')
-            with patch.object(pipeline,'ROOT',base), patch.object(pipeline,'run',side_effect=run):
+            manifest={'config': pipeline.read_config(ROOT/'configs/bam-cpu.json')}
+            with patch.object(pipeline,'ROOT',base), patch.object(pipeline,'run',side_effect=run), \
+                 patch.object(pipeline,'manifest_for',return_value=manifest):
                 pipeline.compare(args)
             self.assertEqual(calls,[('bam',1024,8,True,512),('copilotio',1024,8,True,512)])
             self.assertEqual(len(list((base/'results').glob('compare-*/comparison.csv'))),1)
             summary = json.loads(next((base/'results').glob('compare-*/comparison.json')).read_text())
             self.assertEqual([row['notify_memory'] for row in summary['runs']], ['none', 'host'])
             self.assertEqual([row['doorbell_mode'] for row in summary['runs']], ['relay', 'relay'])
-            with patch.object(pipeline,'run',side_effect=pipeline.Error('failed')) as failed:
+            with patch.object(pipeline,'run',side_effect=pipeline.Error('failed')) as failed, \
+                 patch.object(pipeline,'manifest_for',return_value=manifest):
                 with self.assertRaises(pipeline.Error): pipeline.compare(args)
                 self.assertEqual(failed.call_count,1)
 
@@ -462,6 +484,7 @@ int main() {
             args = SimpleNamespace(threads=1024, reqs=8, num_queues=8,
                                    queue_depth=512, doorbell_mode='relay')
             with patch.object(pipeline, 'ROOT', base), \
+                 patch.object(pipeline, 'manifest_for', return_value={'config': pipeline.read_config(ROOT/'configs/bam-cpu.json')}), \
                  patch.object(pipeline, 'run', side_effect=lambda a: base / a.engine):
                 with self.assertRaisesRegex(pipeline.Error, 'doorbell'):
                     pipeline.compare(args)

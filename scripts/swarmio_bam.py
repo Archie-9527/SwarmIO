@@ -107,6 +107,18 @@ def validate_benchmark(bench, config):
             raise Error(name + ' 必须为正整数')
     if bench['pages'] < bench['threads']:
         raise Error('pages 必须不少于 threads，避免并发请求覆盖同一缓冲页')
+    batch = bench.get('batch_size', 1)
+    if type(batch) is not int or not 1 <= batch <= 32:
+        raise Error('batch_size 必须是 1..32 的整数')
+    window = min(batch, bench['reqs'])
+    if bench['pages'] < bench['threads'] * window:
+        raise Error(f"批量请求需要 pages >= threads * min(batch_size, reqs) = {bench['threads'] * window}")
+    per_queue = (bench['threads'] + bench['num_queues'] - 1) // bench['num_queues']
+    if batch > 1 and per_queue * window >= bench['queue_depth']:
+        raise Error(f"批量请求超过队列容量：ceil(threads/num_queues) * min(batch_size,reqs) = {per_queue * window}，"
+                    f"必须小于 queue_depth={bench['queue_depth']}；请减少 threads/batch_size 或增加队列数/深度")
+    if bench['threads'] * bench['reqs'] * bench['page_size'] > (1 << 64) - 1:
+        raise Error('请求总字节数超过 64 位计数范围')
     if bench['access_type'] != 0:
         raise Error('本分支统一基准仅支持读测试')
     if bench['page_size'] not in (512, 4096) or bench['blk_size'] != 64 or bench['threads'] % 64:
@@ -324,7 +336,7 @@ def build(args, config):
     if out.exists() or out == ROOT or out in ROOT.parents or out.is_relative_to(ROOT / 'copilotio'):
         raise Error('构建目录必须是一个新目录，不能覆盖源码或位于 bam 子模块内')
     out.mkdir(parents=True)
-    manifest = {'state': 'building', 'config': config, 'environment': env, 'commands': [],
+    manifest = {'state': 'building', 'benchmark_protocol': 2, 'config': config, 'environment': env, 'commands': [],
                 'source_transformations': False, 'source_sha256': {
                     'swarmio': source_inventory(ROOT), 'copilotio': source_inventory(ROOT / 'copilotio')},
                 'git': {name: {'commit': output(['git', '-C', str(path), 'rev-parse', 'HEAD']),
@@ -647,20 +659,37 @@ def benchmark_command(binary, bench):
         for key, value in bench.items()] + ['--gpu=0', '--n_ctrls=1']
 
 
+def workload_for(args, config, engine):
+    bench = dict(config['benchmark'])
+    for name in ('threads', 'reqs', 'queue_depth', 'num_queues', 'page_size', 'num_blks', 'pages'):
+        if getattr(args, name, None) is not None:
+            bench[name] = getattr(args, name)
+    requested = getattr(args, 'batch_size', None)
+    if getattr(args, 'command', None) == 'compare' and engine == 'bam':
+        requested = 1
+    batch = requested if requested is not None else bench.get('batch_size', 1)
+    if engine == 'bam' and batch != 1:
+        raise Error('BaM 同步基线要求 batch_size=1；compare 的 --batch-size 仅用于 CoPilotIO')
+    # Omit the new flag for old sync-only builds, which have no such CLI option.
+    if batch != 1 or 'batch_size' in bench:
+        bench['batch_size'] = batch
+    if args.random:
+        bench['random'] = True
+    if args.access:
+        bench['access_type'] = {'read': 0, 'write': 1}[args.access]
+    validate_benchmark(bench, config)
+    return bench
+
+
 def run(args):
     linux_only(root=True)
     check_kernel_health(dmesg_text())
     check_no_workload()
     manifest = verify_session(args)
-    bench = dict(manifest['config']['benchmark'])
-    for name in ('threads', 'reqs', 'queue_depth', 'num_queues', 'page_size', 'num_blks', 'pages'):
-        if getattr(args, name, None) is not None:
-            bench[name] = getattr(args, name)
-    if args.random:
-        bench['random'] = True
-    if args.access:
-        bench['access_type'] = {'read': 0, 'write': 1}[args.access]
-    validate_benchmark(bench, manifest['config'])
+    engine = getattr(args, 'engine', 'copilotio')
+    bench = workload_for(args, manifest['config'], engine)
+    if (getattr(args, 'batch_size', None) is not None or bench.get('batch_size', 1) > 1) and manifest.get('benchmark_protocol', 1) < 2:
+        raise Error('当前产物不支持批量提交；请用新构建目录重新 build/load')
     bench['doorbell_mode'] = getattr(args, 'doorbell_mode', 'mmio')
     is_probe = getattr(args, 'probe_only', False)
     if is_probe:
@@ -676,7 +705,6 @@ def run(args):
     if bar_latency:
         from swarmio_monitor import bar_latency_mode
         latency_context = bar_latency_mode()
-    engine = getattr(args, 'engine', 'copilotio')
     bi, li = (5, 4) if engine == 'copilotio' else (3, 2)
     if engine == 'copilotio':
         mode = notification_memory(manifest['config'])
@@ -706,6 +734,8 @@ def run(args):
     child_env['LD_LIBRARY_PATH'] = os.pathsep.join([str(args.build_dir / engine / 'lib'), str(args.build_dir / 'gdrcopy/src')]) + (
         os.pathsep + child_env['LD_LIBRARY_PATH'] if child_env.get('LD_LIBRARY_PATH') else '')
     record = {'operation': 'probe' if is_probe else 'read', 'doorbell_mode': bench['doorbell_mode'], 'notify_memory': bench.get('notify_memory', 'none'), 'engine': engine, 'benchmark': bench, 'command': command, 'gpu': manifest['environment']['gpu'], 'state': 'running',
+              'submission_mode': 'batch' if bench.get('batch_size', 1) > 1 else 'sync',
+              'batch_size': bench.get('batch_size', 1), 'effective_batch_size': min(bench.get('batch_size', 1), bench['reqs']),
               'build_manifest_sha256': digest(args.build_dir / 'manifest.json'),
               'bar_latency_requested': bar_latency}
     print('输出目录：', directory, flush=True)
@@ -789,10 +819,17 @@ def probe(args):
 def compare(args):
     # Finite runs share the loaded controller. Stop immediately on any failure.
     args.probe_only = False
+    args.command = 'compare'
     args.random, args.access = True, 'read'
     for name, value in [('threads', 1024), ('reqs', 8), ('num_queues', 8), ('queue_depth', 512)]:
         if getattr(args, name, None) is None:
             setattr(args, name, value)
+    manifest = manifest_for(args)
+    # Validate both runs before starting BaM, so CoPilot geometry cannot
+    # fail only after an otherwise unnecessary baseline run.
+    workloads = {engine: workload_for(args, manifest['config'], engine) for engine in ('bam', 'copilotio')}
+    if (getattr(args, 'batch_size', None) is not None or workloads['copilotio'].get('batch_size', 1) > 1) and manifest.get('benchmark_protocol', 1) < 2:
+        raise Error('当前产物不支持批量提交；请用新构建目录重新 build/load')
     rows = []
     for engine in ('bam', 'copilotio'):
         args.engine = engine
@@ -805,7 +842,17 @@ def compare(args):
         doorbells = re.search(r'Doorbell mode:\s*(mmio|relay)\b', log)
         if not doorbells or doorbells[1] != getattr(args, 'doorbell_mode', 'mmio'):
             raise Error('日志缺少匹配的 doorbell 模式，拒绝输出混合传输模式的对比')
-        rows.append({'doorbell_mode': doorbells[1], 'notify_memory': mode[1] if mode else 'none', 'engine': engine, 'ops_per_sec': float(rate[1]), 'result_dir': str(directory)})
+        batch = workloads[engine].get('batch_size', 1)
+        submission = re.search(r'Submission mode:\s*(sync|batch)\b', log)
+        logged_batch = re.search(r'^Batch size:\s*(\d+)\s*$', log, re.M)
+        if (getattr(args, 'batch_size', None) is not None or batch > 1) and (not logged_batch or int(logged_batch[1]) != batch or
+                not submission or submission[1] != ('batch' if batch > 1 else 'sync')):
+            raise Error('日志中的提交模式/批量大小与请求不符，拒绝输出性能对比')
+        rows.append({'doorbell_mode': doorbells[1], 'notify_memory': mode[1] if mode else 'none',
+                     'submission_mode': submission[1] if submission else 'sync',
+                     'batch_size': int(logged_batch[1]) if logged_batch else 1,
+                     'effective_batch_size': min(batch, args.reqs),
+                     'engine': engine, 'ops_per_sec': float(rate[1]), 'result_dir': str(directory)})
     destination = ROOT / 'results' / ('compare-' + dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
     destination.mkdir(parents=True)
     with (destination / 'comparison.csv').open('w') as stream:
@@ -865,7 +912,7 @@ def unload(args):
     print('模块已正常卸载。')
 
 
-def main():
+def main(argv=None):
     from swarmio_monitor import interval_value
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=ROOT / 'configs/bam-cpu.json')
@@ -889,6 +936,8 @@ def main():
     p.add_argument('--doorbell-mode', choices=('mmio', 'relay'), default='mmio',
                    help='mmio 由 GPU 直接访问 BAR；relay 使用 CPU 转发虚拟 SSD doorbell，结果会单独标记')
     p.add_argument('--engine', choices=('copilotio', 'bam'), default='copilotio')
+    p.add_argument('--batch-size', type=int,
+                   help='CoPilotIO 每线程先提交后等待的请求数（1..32）；compare 中 BaM 保持同步，省略时为 1')
     p.add_argument('--copilot-base-core', type=int, default=0)
     p.add_argument('--copilot-cores', type=int, default=4)
     p.add_argument('--random', action='store_true')
@@ -900,7 +949,7 @@ def main():
     p = commands.add_parser('status', help='只读收集队列、进程、线程栈和内核日志')
     p.add_argument('--output', type=Path)
     commands.add_parser('unload', help='仅在无负载和无内核异常时正常卸载')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     args.build_dir = args.build_dir.resolve()
     try:
         if args.command in ('doctor', 'build'):
