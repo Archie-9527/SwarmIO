@@ -3,7 +3,8 @@
 SwarmIO 通过 Linux 内核模块创建虚拟 PCI/NVMe SSD，BaM 通过 GPU 发起 NVMe I/O。
 本仓库统一维护一套 **CPU 实际数据复制、512 B/4 KiB I/O、NVIDIA P2P** 的操作流程，
 对应当前 AMD 7950X、`6.8.0-multistream`、NVIDIA 专有驱动 `550.163.01` 实验机。
-DSA 后端源码保留，但不属于本入口的支持配置。
+默认入口仍采用 CPU 后端。针对 lab230-s6 的显式 DSA payload 配置、正确性校验和测试步骤见
+[DSA + BaM 测试说明](docs/dsa-bam-lab230.zh-CN.md)；该基线使用借用队列的同步 DSA MEMMOVE，不自动回退 CPU。
 
 兼容修改已经直接合入源文件，包含中文注释。无需打补丁、修改二进制或复制旧构建目录。
 只维护以下入口：

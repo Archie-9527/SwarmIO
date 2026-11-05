@@ -145,6 +145,10 @@ static inline void __dsa_prep_hw_desc(struct dsa_hw_desc *hw, char opcode,
 }
 
 #ifdef CONFIG_SWARMIO_HAS_DSA
+void swarmio_dsa_error(bool timeout);
+bool swarmio_dsa_faulted(void);
+void swarmio_dsa_submit(void);
+void swarmio_dsa_complete(u64 bytes);
 static inline void __dsa_sync_wait(struct idxd_desc *desc, int timeout)
 {
 	unsigned long timeout_jiffies = jiffies + msecs_to_jiffies(timeout);

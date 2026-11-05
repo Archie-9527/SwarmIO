@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SwarmIO + BaM 的统一入口：doctor/build/load/run/status/unload。
 
-支持当前 CPU full-I/O 的 512 B/4 KiB 请求。所有实现来自仓库源码，不生成源码补丁。
+支持 CPU full-I/O 和显式配置的 DSA payload 基线。所有实现来自仓库源码，不生成源码补丁。
 """
 import argparse
 import csv
@@ -28,6 +28,10 @@ ARTIFACTS = ('swarmio/swarmio.ko', 'libnvm/libnvm.ko',
 
 class Error(RuntimeError):
     pass
+
+
+def is_dsa(config):
+    return config.get('backend', 'cpu') == 'dsa'
 
 
 def output(command, **kwargs):
@@ -100,23 +104,38 @@ def validate_benchmark(bench, config):
     capacity = parse_size(config['module']['memmap_size']) - (4 << 30)
     if bench['num_blks'] * bench['page_size'] > capacity or bench['threads'] > bench['num_blks']:
         raise Error('访问范围超过虚拟 namespace 容量或不足以容纳顺序线程起始 LBA')
+    if is_dsa(config):
+        if bench['access_type'] != 0 or bench['pages'] < bench['threads']:
+            raise Error('DSA 基线仅支持读，pages 必须覆盖所有线程')
+        if bench.get('verify') and (bench['reqs'] != 1 or bench['num_blks'] * bench['page_size'] > config['module']['verify_bytes']):
+            raise Error('逐请求内容校验要求 reqs=1 且访问范围不超过 verify_bytes')
 
 
 def read_config(path):
     config = json.loads(Path(path).read_text())
     build, params = config['build'], config['module']
+    if config.get('backend', 'cpu') not in ('cpu', 'dsa'):
+        raise Error('backend 必须为 cpu 或 dsa')
     required = {'CONFIG_SWARMIO_WORKER_SKIP_IO': 'n', 'CONFIG_SWARMIO_DMA_DISPATCHER': 'n',
-                'CONFIG_SWARMIO_DMA_WORKER': 'n', 'CONFIG_SWARMIO_COMMIT': 'n',
+                'CONFIG_SWARMIO_DMA_WORKER': 'y' if is_dsa(config) else 'n', 'CONFIG_SWARMIO_COMMIT': 'n',
                 'CONFIG_SWARMIO_DISP_ALLOC_WORKER_RR': 'n',
                 'CONFIG_SWARMIO_SQ_DIAGNOSTICS': 'y', 'CONFIG_SWARMIO_QUEUE_DIAGNOSTICS': 'y'}
     if any(build.get(k) != v for k, v in required.items()):
-        raise Error('当前入口要求 CPU full-I/O / single-owner / 诊断开启配置')
+        raise Error('构建必须为所选后端的 full-I/O / single-owner / 诊断开启配置')
     if not 1 < int(build['NR_WORKER_QUEUE_SIZE']) <= 65535:
         raise Error('worker 本地队列必须能由 16 位索引表示，范围为 2..65535')
     if not 1 <= int(build['NR_MAX_IO_QUEUE']) <= 64 or not 1 <= params['qdiag_qid'] <= int(build['NR_MAX_IO_QUEUE']):
         raise Error('当前入口支持最多 64 个 I/O 队列，诊断 QID 必须在范围内')
-    if params['disp_using_dma'] or params['worker_using_dma'] or params['io_unit_shift'] != 9:
-        raise Error('运行参数必须关闭 DSA，并使用 512 B 时序单位')
+    if params['disp_using_dma'] or bool(params['worker_using_dma']) != is_dsa(config) or params['io_unit_shift'] != 9:
+        raise Error('运行参数与后端不符：dispatcher 使用 CPU，worker 按 backend 选择，时序单位为 512 B')
+    if is_dsa(config):
+        if build.get('CONFIG_SWARMIO_WORKER_BATCH_IO') != 'n' or params.get('num_workers_per_service_unit') != 1:
+            raise Error('DSA 基线要求同步 single DMA，每个 service unit 一个 worker')
+        if (params.get('dsa_num_devs') != 1 or params.get('dsa_num_wqs_per_grp') != 2 or
+            params.get('dsa_num_engs_per_grp') != 1 or params.get('dsa_num_grps_per_dev') != params['num_service_units'] or
+            not 1 <= params['num_service_units'] <= 4 or type(params.get('dsa_device_id')) is not int or
+            params['dsa_device_id'] < 0 or params.get('verify_bytes', 0) <= 0 or params['verify_bytes'] % 8):
+            raise Error('DSA 配置要求指定单设备、1..4 group，每组两个 WQ、一个 engine，且配置校验区')
     if params['num_service_units'] <= 0 or params['num_workers_per_service_unit'] <= 0:
         raise Error('服务单元和 worker 数必须为正数')
     needed = params['num_service_units'] * (1 + params['num_workers_per_service_unit'])
@@ -227,7 +246,7 @@ def environment(args, config):
     if 'sm_' + gpu['cuda_arch'] not in output([str(nvcc), '--list-gpu-code']).split():
         raise Error('当前 CUDA 工具链不支持目标 GPU 架构 sm_' + gpu['cuda_arch'])
     nvtable, ktable = read_symvers(symvers), read_symvers(kernel / 'Module.symvers')
-    if 'nvidia_p2p_get_pages' not in nvtable:
+    if not {'nvidia_p2p_get_pages_persistent', 'nvidia_p2p_put_pages_persistent'} <= nvtable.keys():
         raise Error('所选 NVIDIA DKMS 符号表没有 P2P 导出')
     if any(ktable.get(name, {}).get('export') != 'EXPORT_SYMBOL'
            for name in ('misc_register', 'misc_deregister')):
@@ -235,13 +254,63 @@ def environment(args, config):
     validate_sources(ROOT)
     expected = 'memmap=' + str(config['module']['memmap_size']) + '$' + str(config['module']['memmap_start'])
     online = cpu_set(Path('/sys/devices/system/cpu/online').read_text().strip())
-    return {'kernel': release, 'kernel_build': str(kernel.resolve()), 'nvidia_version': version,
+    report = {'kernel': release, 'kernel_build': str(kernel.resolve()), 'nvidia_version': version,
             'nvidia_symvers': str(symvers), 'nvidia_include': str(include),
             'nvidia_symvers_sha256': digest(symvers), 'gpu': gpu,
             'boot_reservation': expected, 'boot_reservation_ready': expected in Path('/proc/cmdline').read_text().split(),
             'service_cpus_online': cpu_set(config['module']['cpus']) <= online,
             'nvcc_path': str(nvcc), 'cuda_root': str(nvcc.parent.parent),
             'nvcc': output([str(nvcc), '--version']), 'cmake': cmake}
+    if is_dsa(config):
+        idxd = getattr(args, 'idxd_include', None)
+        if not idxd:
+            raise Error('DSA 构建需 --idxd-include <匹配 6.8.0-138 内核源码/drivers/dma/idxd>')
+        idxd = idxd.resolve()
+        if not re.fullmatch(r'[/A-Za-z0-9_.+\-]+', str(idxd)):
+            raise Error('IDXD_INCLUDE 路径不能包含空格或 Makefile 特殊字符')
+        for name in ('idxd.h', 'registers.h'):
+            require_readable_file(idxd / name)
+        for name in ('dsa_bus_type', 'idxd_alloc_desc', 'idxd_free_desc', 'idxd_submit_desc', '__dma_request_channel', 'dma_release_channel', 'iommu_get_domain_for_dev'):
+            if name not in ktable: raise Error('目标内核未导出 ' + name)
+        report['idxd_include'] = str(idxd)
+        report['idxd_headers_sha256'] = {p.name: digest(p) for p in idxd.glob('*.h')}
+        report['dsa'] = dsa_environment(config, gpu)
+    return report
+
+
+def dsa_environment(config, gpu):
+    # Check fault/module state before reading accelerator sysfs, which may be
+    # locked by an interrupted teardown in an unhealthy kernel.
+    if (MODULES / 'dsa_gpu_test').exists():
+        raise Error('dsa_gpu_test 仍存在；不能与 SwarmIO 共用队列，going 状态需维护重启')
+    if int(Path('/proc/sys/kernel/tainted').read_text()) & 128:
+        raise Error('内核记录过 Oops；停止新的 DSA 实验，需维护重启')
+    if [x for x in Path('/proc/cmdline').read_text().split() if x.startswith('intel_iommu=')] != ['intel_iommu=off']:
+        raise Error('此 DSA 基线仅支持已验证的 intel_iommu=off')
+    p = config['module']; dev = Path('/sys/bus/dsa/devices') / ('dsa' + str(p['dsa_device_id']))
+    bdf = dev.resolve().parent.name
+    if not re.fullmatch(r'[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]', bdf):
+        raise Error('无法确定所选 DSA 的 PCI BDF')
+    if (dev / 'state').read_text().strip() != 'enabled':
+        raise Error('所选 DSA 尚未启用；先检查 tests/dsa_gpu/prepare_dsa.sh，脚本不自动配置设备')
+    node = int((dev / 'numa_node').read_text())
+    parts = gpu['pci'].lower().split(':'); gpu_bdf = f'{int(parts[0], 16):04x}:' + ':'.join(parts[1:])
+    gpu_node = int((PCI / gpu_bdf / 'numa_node').read_text())
+    if node < 0 or gpu_node != node:
+        raise Error('所选 DSA 与 GPU 不在同一已知 NUMA 节点')
+    node_cpus = cpu_set((Path('/sys/devices/system/node') / f'node{node}/cpulist').read_text().strip())
+    if not cpu_set(p['cpus']) <= node_cpus:
+        raise Error('DSA 服务 CPU 必须与 DSA/GPU 位于同一 NUMA 节点')
+    queues = []
+    for group in range(p['num_service_units']):
+        q = dev / f"wq{p['dsa_device_id']}.{group * 2 + 1}"
+        wanted = {'state': 'enabled', 'type': 'kernel', 'mode': 'dedicated', 'group_id': str(group)}
+        if any((q / k).read_text().strip() != v for k, v in wanted.items()) or (q / 'driver').resolve().name != 'dmaengine':
+            raise Error('payload 队列不是匹配的 dedicated kernel DMAengine WQ：' + q.name)
+        if int((q / 'size').read_text()) < p['num_dma_descs_per_worker']:
+            raise Error('payload WQ 描述符容量不足')
+        queues.append(q.name)
+    return {'device': dev.name, 'pci': bdf, 'numa_node': node, 'gpu_pci': gpu_bdf, 'payload_wqs': queues}
 
 
 def source_inventory(root):
@@ -262,7 +331,7 @@ def audit_libnvm(module, kernel_symbols, nvidia_symbols):
         if len(fields) == 2:
             imported[fields[1]] = int(fields[0], 16)
     names = sorted(name for name in undefined if name.startswith('nvidia_p2p_'))
-    if 'nvidia_p2p_get_pages' not in names:
+    if not {'nvidia_p2p_get_pages', 'nvidia_p2p_get_pages_persistent'}.intersection(names):
         raise Error('libnvm 没有编入 NVIDIA P2P 支持')
     for name in names:
         if name not in nvidia_symbols or imported.get(name) != nvidia_symbols[name]['crc']:
@@ -320,7 +389,9 @@ def build(args, config):
                     shutil.copy2(p, destination / p.name)
         shutil.copy2(ROOT / 'Kbuild', source / 'Kbuild')
         command = ['make', '-C', env['kernel_build'], 'M=' + str(source), '-j' + str(args.jobs),
-                   'CONFIG_DEBUG_INFO_BTF_MODULES=n', 'KBUILD_EXTRA_SYMBOLS=']
+                   'CONFIG_DEBUG_INFO_BTF_MODULES=', 'KBUILD_EXTRA_SYMBOLS=']
+        if is_dsa(config):
+            command += ['IDXD_INCLUDE=' + env['idxd_include']]
         command += [key + '=' + str(value) for key, value in config['build'].items()]
         execute(command + ['modules'])
         swarmio = out / ARTIFACTS[0]
@@ -329,11 +400,18 @@ def build(args, config):
             expected = '0' if field == 'swarmio_skip_io' else '1'
             if output(['modinfo', '-F', field, str(swarmio)]) != expected:
                 raise Error('SwarmIO 编译模式不符：' + field)
-        if re.search(r'\b(?:idxd_\w+|dsa_bus_type)\b', output(['nm', '-u', str(swarmio)])):
+        imports = output(['nm', '-u', str(swarmio)])
+        if not is_dsa(config) and re.search(r'\b(?:idxd_\w+|dsa_bus_type)\b', imports):
             raise Error('CPU SwarmIO 仍然依赖 idxd 私有符号')
+        if is_dsa(config):
+            if not all(name in imports for name in ('idxd_submit_desc', 'dma_release_channel')):
+                raise Error('DSA 构建没有实际 DMA 提交/通道归还接口')
+            if output(['modinfo', '-F', 'swarmio_dsa_mode', str(swarmio)]) != 'borrowed-single-v1':
+                raise Error('不是本次借用队列、无 CPU 回退的 DSA 基线')
         execute(['cmake', '-S', str(ROOT / 'bam'), '-B', str(out / 'bam'),
                  '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CUDA_ARCHITECTURES=' + env['gpu']['cuda_arch'],
                  '-DCMAKE_CUDA_COMPILER=' + env['nvcc_path'], '-DCUDA_TOOLKIT_ROOT_DIR=' + env['cuda_root'],
+                 *(['-DSWARMIO_BENCH_SOURCE=' + str(ROOT / 'benchmarks/bam_dsa_read.cu')] if is_dsa(config) else []),
                  '-Dno_module=ON', '-Dno_cuda=OFF', '-Dno_smartio=ON'])
         execute(['cmake', '--build', str(out / 'bam'), '--target', 'block-benchmark-module', '--parallel', str(args.jobs)])
         module_source = out / 'libnvm/source'
@@ -346,7 +424,7 @@ def build(args, config):
         (module_source / 'Makefile').write_text('obj-m := libnvm.o\nlibnvm-objs := pci.o list.o ctrl.o map.o\n'
                                                'ccflags-y += -D_CUDA -I' + env['nvidia_include'] + '\n')
         execute(['make', '-C', env['kernel_build'], 'M=' + str(module_source),
-                 'KBUILD_EXTRA_SYMBOLS=' + env['nvidia_symvers'], 'CONFIG_DEBUG_INFO_BTF_MODULES=n',
+                 'KBUILD_EXTRA_SYMBOLS=' + env['nvidia_symvers'], 'CONFIG_DEBUG_INFO_BTF_MODULES=',
                  '-j' + str(args.jobs), 'modules'])
         libnvm = out / ARTIFACTS[1]
         execute(['objcopy', '--remove-section=.BTF', '--remove-section=.BTF.ext',
@@ -462,6 +540,9 @@ def load(args):
     if module_state():
         raise Error('已有 swarmio/libnvm；load 不自动卸载或替换活动模块')
     verify_gpu(manifest)
+    dsa = dsa_environment(config, manifest['environment']['gpu']) if is_dsa(config) else None
+    if dsa is not None and dsa != manifest['environment']['dsa']:
+        raise Error('DSA/GPU 拓扑与构建记录不同，请重新 doctor/build')
     params = config['module']
     expected = 'memmap=' + str(params['memmap_size']) + '$' + str(params['memmap_start'])
     if expected not in Path('/proc/cmdline').read_text().split():
@@ -484,7 +565,8 @@ def load(args):
     if previous:
         (device / 'driver/unbind').write_text(device.name)
     try:
-        subprocess.run(['insmod', str(args.build_dir / ARTIFACTS[1]), 'max_num_ctrls=64'], check=True)
+        subprocess.run(['insmod', str(args.build_dir / ARTIFACTS[1]), 'max_num_ctrls=64'] +
+                       (['dma_peer_bdf=' + dsa['pci'], 'max_gpu_pinned_mb=32'] if dsa else []), check=True)
     except subprocess.CalledProcessError:
         if previous and not (device / 'driver').exists():
             (previous / 'bind').write_text(device.name)
@@ -495,10 +577,14 @@ def load(args):
         if (MODULES / 'swarmio/parameters' / name).read_text().strip() != expected_value:
             raise Error('模块状态不符：' + name)
     check_kernel_health(dmesg_text())
+    if dsa is not None:
+        read_dsa_state(manifest)
     save_json(args.build_dir / 'loaded.json', {'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
                'bdf': device.name, 'manifest_sha256': digest(args.build_dir / 'manifest.json'),
                'run_state': 'not_started'})
-    print('已就绪：', device.name, '-> /dev/libnvm0；CPU full-I/O；GPU', manifest['environment']['gpu']['name'])
+    print('已就绪：', device.name, '-> /dev/libnvm0；',
+          'CPU SQ fetch + DSA synchronous payload' if dsa else 'CPU full-I/O',
+          '；GPU', manifest['environment']['gpu']['name'])
 
 
 def verify_session(args):
@@ -529,7 +615,7 @@ def snapshot():
             parts += ['\n$ ' + ' '.join(command), output(command)]
         except (OSError, subprocess.CalledProcessError) as exc:
             parts.append(str(exc))
-    for name in ('skip_io', 'sq_diag_faulted', 'qdiag_sq_state', 'qdiag_cq_state'):
+    for name in ('skip_io', 'sq_diag_faulted', 'qdiag_sq_state', 'qdiag_cq_state', 'dsa_state', 'worker_using_dma'):
         path = MODULES / 'swarmio/parameters' / name
         if path.is_file():
             parts += ['\n' + name + '=', path.read_text().strip()]
@@ -571,13 +657,16 @@ def run(args):
     check_no_workload()
     manifest = verify_session(args)
     bench = dict(manifest['config']['benchmark'])
-    for name in ('threads', 'reqs', 'queue_depth', 'num_queues', 'page_size', 'num_blks'):
+    for name in ('threads', 'reqs', 'queue_depth', 'num_queues', 'page_size', 'num_blks', 'pages'):
         if getattr(args, name, None) is not None:
             bench[name] = getattr(args, name)
     if args.random:
         bench['random'] = True
     if args.access:
         bench['access_type'] = {'read': 0, 'write': 1}[args.access]
+    if getattr(args, 'verify', False):
+        if not is_dsa(manifest['config']): raise Error('--verify 仅用于新的 DSA BaM 基线')
+        bench['verify'] = True
     validate_benchmark(bench, manifest['config'])
     monitor_interval = getattr(args, 'monitor_interval', None)
     bar_latency = getattr(args, 'bar_latency', False)
@@ -599,9 +688,13 @@ def run(args):
     child_env['LD_LIBRARY_PATH'] = str(args.build_dir / 'bam/lib') + (
         os.pathsep + child_env['LD_LIBRARY_PATH'] if child_env.get('LD_LIBRARY_PATH') else '')
     record = {'command': command, 'gpu': manifest['environment']['gpu'], 'state': 'running',
+              'payload_backend': 'dsa-borrowed-single' if is_dsa(manifest['config']) else 'cpu',
+              'sq_backend': 'cpu', 'benchmark': bench,
               'build_manifest_sha256': digest(args.build_dir / 'manifest.json'),
               'bar_latency_requested': bar_latency}
     print('输出目录：', directory, flush=True)
+    dsa_before = read_dsa_state(manifest) if is_dsa(manifest['config']) else None
+    if dsa_before is not None: record['dsa_before'] = dsa_before
     (directory / 'before.log').write_text(snapshot())
     interrupted = [None]
     with latency_context as latency_setting, (directory / 'bench.log').open('wb') as log, (directory / 'bench.log').open('r') as tail:
@@ -654,6 +747,20 @@ def run(args):
                     print('监控报告生成失败，保留原始 CSV：', exc, flush=True)
     text = (directory / 'bench.log').read_text(errors='replace')
     record.update(returncode=code, state='completed' if code == 0 and 'Ops/sec:' in text else 'incomplete')
+    if dsa_before is not None:
+        try:
+            final = read_dsa_state(manifest)
+            record['dsa_after'] = final
+            delta = {k: final[k] - dsa_before[k] for k in ('submitted', 'completed', 'bytes', 'errors', 'timeouts')}
+            record['dsa_delta'] = delta
+            expected = bench['threads'] * bench['reqs']
+            if (delta['submitted'] != expected or delta['completed'] != expected or
+                delta['bytes'] != expected * bench['page_size'] or delta['errors'] or delta['timeouts'] or
+                (bench.get('verify') and 'Verification: PASS' not in text)):
+                record['state'] = 'dsa_mismatch'
+            print('DSA 实际完成计数：', delta, flush=True)
+        except (Error, OSError, ValueError) as exc:
+            record.update(state='dsa_mismatch', dsa_error=str(exc))
     try:
         check_kernel_health(dmesg_text())
     except Error:
@@ -669,7 +776,23 @@ def run(args):
     (directory / 'after.log').write_text(snapshot())
     if record['state'] != 'completed':
         raise Error('本轮没有正常完成；日志位于 ' + str(directory) + '；不自动重跑或卸载')
-    print('本轮吞吐统计已完成；不代表内容校验或随机负载问题已修复。')
+    print('DSA 计数匹配；' + ('内容校验通过。' if bench.get('verify') else '性能轮次未逐字节校验。') if dsa_before is not None
+          else '本轮吞吐统计已完成；不代表内容校验或随机负载问题已修复。')
+
+
+def read_dsa_state(manifest):
+    values = {k: int(v) for k, v in re.findall(r'(\w+)=(\d+)', (MODULES / 'swarmio/parameters/dsa_state').read_text())}
+    needed = {'device', 'borrowed', 'fault', 'submitted', 'completed', 'bytes', 'errors', 'timeouts'}
+    if not needed <= values.keys() or values['fault'] or values['device'] != manifest['config']['module']['dsa_device_id']:
+        raise Error('DSA 状态缺失、设备不匹配或已有 DMA 故障')
+    if values['borrowed'] != manifest['config']['module']['num_service_units']:
+        raise Error('DSA 借用通道数量不匹配')
+    if (MODULES / 'swarmio/parameters/worker_using_dma').read_text().strip() not in ('Y', '1'):
+        raise Error('worker DMA 未启用')
+    expected_peer = manifest['environment']['dsa']['pci']
+    if (MODULES / 'libnvm/parameters/dma_peer_bdf').read_text().strip() != expected_peer:
+        raise Error('GPU 内存映射的 DMA peer 与 DSA 不一致')
+    return values
 
 
 def unload(args):
@@ -725,15 +848,17 @@ def main():
         p.add_argument('--gpu', help='nvidia-smi 的目标 index/UUID，默认使用配置中的 GPU')
         p.add_argument('--nvidia-symvers', type=Path)
         p.add_argument('--nvidia-include', type=Path)
+        p.add_argument('--idxd-include', type=Path, help='匹配运行内核的 drivers/dma/idxd 目录；DSA 构建必需')
         p.add_argument('--cuda-root', type=Path, help='CUDA 工具链目录，例如 /usr/local/cuda-12.4；sudo 下也可显式选择')
         if name == 'build':
             p.add_argument('--jobs', type=int, default=8)
     p = commands.add_parser('load', help='加载两个模块并绑定虚拟控制器')
     p.add_argument('--bdf', help='可选；必须属于 SwarmIO 虚拟设备')
     p = commands.add_parser('run', help='运行单轮读/写检查')
-    for name in ('threads', 'reqs', 'queue-depth', 'num-queues', 'page-size', 'num-blks'):
+    for name in ('threads', 'reqs', 'queue-depth', 'num-queues', 'page-size', 'num-blks', 'pages'):
         p.add_argument('--' + name, type=int)
     p.add_argument('--random', action='store_true')
+    p.add_argument('--verify', action='store_true', help='DSA 基线逐请求内容校验，要求 reqs=1')
     p.add_argument('--access', choices=('read', 'write'))
     p.add_argument('--monitor-interval', type=interval_value,
                    help='启用资源及 NVMe 吞吐采样，单位秒，例如 0.1；范围 0.01..60，默认关闭')

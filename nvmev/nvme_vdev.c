@@ -13,6 +13,13 @@
 #include "pci.h"
 #include "worker.h"
 #include "simple_timing_model.h"
+#include "src/swarmio_pattern.h"
+#include <linux/module.h>
+#include <linux/sched.h>
+
+static unsigned long verify_bytes;
+module_param(verify_bytes, ulong, 0444);
+MODULE_PARM_DESC(verify_bytes, "Initialize this many namespace bytes with the read verification pattern (0 disables)");
 
 struct nvme_vdev *nvme_vdev = NULL;
 extern struct nvme_vdev *vdev __attribute__((alias("nvme_vdev")));
@@ -41,6 +48,22 @@ static int vdev_storage_init(struct nvme_vdev *vdev)
 		kfree(vdev->sched_inst_stat);
 		vdev->sched_inst_stat = NULL;
 		return -ENOMEM;
+	}
+	if (verify_bytes) {
+		unsigned long off;
+		if (verify_bytes > vdev->config.storage_size || (verify_bytes & 7)) {
+			memunmap(vdev->storage_mapped);
+			vdev->storage_mapped = NULL;
+			kfree(vdev->sched_inst_stat);
+			vdev->sched_inst_stat = NULL;
+			return -EINVAL;
+		}
+		for (off = 0; off < verify_bytes; off += 8) {
+			*(u64 *)(vdev->storage_mapped + off) = swarmio_pattern(off / 8);
+			if (!(off & ((1UL << 20) - 1))) cond_resched();
+		}
+		wmb();
+		SWARMIO_INFO("Initialized %lu bytes for read verification\n", verify_bytes);
 	}
 
 	if (swarmio_proc_init(vdev))

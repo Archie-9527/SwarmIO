@@ -1,419 +1,122 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/*
- * Copyright (C) 2026 VIA-Research
- */
-
-#include <linux/kernel.h>
-#include <linux/pci.h>
-#include <linux/dma-mapping.h>
-#include <linux/delay.h>
-#include <linux/idxd.h>
-
-#include <idxd.h>
-
+/* Borrow configured DMAengine channels. Never attach/detach/reset the DSA. */
+#include <linux/module.h>
+#include <linux/dmaengine.h>
+#include <linux/iommu.h>
+#include <linux/panic.h>
+#include <linux/mm.h>
 #include "dsa.h"
 
-// extern const struct bus_type dsa_bus_type;
-extern struct dsa_engine_cfg dsa_engine_cfg_list[];
-extern struct dsa_wq_cfg dsa_wq_cfg_list[];
-extern struct dsa_group_cfg dsa_group_cfg_list[];
-extern struct dsa_dev_cfg dsa_dev_cfg_list[];
-
-struct idxd_device *dsa_idxd_list[DSA_MAX_DEVS] = { NULL };
-extern unsigned int dsa_num_devs;
-extern unsigned int dsa_num_groups_per_dev;
-extern unsigned int dsa_num_wqs_per_group;
+struct idxd_device *dsa_idxd_list[DSA_MAX_DEVS];
+extern unsigned int dsa_num_devs, dsa_num_groups_per_dev, dsa_num_wqs_per_group;
 extern unsigned int dsa_num_engines_per_group;
+extern bool disp_using_dma, worker_using_dma;
+static unsigned int device_id;
+module_param_named(dsa_device_id, device_id, uint, 0444);
+static struct device *held;
+static struct dma_chan *channels[DSA_MAX_WQS];
+static unsigned int groups;
+static atomic_t fault = ATOMIC_INIT(0);
+static atomic64_t submitted = ATOMIC64_INIT(0), completed = ATOMIC64_INIT(0);
+static atomic64_t bytes_done = ATOMIC64_INIT(0), errors = ATOMIC64_INIT(0);
+static atomic64_t timeouts = ATOMIC64_INIT(0);
 
-static inline int __num_wqs_per_dev(void)
+void swarmio_dsa_error(bool timeout)
 {
-	return dsa_num_groups_per_dev * dsa_num_wqs_per_group;
+    atomic_set(&fault, 1); atomic64_inc(&errors);
+    if (timeout) atomic64_inc(&timeouts);
 }
-
-static inline int __num_engines_per_dev(void)
+bool swarmio_dsa_faulted(void) { return atomic_read(&fault); }
+void swarmio_dsa_submit(void) { atomic64_inc(&submitted); }
+void swarmio_dsa_complete(u64 bytes)
 {
-	return dsa_num_groups_per_dev * dsa_num_engines_per_group;
+    atomic64_inc(&completed); atomic64_add(bytes, &bytes_done);
 }
-
-static inline int __wq_id_to_group_id(int wq_id)
+static int state_get(char *buf, const struct kernel_param *kp)
 {
-	if (unlikely(wq_id < 0 || wq_id >= __num_wqs_per_dev()))
-		return -1;
-
-	return dsa_wq_cfg_list[wq_id].group_id;
+    unsigned int i, borrowed = 0;
+    for (i = 0; i < DSA_MAX_WQS; ++i) borrowed += !!channels[i];
+    return scnprintf(buf, PAGE_SIZE,
+        "version=1 device=%u borrowed=%u fault=%d submitted=%lld completed=%lld bytes=%lld errors=%lld timeouts=%lld\n",
+        device_id, borrowed, atomic_read(&fault), atomic64_read(&submitted),
+        atomic64_read(&completed), atomic64_read(&bytes_done), atomic64_read(&errors), atomic64_read(&timeouts));
 }
+static const struct kernel_param_ops state_ops = { .get = state_get };
+module_param_cb(dsa_state, &state_ops, NULL, 0444);
 
-static inline int __engine_id_to_group_id(int engine_id)
+static bool match_channel(struct dma_chan *chan, void *arg)
 {
-	if (unlikely(engine_id < 0 || engine_id >= __num_engines_per_dev()))
-		return -1;
-
-	return dsa_engine_cfg_list[engine_id].group_id;
+    struct idxd_wq *wq = arg;
+    return wq->idxd_chan && chan == &wq->idxd_chan->chan && wq->state == IDXD_WQ_ENABLED;
 }
-
-static struct idxd_device *__dev_id_to_idxd(int id)
-{
-	struct device *dev;
-	struct idxd_dev *idxd_dev;
-	char name[8];
-
-	snprintf(name, sizeof(name), "dsa%d", id);
-
-	dev = bus_find_device_by_name(&dsa_bus_type, NULL, name);
-	if (!dev) {
-		return NULL;
-	}
-
-	idxd_dev = confdev_to_idxd_dev(dev);
-	put_device(dev);
-
-	return idxd_dev_to_idxd(idxd_dev);
-}
-
-static int dsa_validate_params(const struct dsa_cfg_params *p)
-{
-	int i;
-	int total_wqs = p->num_groups_per_dev * p->num_wqs_per_group;
-	int total_engines = p->num_groups_per_dev * p->num_engines_per_group;
-	struct idxd_device *idxd = __dev_id_to_idxd(0);
-
-	if (p->num_devs > DSA_MAX_DEVS) {
-		SWARMIO_ERROR("num_devs exceeds max limit\n");
-		return -EINVAL;
-	}
-
-	if (idxd) {
-		if (total_wqs > idxd->max_wqs) {
-			SWARMIO_ERROR("num_wqs %d exceeds idxd limit %d\n",
-				      total_wqs, idxd->max_wqs);
-			return -EINVAL;
-		}
-
-		if (total_engines > idxd->max_engines) {
-			SWARMIO_ERROR("num_engines %d exceeds idxd limit %d\n",
-				      total_engines, idxd->max_engines);
-			return -EINVAL;
-		}
-	} else {
-		if (p->num_groups_per_dev > DSA_MAX_GROUPS) {
-			SWARMIO_ERROR("num_groups exceeds max limit\n");
-			return -EINVAL;
-		}
-
-		if (total_wqs > DSA_MAX_WQS) {
-			SWARMIO_ERROR("num_wqs exceeds max limit\n");
-			return -EINVAL;
-		}
-
-		if (total_engines > DSA_MAX_ENGINES) {
-			SWARMIO_ERROR("num_engines exceeds max limit\n");
-			return -EINVAL;
-		}
-	}
-
-	for (i = 0; i < p->num_wqs_per_group; i++) {
-		if (idxd) {
-			if (p->wq_sizes[i] > idxd->max_wq_size) {
-				SWARMIO_ERROR(
-					"wq_sizes[%d] %u exceeds idxd limit %u\n",
-					i, p->wq_sizes[i], idxd->max_wq_size);
-				return -EINVAL;
-			}
-		} else if (p->wq_sizes[i] > DSA_MAX_WQ_SIZE) {
-			SWARMIO_ERROR("wq_sizes[%d] %u is too large\n", i,
-				      p->wq_sizes[i]);
-			return -EINVAL;
-		}
-		if (p->wq_priorities[i] < DSA_MIN_PRIORITY ||
-		    p->wq_priorities[i] > DSA_MAX_PRIORITY) {
-			SWARMIO_ERROR(
-				"wq_priorities[%d] %u is out of range (%d - %d)\n",
-				i, p->wq_priorities[i], DSA_MIN_PRIORITY,
-				DSA_MAX_PRIORITY);
-			return -EINVAL;
-		}
-	}
-
-	return 0;
-}
-
 int dsa_set_params(const struct dsa_cfg_params *p)
 {
-	int ret;
-	int i, j, k;
-	int wq_id, eng_id;
-
-	ret = dsa_validate_params(p);
-
-	SWARMIO_DEBUG("set params for %u devices\n", p->num_devs);
-
-	for (i = 0; i < p->num_devs; i++) {
-		struct dsa_dev_cfg *dev = &dsa_dev_cfg_list[i];
-
-		dev->num_groups = p->num_groups_per_dev;
-		wq_id = 0;
-		eng_id = 0;
-
-		if (i != 0)
-			break;
-
-		for (j = 0; j < dev->num_groups; j++) {
-			struct dsa_group_cfg *grp = &dsa_group_cfg_list[j];
-
-			grp->num_wqs = p->num_wqs_per_group;
-			grp->num_engines = p->num_engines_per_group;
-
-			for (k = 0; k < grp->num_wqs; k++) {
-				struct dsa_wq_cfg *wq = &dsa_wq_cfg_list[wq_id];
-				grp->wq_ids[k] = wq_id++;
-				wq->size = p->wq_sizes[k];
-				wq->priority = p->wq_priorities[k];
-				wq->group_id = j;
-			}
-
-			for (k = 0; k < grp->num_engines; k++) {
-				struct dsa_engine_cfg *eng =
-					&dsa_engine_cfg_list[eng_id];
-				grp->engine_ids[k] = eng_id++;
-				eng->group_id = j;
-			}
-		}
-	}
-
-	dsa_num_devs = p->num_devs;
-	dsa_num_groups_per_dev = p->num_groups_per_dev;
-	dsa_num_wqs_per_group = p->num_wqs_per_group;
-	dsa_num_engines_per_group = p->num_engines_per_group;
-
-	return 0;
+    if (!p || p->num_devs != 1 || !p->num_groups_per_dev || p->num_groups_per_dev > 4 ||
+        p->num_wqs_per_group != 2 || p->num_engines_per_group != 1 || !p->wq_sizes ||
+        !p->wq_sizes[0] || !p->wq_sizes[1]) return -EINVAL;
+    groups = p->num_groups_per_dev;
+    dsa_num_devs = 1; dsa_num_groups_per_dev = groups;
+    dsa_num_wqs_per_group = 2; dsa_num_engines_per_group = 1;
+    return 0;
 }
-
-static int dsa_wqs_config(struct idxd_device *idxd)
-{
-	int i, j;
-	struct idxd_wq *wq;
-	int num_wqs = __num_wqs_per_dev();
-
-	if (num_wqs <= 0)
-		return -1;
-
-	for (i = 0; i < dsa_num_groups_per_dev; i++) {
-		idxd->groups[i]->rdbufs_allowed =
-			idxd->max_rdbufs / dsa_num_groups_per_dev;
-		idxd->groups[i]->rdbufs_reserved =
-			idxd->max_rdbufs / dsa_num_groups_per_dev;
-	}
-
-	for (i = 0; i < num_wqs; i++) {
-		wq = idxd->wqs[i];
-		j = __wq_id_to_group_id(i);
-		if (j < 0) {
-			continue;
-		}
-
-		wq->size = dsa_wq_cfg_list[i].size;
-		wq->priority = dsa_wq_cfg_list[i].priority;
-
-		wq->type = IDXD_WQT_KERNEL;
-		wq->threshold = 0;
-		wq->group = idxd->groups[j];
-		wq->flags = 0;
-		set_bit(WQ_FLAG_DEDICATED, &wq->flags);
-		memset(wq->name, 0, WQ_NAME_SIZE);
-		snprintf(wq->name, WQ_NAME_SIZE, "wq%d.%d", idxd->id, i);
-		wq->max_xfer_bytes = 256ULL << 10;
-		wq->max_batch_size = DSA_MAX_BATCH_SIZE;
-	}
-
-	return 0;
-}
-
-static int dsa_engines_config(struct idxd_device *idxd)
-{
-	int i, j;
-	struct idxd_engine *eng;
-	int num_engines = __num_engines_per_dev();
-
-	if (num_engines <= 0)
-		return -1;
-
-	for (i = 0; i < num_engines; i++) {
-		eng = idxd->engines[i];
-		j = __engine_id_to_group_id(i);
-		if (j < 0) {
-			continue;
-		}
-
-		eng->group = idxd->groups[j];
-	}
-
-	return 0;
-}
-
-static int dsa_wqs_enable(struct idxd_device *idxd)
-{
-	int i, rc;
-	struct idxd_wq *wq;
-	int num_enabled = 0;
-
-	int num_wqs = __num_wqs_per_dev();
-	if (num_wqs <= 0)
-		return -EINVAL;
-
-	for (i = 0; i < num_wqs; i++) {
-		wq = idxd->wqs[i];
-		mutex_lock(&wq->wq_lock);
-		rc = idxd_drv_enable_wq(wq);
-		mutex_unlock(&wq->wq_lock);
-		if (rc) {
-			SWARMIO_WARN("failed to enable %s: %d\n", wq->name, rc);
-			continue;
-		}
-		SWARMIO_DEBUG("enabled wq %d\n", wq->id);
-		num_enabled++;
-	}
-
-	if (num_enabled == 0) {
-		return -ENODEV;
-	}
-
-	return 0;
-}
-
-static void dsa_wqs_disable(struct idxd_device *idxd)
-{
-	int i;
-	struct idxd_wq *wq;
-
-	int num_wqs = __num_wqs_per_dev();
-	if (num_wqs <= 0)
-		return;
-
-	for (i = 0; i < num_wqs; i++) {
-		wq = idxd->wqs[i];
-		mutex_lock(&wq->wq_lock);
-		__idxd_wq_quiesce(wq);
-		idxd_drv_disable_wq(wq);
-		SWARMIO_DEBUG("disabled wq %d\n", wq->id);
-		mutex_unlock(&wq->wq_lock);
-	}
-}
-
-int dsa_enable_devices(void)
-{
-	int i, rc;
-	int dsa_id;
-	int requested_devs = dsa_num_devs;
-	int num_enabled_devs = 0;
-	struct device *dev;
-	struct idxd_device *idxd;
-
-	for (dsa_id = 0;
-	     dsa_id < DSA_SCAN_MAX_DEVS && num_enabled_devs < requested_devs;
-	     dsa_id++) {
-		idxd = __dev_id_to_idxd(dsa_id);
-		if (!idxd) {
-			continue;
-		}
-
-		/* config wqs and engines *before* enabling device */
-		if (dsa_wqs_config(idxd) < 0)
-			break;
-
-		if (dsa_engines_config(idxd) < 0)
-			break;
-
-		dev = &idxd->idxd_dev.conf_dev;
-
-		/* attach dsa device to idxd driver */
-		if (!dev->driver) {
-			rc = device_attach(dev);
-			if (rc <= 0) {
-				SWARMIO_WARN("failed to attch dsa%d: %d\n",
-					     dsa_id, rc);
-				break;
-			}
-		}
-		if (!dev->driver) {
-			SWARMIO_WARN("dsa%d is not attached to a driver\n",
-				     dsa_id);
-			rc = -ENODEV;
-			break;
-		}
-
-		/* enable wqs */
-		rc = dsa_wqs_enable(idxd);
-		if (rc < 0) {
-			SWARMIO_WARN("failed to enable dsa%d wqs: %d\n", dsa_id,
-				     rc);
-			device_release_driver(dev);
-			break;
-		}
-
-		dsa_idxd_list[num_enabled_devs] = idxd;
-		num_enabled_devs++;
-	}
-
-	if (num_enabled_devs == 0) {
-		dsa_num_devs = 0;
-		return -ENODEV;
-	} else if (num_enabled_devs < requested_devs) {
-		SWARMIO_ERROR("only %d dsa devices enabled (requested: %d)\n",
-			      num_enabled_devs, requested_devs);
-		dsa_num_devs = num_enabled_devs;
-		dsa_disable_devices();
-		return -ENODEV;
-	}
-	dsa_num_devs = num_enabled_devs;
-
-	return 0;
-}
-
 void dsa_disable_devices(void)
 {
-	int i;
-	struct device *dev;
-	struct idxd_device *idxd;
-
-	for (i = 0; i < dsa_num_devs; i++) {
-		idxd = dsa_idxd_list[i];
-		dev = &idxd->idxd_dev.conf_dev;
-
-		dsa_wqs_disable(idxd);
-		if (dev->driver)
-			device_release_driver(dev);
-		dsa_idxd_list[i] = NULL;
-	}
-
-	dsa_num_devs = 0;
+    unsigned int i;
+    for (i = 0; i < DSA_MAX_WQS; ++i) {
+        if (channels[i]) dma_release_channel(channels[i]);
+        channels[i] = NULL;
+    }
+    dsa_idxd_list[0] = NULL;
+    if (held) put_device(held);
+    held = NULL;
+    pr_info("SwarmIO: DSA channels released; device/WQ configuration and bindings preserved\n");
 }
-
-void dsa_assign_wq_by_group_rr(int team_id, int local_id, int *dev_id,
-			       int *wq_id)
+int dsa_enable_devices(void)
 {
-	int grp_id, grp_wq_id;
-
-	*dev_id = (team_id / dsa_num_groups_per_dev) % dsa_num_devs;
-
-	grp_id = (team_id % dsa_num_groups_per_dev);
-
-	grp_wq_id = local_id % dsa_num_wqs_per_group;
-
-	*wq_id = dsa_dev_cfg_list[*dev_id].groups[grp_id].wq_ids[grp_wq_id];
+    struct idxd_device *idxd;
+    dma_cap_mask_t mask;
+    char name[16];
+    unsigned int i;
+    int ret = -EINVAL;
+    if (held || !groups || test_taint(TAINT_DIE)) return -EBUSY;
+    snprintf(name, sizeof(name), "dsa%u", device_id);
+    held = bus_find_device_by_name(&dsa_bus_type, NULL, name);
+    if (!held) return -ENODEV;
+    idxd = container_of(confdev_to_idxd_dev(held), struct idxd_device, idxd_dev);
+    if (!held->driver || strcmp(held->driver->name, "idxd") || idxd->state != IDXD_DEV_ENABLED ||
+        idxd->max_wqs < (int)groups * 2 || idxd->max_groups < (int)groups) goto fail;
+    /* Only the tested physical-address path: never assume translated/PASID
+     * addresses are identical to physical addresses of reserved host RAM. */
+    if (iommu_get_domain_for_dev(&idxd->pdev->dev) || device_pasid_enabled(idxd)) {
+        pr_err("SwarmIO: DSA baseline requires intel_iommu=off and no kernel PASID\n");
+        ret = -EOPNOTSUPP; goto fail;
+    }
+    dma_cap_zero(mask); dma_cap_set(DMA_MEMCPY, mask);
+    for (i = 0; i < groups * 2; ++i) {
+        struct idxd_wq *wq;
+        if ((i % 2 == 0 && !disp_using_dma) || (i % 2 && !worker_using_dma)) continue;
+        wq = idxd->wqs[i];
+        if (wq && wq->client_count) { ret = -EBUSY; goto fail; }
+        if (!wq || wq->state != IDXD_WQ_ENABLED || !wq_confdev(wq)->driver ||
+            strcmp(wq_confdev(wq)->driver->name, "dmaengine") ||
+            wq->type != IDXD_WQT_KERNEL || !wq_dedicated(wq) ||
+            wq->group != idxd->groups[i / 2] || !wq->idxd_chan || !wq->descs || !wq->portal ||
+            wq->size < 2 || wq->max_xfer_bytes < PAGE_SIZE) goto fail;
+        channels[i] = dma_request_channel(mask, match_channel, wq);
+        if (!channels[i]) { ret = -EBUSY; goto fail; }
+    }
+    dsa_idxd_list[0] = idxd;
+    pr_info("SwarmIO: borrowed dsa%u WQs; no device reconfiguration\n", device_id);
+    return 0;
+fail:
+    dsa_disable_devices();
+    return ret;
 }
-
-void dsa_assign_wq_by_group_disagg(int team_id, int local_id, int *dev_id,
-				   int *wq_id)
+void dsa_assign_wq_by_group_disagg(int team, int local, int *dev, int *wq)
 {
-	int grp_id, grp_wq_id;
-
-	*dev_id = (team_id / dsa_num_groups_per_dev) % dsa_num_devs;
-
-	grp_id = (team_id % dsa_num_groups_per_dev);
-
-	grp_wq_id = local_id == 0 ?
-			    0 :
-			    1 + (local_id - 1) % (dsa_num_wqs_per_group - 1);
-
-	*wq_id = dsa_dev_cfg_list[*dev_id].groups[grp_id].wq_ids[grp_wq_id];
+    *dev = 0; *wq = 2 * (team % groups) + (local != 0);
+}
+void dsa_assign_wq_by_group_rr(int team, int local, int *dev, int *wq)
+{
+    dsa_assign_wq_by_group_disagg(team, local, dev, wq);
 }

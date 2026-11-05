@@ -588,9 +588,8 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 						&w->cmd.rw, ctx, w,
 						worker->paddr_list);
 					if (unlikely(ret)) {
-						__swarmio_disable_worker_dma();
-						if (__swarmio_xfer_data(&w->cmd.rw, &w->bar_timing))
-							w->cqe.status = cpu_to_le16(NVME_SC_INTERNAL << 1);
+						/* Never report CPU fallback as DSA throughput. */
+						w->cqe.status = cpu_to_le16(NVME_SC_INTERNAL << 1);
 						__swarmio_mark_copied(w);
 					}
 #else
@@ -848,6 +847,8 @@ int swarmio_worker_init(struct nvme_vdev *vdev)
 
 	for (i = 0; i < num_workers; i++) {
 		worker = &vdev->workers[i];
+		/* Include partially initialized workers in rollback. */
+		vdev->num_workers_initialized = i + 1;
 		worker->id = i % num_workers_per_service_unit;
 		worker->disp_id = i / num_workers_per_service_unit;
 		worker->dispatcher = NULL;
@@ -937,7 +938,6 @@ int swarmio_worker_init(struct nvme_vdev *vdev)
 
 		kthread_bind(worker->task_struct, worker->cpu_id);
 		wake_up_process(worker->task_struct);
-		vdev->num_workers_initialized++;
 	}
 
 	return 0;
@@ -1004,4 +1004,9 @@ MODULE_INFO(swarmio_skip_io, "1");
 #else
 MODULE_INFO(swarmio_skip_io, "0");
 #endif
+#ifdef CONFIG_SWARMIO_HAS_DSA
+MODULE_INFO(swarmio_build_profile, "dsa-payload-sync-v1");
+MODULE_INFO(swarmio_dsa_mode, "borrowed-single-v1");
+#else
 MODULE_INFO(swarmio_build_profile, "cpu-fullio-512b-v1");
+#endif

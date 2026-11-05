@@ -136,9 +136,9 @@ MODULE_PARM_DESC(num_dma_descs_per_disp,
 module_param(num_dma_descs_per_worker, int, 0644);
 MODULE_PARM_DESC(num_dma_descs_per_worker,
 		 "Number of DMA descriptors per I/O worker");
-module_param(disp_using_dma, bool, 0644);
+module_param(disp_using_dma, bool, 0444);
 MODULE_PARM_DESC(disp_using_dma, "Enable/Disable dispatcher DMA");
-module_param(worker_using_dma, bool, 0644);
+module_param(worker_using_dma, bool, 0444);
 MODULE_PARM_DESC(worker_using_dma, "Enable/Disable worker DMA");
 module_param(dma_timeout, int, 0644);
 MODULE_PARM_DESC(dma_timeout, "DMA timeout in milliseconds");
@@ -403,10 +403,10 @@ static int swarmio_init(void)
 		if (ret)
 			goto err_vdev_init;
 
-		if (dsa_enable_devices() != 0) {
-			disp_using_dma = false;
-			worker_using_dma = false;
-			SWARMIO_ERROR("Cannot use DSA devices\n");
+		ret = dsa_enable_devices();
+		if (ret) {
+			SWARMIO_ERROR("Cannot borrow DSA queues; refusing CPU fallback\n");
+			goto err_vdev_init;
 		} else {
 			vdev->dsa_enabled = true;
 		}
@@ -472,6 +472,7 @@ static void swarmio_exit(void)
 }
 
 MODULE_LICENSE("GPL v2");
+MODULE_DESCRIPTION("SwarmIO virtual NVMe SSD with CPU or borrowed-DSA payload backend");
 
 
 /* SWARMIO_FULLIO_BUILD_STATUS：读取 worker 的实际编译模式，禁止运行时写入。 */
