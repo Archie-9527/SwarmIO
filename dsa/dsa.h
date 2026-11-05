@@ -28,15 +28,12 @@ struct idxd_wq;
 #define DSA_MAX_WQS 16
 #define DSA_MAX_ENGINES 4
 #define DSA_MAX_GROUPS 4
-#define DSA_MAX_BATCH_SIZE 32
+#define DSA_MAX_BATCH_SIZE 1024
 #define DSA_MIN_WQ_SIZE 1
 #define DSA_MAX_WQ_SIZE 256
 #define DSA_MIN_PRIORITY 1
 #define DSA_MAX_PRIORITY 15
 #define DSA_MAX_NUM_DESCS_PER_THREAD 64
-
-#define DSA_BATCH_MAX_SUBMIT_TIMEOUT_US 5LL
-#define DSA_BATCH_MAX_SYNC_TIMEOUT_US 5LL
 
 enum dsa_wq_alloc_mode {
 	DSA_WQ_ALLOC_DEV_ORDERED = 0,
@@ -93,15 +90,13 @@ struct dsa_dma_ctx_single {
 
 struct dsa_batch_desc {
 	struct idxd_desc *idxd_desc;
-
 	struct dsa_hw_desc *lv2_hw_descs;
 	struct dsa_completion_record *lv2_compls;
-
 	void **data;
-	struct list_head node;
-	int id;
-
 	int num_filled;
+	int state, result;
+	bool timed_out;
+	u64 start_ns;
 };
 
 struct dsa_dma_ctx_batch {
@@ -112,22 +107,11 @@ struct dsa_dma_ctx_batch {
 	dma_addr_t lv2_compl_list_dma;
 
 	struct idxd_wq *wq;
+	struct device *dev;
 	void **data_list;
-
-	struct list_head issued_descs;
-	DECLARE_BITMAP(issued_mask, DSA_MAX_NUM_DESCS_PER_THREAD);
-
-	u64 start_issue_time;
-	u64 last_wait_time;
-	s64 batch_issue_timeout_ns;
-	s64 batch_sync_timeout_ns;
 	int batch_size;
 	int num_descs;
-	int curr_desc;
-	int curr_num_filled;
-
-	int dev_id;
-	int wq_id;
+	int filling, active;
 	int timeout;
 };
 
@@ -149,20 +133,11 @@ void swarmio_dsa_error(bool timeout);
 bool swarmio_dsa_faulted(void);
 void swarmio_dsa_submit(void);
 void swarmio_dsa_complete(u64 bytes);
-static inline void __dsa_sync_wait(struct idxd_desc *desc, int timeout)
-{
-	unsigned long timeout_jiffies = jiffies + msecs_to_jiffies(timeout);
-
-	while (desc->completion->status == DSA_COMP_NONE) {
-		if (time_after(jiffies, timeout_jiffies)) {
-			SWARMIO_WARN_RL("wq %d polling timed out!\n",
-					desc->wq->id);
-			break;
-		}
-		cpu_relax();
-	}
-}
-
+void swarmio_dsa_batch_submit(unsigned int count);
+void swarmio_dsa_batch_retire(unsigned int count, u64 bytes);
+bool swarmio_dsa_batch_begin(void);
+void swarmio_dsa_batch_cancel(void);
+bool swarmio_dsa_batch_idle(void);
 #endif
 
 int dsa_set_params(const struct dsa_cfg_params *p);
@@ -183,17 +158,13 @@ int dsa_dma_ctx_batch_init(struct dsa_dma_ctx_batch *ctx, int dev_id, int wq_id,
 			   int batch_size, int num_descs, int timeout);
 void dsa_dma_ctx_batch_remove(struct dsa_dma_ctx_batch *ctx);
 
-int dsa_dma_issue_async_batch(struct dsa_dma_ctx_batch *ctx, dma_addr_t dma_dst,
-			      dma_addr_t dma_src, size_t size, void *data,
-			      void (*callback)(void *));
-int dsa_dma_issue_async_remaining_batch(struct dsa_dma_ctx_batch *ctx);
-int dsa_dma_wait_oldest_batch(struct dsa_dma_ctx_batch *ctx,
-			      void (*callback)(void *));
-int dsa_dma_wait_all_batch(struct dsa_dma_ctx_batch *ctx,
-			   void (*callback)(void *));
-bool __dsa_dma_is_issue_timeout_batch(struct dsa_dma_ctx_batch *ctx);
-bool __dsa_dma_is_wait_timeout_batch(struct dsa_dma_ctx_batch *ctx);
-bool __dsa_dma_all_busy_batch(struct dsa_dma_ctx_batch *ctx);
+/* enqueue returns -EAGAIN without consuming the request when every slot is busy.
+ * All other accepted requests finish exactly once via poll's status callback. */
+int dsa_dma_batch_enqueue(struct dsa_dma_ctx_batch *ctx, dma_addr_t dst,
+			 dma_addr_t src, size_t size, void *data);
+void dsa_dma_batch_poll(struct dsa_dma_ctx_batch *ctx,
+			void (*callback)(void *, int));
+void dsa_dma_batch_flush_due(struct dsa_dma_ctx_batch *ctx);
 
 /* single */
 int dsa_dma_ctx_single_init(struct dsa_dma_ctx_single *ctx, int dev_id,

@@ -226,7 +226,7 @@ int main(void) {
     assert(dsa_enable_devices() == -EOPNOTSUPP);
     assert(dsa_dma_ctx_single_init(NULL, 0, 0, 1, 1) == -EOPNOTSUPP);
     assert(dsa_dma_issue_sync_single(NULL, 0, 0, 512, NULL, NULL) == -EOPNOTSUPP);
-    assert(dsa_dma_issue_async_batch(NULL, 0, 0, 512, NULL, NULL) == -EOPNOTSUPP);
+    assert(dsa_dma_batch_enqueue(NULL, 0, 0, 512, NULL) == -EOPNOTSUPP);
     dsa_assign_wq_by_group_rr(0, 0, &dev, &wq);
     assert(dev == -1 && wq == -1);
     return 0;

@@ -20,10 +20,14 @@ static atomic_t fault = ATOMIC_INIT(0);
 static atomic64_t submitted = ATOMIC64_INIT(0), completed = ATOMIC64_INIT(0);
 static atomic64_t bytes_done = ATOMIC64_INIT(0), errors = ATOMIC64_INIT(0);
 static atomic64_t timeouts = ATOMIC64_INIT(0);
+static atomic64_t batches_submitted = ATOMIC64_INIT(0), batches_retired = ATOMIC64_INIT(0);
+static atomic_t active_batches = ATOMIC_INIT(0), peak_batches = ATOMIC_INIT(0);
+static atomic_t pending_batches = ATOMIC_INIT(0);
+static atomic_t max_batch = ATOMIC_INIT(0);
 
 void swarmio_dsa_error(bool timeout)
 {
-    atomic_set(&fault, 1); atomic64_inc(&errors);
+    atomic_set(&fault, 1); smp_mb(); atomic64_inc(&errors);
     if (timeout) atomic64_inc(&timeouts);
 }
 bool swarmio_dsa_faulted(void) { return atomic_read(&fault); }
@@ -32,14 +36,57 @@ void swarmio_dsa_complete(u64 bytes)
 {
     atomic64_inc(&completed); atomic64_add(bytes, &bytes_done);
 }
+static void update_max(atomic_t *p, int value)
+{
+    int old = atomic_read(p);
+    while (old < value) {
+        int seen = atomic_cmpxchg(p, old, value);
+        if (seen == old) break;
+        old = seen;
+    }
+}
+void swarmio_dsa_batch_submit(unsigned int count)
+{
+    atomic64_add(count, &submitted); atomic64_inc(&batches_submitted);
+    update_max(&peak_batches, atomic_inc_return(&active_batches));
+    update_max(&max_batch, count);
+}
+bool swarmio_dsa_batch_begin(void)
+{
+    /* Register before testing the fault latch. Any racing submitter is either
+     * counted by the error drain barrier or observes fault and submits no DMA. */
+    atomic_inc_return(&pending_batches);
+    if (!swarmio_dsa_faulted()) return true;
+    atomic_dec(&pending_batches);
+    return false;
+}
+void swarmio_dsa_batch_cancel(void) { atomic_dec(&pending_batches); }
+bool swarmio_dsa_batch_idle(void)
+{
+    smp_mb();
+    return !atomic_read(&pending_batches);
+}
+void swarmio_dsa_batch_retire(unsigned int count, u64 bytes)
+{
+    atomic64_add(count, &completed); atomic64_add(bytes, &bytes_done);
+    atomic64_inc(&batches_retired); atomic_dec(&active_batches);
+    atomic_dec(&pending_batches);
+}
 static int state_get(char *buf, const struct kernel_param *kp)
 {
     unsigned int i, borrowed = 0;
+    unsigned int mode = 0;
+#ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
+    mode = 1;
+#endif
     for (i = 0; i < DSA_MAX_WQS; ++i) borrowed += !!channels[i];
     return scnprintf(buf, PAGE_SIZE,
-        "version=1 device=%u borrowed=%u fault=%d submitted=%lld completed=%lld bytes=%lld errors=%lld timeouts=%lld\n",
+        "version=2 device=%u borrowed=%u fault=%d submitted=%lld completed=%lld bytes=%lld errors=%lld timeouts=%lld "
+        "mode=%u batches_submitted=%lld batches_retired=%lld active_batches=%d peak_batches=%d max_batch=%d pending_batches=%d\n",
         device_id, borrowed, atomic_read(&fault), atomic64_read(&submitted),
-        atomic64_read(&completed), atomic64_read(&bytes_done), atomic64_read(&errors), atomic64_read(&timeouts));
+        atomic64_read(&completed), atomic64_read(&bytes_done), atomic64_read(&errors), atomic64_read(&timeouts),
+        mode, atomic64_read(&batches_submitted), atomic64_read(&batches_retired),
+        atomic_read(&active_batches), atomic_read(&peak_batches), atomic_read(&max_batch), atomic_read(&pending_batches));
 }
 static const struct kernel_param_ops state_ops = { .get = state_get };
 module_param_cb(dsa_state, &state_ops, NULL, 0444);
@@ -94,11 +141,15 @@ int dsa_enable_devices(void)
     dma_cap_zero(mask); dma_cap_set(DMA_MEMCPY, mask);
     for (i = 0; i < groups * 2; ++i) {
         struct idxd_wq *wq;
+        struct device *dev;
         if ((i % 2 == 0 && !disp_using_dma) || (i % 2 && !worker_using_dma)) continue;
         wq = idxd->wqs[i];
-        if (wq && wq->client_count) { ret = -EBUSY; goto fail; }
-        if (!wq || wq->state != IDXD_WQ_ENABLED || !wq_confdev(wq)->driver ||
-            strcmp(wq_confdev(wq)->driver->name, "dmaengine") ||
+        if (!wq) goto fail;
+        /* wq_confdev() is a struct device lvalue in the target 6.8 headers. */
+        dev = &wq->idxd_dev.conf_dev;
+        if (wq->client_count) { ret = -EBUSY; goto fail; }
+        if (wq->state != IDXD_WQ_ENABLED || !dev->driver ||
+            strcmp(dev->driver->name, "dmaengine") ||
             wq->type != IDXD_WQT_KERNEL || !wq_dedicated(wq) ||
             wq->group != idxd->groups[i / 2] || !wq->idxd_chan || !wq->descs || !wq->portal ||
             wq->size < 2 || wq->max_xfer_bytes < PAGE_SIZE) goto fail;

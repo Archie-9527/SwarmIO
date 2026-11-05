@@ -26,7 +26,7 @@ class DSATests(unittest.TestCase):
         self.assertTrue(pipeline.is_dsa(c))
         for scope,key,value in [('module','worker_using_dma',0),('module','disp_using_dma',1),
                                 ('build','CONFIG_SWARMIO_WORKER_SKIP_IO','y'),
-                                ('build','CONFIG_SWARMIO_WORKER_BATCH_IO','y'),('module','dsa_num_devs',2)]:
+                                ('build','CONFIG_SWARMIO_WORKER_BATCH_IO','invalid'),('module','dsa_num_devs',2)]:
             bad=json.loads(json.dumps(c)); bad[scope][key]=value
             with tempfile.TemporaryDirectory() as d:
                 p=Path(d)/'config.json'; p.write_text(json.dumps(bad))
@@ -97,6 +97,9 @@ static void atomic64_add(u64 x,atomic64_t *p) { p->counter+=x; }
 static long long atomic64_read(atomic64_t *p) { return p->counter; }
 int atomic_read(const atomic_t *p) { return p->counter; }
 void atomic_set(atomic_t *p,int x) { p->counter=x; }
+int atomic_inc_return(atomic_t *p) { return ++p->counter; }
+void atomic_dec(atomic_t *p) { p->counter--; }
+int atomic_cmpxchg(atomic_t *p,int old,int value) { int seen=p->counter; if(seen==old) p->counter=value; return seen; }
 struct kernel_param {};
 struct kernel_param_ops { int (*get)(char *, const struct kernel_param *); };
 #define scnprintf snprintf
@@ -168,12 +171,23 @@ int main(void) {
     }
     setup(); queues[3].client_count=1;
     assert(dsa_enable_devices()==-EBUSY && acquired==1 && released==1 && !refs && queues[3].client_count==1);
+    setup(); qp[3]=NULL;
+    assert(dsa_enable_devices()==-EINVAL && acquired==1 && released==1 && !refs);
+    setup(); queues[3].idxd_dev.conf_dev.driver=NULL;
+    assert(dsa_enable_devices()==-EINVAL && acquired==1 && released==1 && !refs);
     setup(); domain=&d; assert(dsa_enable_devices()==-EOPNOTSUPP && !attempt && !refs);
     setup(); pasid=true; assert(dsa_enable_devices()==-EOPNOTSUPP && !attempt && !refs);
+    assert(swarmio_dsa_batch_begin()); swarmio_dsa_batch_submit(32);
+    assert(swarmio_dsa_batch_begin()); swarmio_dsa_batch_submit(32);
+    assert(!swarmio_dsa_batch_idle());
+    swarmio_dsa_batch_retire(32,16384); swarmio_dsa_batch_retire(32,16384);
+    assert(swarmio_dsa_batch_idle());
     swarmio_dsa_submit(); swarmio_dsa_complete(512); swarmio_dsa_error(false);
     assert(swarmio_dsa_faulted());
+    assert(!swarmio_dsa_batch_begin() && swarmio_dsa_batch_idle());
     char out[4096]; state_get(out,NULL);
-    assert(strstr(out,"submitted=1 completed=1 bytes=512 errors=1"));
+    assert(strstr(out,"submitted=65 completed=65 bytes=33280 errors=1"));
+    assert(strstr(out,"batches_submitted=2 batches_retired=2 active_batches=0 peak_batches=2 max_batch=32 pending_batches=0"));
 }
 '''
         if not shutil.which('cc'): self.skipTest('no C compiler')

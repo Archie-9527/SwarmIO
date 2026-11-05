@@ -25,7 +25,7 @@ static int check_wq(struct idxd_device *idxd, unsigned int i)
     struct idxd_wq *wq = idxd->wqs[i];
     struct device *dev;
     if (!wq || !wq->group) return -ENODEV;
-    dev = wq_confdev(wq);
+    dev = &wq->idxd_dev.conf_dev;
     if (wq->state != IDXD_WQ_ENABLED || !dev->driver ||
         strcmp(dev->driver->name, "dmaengine") ||
         wq->type != IDXD_WQT_KERNEL || strcmp(wq->name, "dmaengine") ||

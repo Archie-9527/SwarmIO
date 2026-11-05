@@ -40,6 +40,7 @@ typedef unsigned char u8;
 #define smp_store_release(p,v) (*(p)=(v))
 #define dma_rmb() ((void)0)
 #define dma_wmb() ((void)0)
+#define smp_mb() ((void)0)
 #define min(a,b) ((a)<(b)?(a):(b))
 #define max(a,b) ((a)>(b)?(a):(b))
 #define min_t(t,a,b) min((t)(a),(t)(b))
@@ -106,7 +107,7 @@ struct idxd_wq {
     struct idxd_group *group; struct idxd_dev idxd_dev;
     struct idxd_dma_chan *idxd_chan; void *portal,*descs; char name[128];
 };
-#define wq_confdev(wq) (&(wq)->idxd_dev.conf_dev)
+#define wq_confdev(wq) ((wq)->idxd_dev.conf_dev)
 #define wq_dedicated(wq) ((wq)->type==IDXD_WQT_KERNEL)
 struct dsa_hw_desc { u32 pasid,opcode,flags; u64 src_addr,dst_addr,completion_addr; u32 xfer_size; };
 struct dsa_completion_record { u8 status; };
@@ -131,6 +132,7 @@ void dma_free_coherent(struct device *,size_t,void *,dma_addr_t);
 unsigned long *bitmap_zalloc(unsigned int,int); void bitmap_free(void *);
 void __set_bit(unsigned long,unsigned long *); bool test_bit(unsigned long,const unsigned long *);
 int atomic_read(const atomic_t *); void atomic_set(atomic_t *,int); int atomic_cmpxchg(atomic_t *,int,int);
+int atomic_inc_return(atomic_t *); void atomic_dec(atomic_t *);
 int nvidia_p2p_dma_unmap_pages(struct pci_dev *,nvidia_p2p_page_table_t *,nvidia_p2p_dma_mapping_t *);
 int nvidia_p2p_put_pages_persistent(u64,nvidia_p2p_page_table_t *,u32);
 int nvidia_p2p_get_pages_persistent(u64,u64,nvidia_p2p_page_table_t **,u32);

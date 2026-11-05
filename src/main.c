@@ -128,19 +128,19 @@ module_param(num_workers_per_service_unit, uint, 0644);
 MODULE_PARM_DESC(num_workers_per_service_unit,
 		 "Number of workers in each service unit");
 
-module_param(dma_batch_size, int, 0644);
+module_param(dma_batch_size, int, 0444);
 MODULE_PARM_DESC(dma_batch_size, "I/O worker's DMA batch size");
-module_param(num_dma_descs_per_disp, int, 0644);
+module_param(num_dma_descs_per_disp, int, 0444);
 MODULE_PARM_DESC(num_dma_descs_per_disp,
 		 "Number of DMA descriptors per dispatcher");
-module_param(num_dma_descs_per_worker, int, 0644);
+module_param(num_dma_descs_per_worker, int, 0444);
 MODULE_PARM_DESC(num_dma_descs_per_worker,
 		 "Number of DMA descriptors per I/O worker");
 module_param(disp_using_dma, bool, 0444);
 MODULE_PARM_DESC(disp_using_dma, "Enable/Disable dispatcher DMA");
 module_param(worker_using_dma, bool, 0444);
 MODULE_PARM_DESC(worker_using_dma, "Enable/Disable worker DMA");
-module_param(dma_timeout, int, 0644);
+module_param(dma_timeout, int, 0444);
 MODULE_PARM_DESC(dma_timeout, "DMA timeout in milliseconds");
 
 module_param(dsa_num_devs, uint, 0444);
@@ -246,6 +246,14 @@ static int __init __validate_dsa_params(void)
 	unsigned int max_workers_per_wq;
 	unsigned int required_worker_wq_size;
 	unsigned int i;
+
+	if (dma_batch_size < 1 || dma_batch_size > DSA_MAX_BATCH_SIZE ||
+	    num_dma_descs_per_worker < 1 || num_dma_descs_per_worker > DSA_MAX_NUM_DESCS_PER_THREAD ||
+	    num_dma_descs_per_disp < 1 || num_dma_descs_per_disp > DSA_MAX_NUM_DESCS_PER_THREAD ||
+	    dma_timeout < 1) return -EINVAL;
+#ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
+	if (dma_batch_size < 2 || num_workers_per_service_unit != 1) return -EINVAL;
+#endif
 
 	if (num_arr_params.wq.size != dsa_num_wqs_per_grp ||
 	    num_arr_params.wq.priority != dsa_num_wqs_per_grp) {

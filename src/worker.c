@@ -43,18 +43,11 @@ static inline int __dsa_dma_issue(dma_ctx_t *ctx, dma_addr_t dma_dst,
 				  void (*callback)(void *))
 {
 #ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
-	return dsa_dma_issue_async_batch(ctx, dma_dst, dma_src, size, data,
-					 callback);
+	return dsa_dma_batch_enqueue(ctx, dma_dst, dma_src, size, data);
 #else
 	return dsa_dma_issue_sync_single(ctx, dma_dst, dma_src, size, data,
 					 callback);
 #endif
-}
-
-static inline void __swarmio_disable_worker_dma(void)
-{
-	SWARMIO_ERROR("disabling worker DMA after DSA failure\n");
-	worker_using_dma = false;
 }
 
 #include "swarmio_queue_diagnostics.h"
@@ -308,6 +301,17 @@ static inline void __swarmio_dma_cb(void *data)
 #endif
 }
 
+#ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
+static void __swarmio_batch_cb(void *data, int status)
+{
+	struct swarmio_io_work *w = data;
+	if (!w) return;
+	if (status) w->cqe.status = cpu_to_le16(NVME_SC_INTERNAL << 1);
+	/* Poll only marks completion eligibility. The owner writes CQEs below. */
+	__swarmio_mark_copied(w);
+}
+#endif
+
 /* CPU 后端：主机 RAM 与 GPU BAR 分别使用普通内存和 I/O 访问接口。 */
 static int __swarmio_xfer_data(struct nvme_rw_command *cmd,
 			      struct swarmio_bar_timing *timing)
@@ -456,6 +460,13 @@ static int __swarmio_xfer_data_using_dma(struct nvme_rw_command *cmd,
 	length = __cmd_io_size(cmd);
 	remaining = length;
 
+#ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
+	/* This benchmark profile accepts one segment per request. Reject before
+	 * enqueueing anything: retry on EAGAIN must never duplicate partial I/O. */
+	if (length > PAGE_SIZE || (cmd->dptr.prp1 & PAGE_OFFSET_MASK) + length > PAGE_SIZE)
+		return -EINVAL;
+#endif
+
 	/* get the PRP list */
 	while (remaining) {
 		if (prp_offs == 0) {
@@ -558,6 +569,13 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 	unsigned short local_queue_tail = smp_load_acquire(&local_queue->tail);
 	unsigned short new_local_queue_head;
 
+#ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
+	if (worker_using_dma) {
+		dsa_dma_batch_poll(ctx, __swarmio_batch_cb);
+		dsa_dma_batch_flush_due(ctx);
+	}
+#endif
+
 	/* empty */
 	if (local_queue->head == local_queue_tail)
 		return;
@@ -569,7 +587,13 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 	if (unlikely(!commit_q))
 		return;
 #endif
+#ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
+	/* Bound each pass so completion publication and partial-batch flushing
+	 * keep progressing even when the software queue stays full. */
+	max_count = min_t(unsigned int, dma_batch_size * num_dma_descs_per_worker, 1024);
+#else
 	max_count = dma_batch_size * num_dma_descs_per_worker;
+#endif
 
 	/* loop1: dma issue */
 	i = local_queue->head;
@@ -587,6 +611,12 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 					ret = __swarmio_xfer_data_using_dma(
 						&w->cmd.rw, ctx, w,
 						worker->paddr_list);
+#ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
+					if (ret == -EAGAIN) {
+						w->is_issued = false;
+						break;
+					}
+#endif
 					if (unlikely(ret)) {
 						/* Never report CPU fallback as DSA throughput. */
 						w->cqe.status = cpu_to_le16(NVME_SC_INTERNAL << 1);
@@ -621,6 +651,12 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 	new_local_queue_head = i;
 	do {
 		w = local_queue->works + i;
+#ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
+		/* Error CQEs can terminate the GPU process. All DMA submitters must
+		 * first cross the global fault/drain barrier, including other workers. */
+		if (worker_using_dma && swarmio_dsa_faulted() && !swarmio_dsa_batch_idle())
+			break;
+#endif
 
 		/* complete */
 		if (w->is_copied && !w->is_completed) {
@@ -725,21 +761,7 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 
 #ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
 	if (worker_using_dma) {
-		if (__dsa_dma_is_issue_timeout_batch(ctx)) {
-			int ret;
-
-			ret = dsa_dma_issue_async_remaining_batch(ctx);
-			if (unlikely(ret))
-				__swarmio_disable_worker_dma();
-		}
-
-		if (__dsa_dma_is_wait_timeout_batch(ctx)) {
-			int ret;
-
-			ret = dsa_dma_wait_oldest_batch(ctx, __swarmio_dma_cb);
-			if (unlikely(ret))
-				__swarmio_disable_worker_dma();
-		}
+		dsa_dma_batch_flush_due(ctx);
 	}
 #endif
 
@@ -1005,8 +1027,13 @@ MODULE_INFO(swarmio_skip_io, "1");
 MODULE_INFO(swarmio_skip_io, "0");
 #endif
 #ifdef CONFIG_SWARMIO_HAS_DSA
+#ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
+MODULE_INFO(swarmio_build_profile, "dsa-payload-async-batch-v1");
+MODULE_INFO(swarmio_dsa_mode, "borrowed-batch-v1");
+#else
 MODULE_INFO(swarmio_build_profile, "dsa-payload-sync-v1");
 MODULE_INFO(swarmio_dsa_mode, "borrowed-single-v1");
+#endif
 #else
 MODULE_INFO(swarmio_build_profile, "cpu-fullio-512b-v1");
 #endif

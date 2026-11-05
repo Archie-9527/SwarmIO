@@ -1,5 +1,7 @@
 # lab230-s6：SwarmIO + BaM 的 DSA payload 基线
 
+本文为同步对照模式。异步BATCH实现和新配置见 [异步批量测试说明](dsa-bam-async.zh-CN.md)。
+
 目标环境：Ubuntu `6.8.0-138-generic`，NVIDIA `595.99.02`，CUDA Toolkit/nvcc `13.2.86`。
 已确认启动参数 `intel_iommu=off memmap=24G$4G`；GPU0 为 RTX PRO 5000 Blackwell，
 PCI `0000:2a:00.0`、NUMA0；DSA0 为 `0000:75:01.0`、NUMA0。

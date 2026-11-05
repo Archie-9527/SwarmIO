@@ -33,11 +33,14 @@ swarmio-objs := src/main.o nvmev/nvme_vdev.o src/proc.o nvmev/pci.o nvmev/admin.
 
 # CPU 复制构建不依赖 idxd 内部头文件或私有符号；DSA 配置仍走原实现。
 ifneq ($(filter y,$(CONFIG_SWARMIO_DMA_DISPATCHER) $(CONFIG_SWARMIO_DMA_WORKER)),)
-ifneq ($(CONFIG_SWARMIO_WORKER_BATCH_IO),n)
-$(error DSA baseline requires CONFIG_SWARMIO_WORKER_BATCH_IO=n)
-endif
 ccflags-y += -DCONFIG_SWARMIO_HAS_DSA=1
 swarmio-objs += dsa/config.o dsa/dsa.o dsa/single.o
+ifeq ($(CONFIG_SWARMIO_WORKER_BATCH_IO),y)
+ifneq ($(CONFIG_SWARMIO_DMA_WORKER):$(CONFIG_SWARMIO_DMA_DISPATCHER):$(CONFIG_SWARMIO_COMMIT),y:n:n)
+$(error asynchronous DSA batches require DMA_WORKER=y DMA_DISPATCHER=n COMMIT=n)
+endif
+swarmio-objs += dsa/batch.o
+endif
 IDXD_INCLUDE ?= $(srctree)/drivers/dma/idxd
 ccflags-y += -I$(IDXD_INCLUDE)
 else

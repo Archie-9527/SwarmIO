@@ -191,3 +191,4 @@ __pycache__/
 # 唯一维护的 CPU full-I/O 配置。
 !/configs/bam-cpu.json
 !/configs/bam-dsa-lab230.json
+!/configs/bam-dsa-async-lab230.json

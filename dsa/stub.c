@@ -44,16 +44,8 @@ int dsa_dma_ctx_batch_init(struct dsa_dma_ctx_batch *ctx, int dev_id, int wq_id,
 			  int batch_size, int num_descs, int timeout)
 { return -EOPNOTSUPP; }
 void dsa_dma_ctx_batch_remove(struct dsa_dma_ctx_batch *ctx) {}
-int dsa_dma_issue_async_batch(struct dsa_dma_ctx_batch *ctx, dma_addr_t dma_dst,
-			     dma_addr_t dma_src, size_t size, void *data,
-			     void (*callback)(void *))
+int dsa_dma_batch_enqueue(struct dsa_dma_ctx_batch *ctx, dma_addr_t dst,
+                         dma_addr_t src, size_t size, void *data)
 { return -EOPNOTSUPP; }
-int dsa_dma_issue_async_remaining_batch(struct dsa_dma_ctx_batch *ctx)
-{ return -EOPNOTSUPP; }
-int dsa_dma_wait_oldest_batch(struct dsa_dma_ctx_batch *ctx, void (*callback)(void *))
-{ return -EOPNOTSUPP; }
-int dsa_dma_wait_all_batch(struct dsa_dma_ctx_batch *ctx, void (*callback)(void *))
-{ return -EOPNOTSUPP; }
-bool __dsa_dma_is_issue_timeout_batch(struct dsa_dma_ctx_batch *ctx) { return false; }
-bool __dsa_dma_is_wait_timeout_batch(struct dsa_dma_ctx_batch *ctx) { return false; }
-bool __dsa_dma_all_busy_batch(struct dsa_dma_ctx_batch *ctx) { return false; }
+void dsa_dma_batch_poll(struct dsa_dma_ctx_batch *ctx, void (*callback)(void *, int)) {}
+void dsa_dma_batch_flush_due(struct dsa_dma_ctx_batch *ctx) {}
