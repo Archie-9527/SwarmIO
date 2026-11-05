@@ -1,163 +1,179 @@
-# GPU SQE 获取与 CPU/GPU DSA 搬运测试
+# 单DSA多group GPU搬运测试：共享服务器模式 v3.1
 
-本目录实现独立测试模块 `dsa_gpu_test.ko` 和 CUDA 程序 `dsa-gpu-bench`。
-目标是复现 SwarmIO 的搬运流程：**GPU 中的 64B SQE → DSA → CPU 命令缓冲区，解析后通过 DSA 在 CPU DRAM 与 GPU 数据区之间搬运 512B/4KiB payload**。
+本版针对4group/4engine/8WQ、WQ总容量128、最大BATCH1024的DSA，仍测试GPU SQE→CPU解析→CPU/GPU payload搬运，payload为512B/4096B。CUDA端与内核使用ABI3，必须同步更新源码并重新编译两端。不能把新版测试直接加载到已有Oops残留的内核中验证。
 
-它没有 NVMe doorbell、CQ、FTL、SSD 时序模型或 GPU 持续轮询：CUDA 先生成一批命令，CPU 通过一次 ioctl 驱动整个实验。这是搬运微基准，报告的 IOPS 不代表 SwarmIO/NVMe 的端到端 IOPS。
+## 0. v3.1修复GPU映射失败后的错误清理
 
-## 1. 文件及复用关系
+本次日志先报告`no space for BAR1 mappings, length: 0x10000000`，256MiB数据区固定失败并返回`-ENOMEM`，随后`unpin → nvidia_p2p_put_pages_persistent → RmP2PPutPagesPersistent`空指针异常。此时尚未创建DSA工作线程。主线程`Z`和其它线程`D`说明发生异常后的退出/清理受阻，不是正常的10秒性能测试还在执行。
 
-| 文件 | 作用 |
-|---|---|
-| `bench.cu` | CUDA 分配、初始化、GPU 生成 SQE、触发测试、最终逐字校验 |
-| `kernel.c` | GPU persistent P2P 映射、主机 DMA 缓冲区、MEMMOVE/BATCH 提交与回收 |
-| `uapi.h` | 64B 简化 SQE、ioctl ABI、两端共用的数据模式与地址生成 |
-| `backend.c` / `config.c` | 直接编入当前 SwarmIO 的 `dsa/dsa.c`、`dsa/config.c` |
-| `run_matrix.sh` | 运行 2 种大小 × 2 种发布模式 × 3 种方向的 12 组测试 |
-| `test_model.py` | 无硬件的共用头编译和数据/地址边界检查 |
+旧代码只检查页面表指针非NULL，没有确认对应get操作成功；失败接口留下的输出指针不能作为有效资源释放。这是测试模块的错误路径缺陷。v3.1用独立所有权状态修复：
 
-DSA 描述符操作参考当前 `dsa/single.c`、`dsa/batch.c`，在测试模块中实现独立的资源生命周期。GPU 映射参考 BaM 的 NVIDIA P2P 用法，但将映射目标明确设为 **DSA 自身的 PCI device**；没有把 CUDA 指针、GPU 物理地址或其它设备的 IOVA 直接当成 DSA 地址。
+* get/map使用局部输出指针，仅在返回成功后保存到资源对象；失败输出不保存、不解引用、不调用对应释放API。
+* get成功、map失败时只释放已成功固定的页面；data成功、SQ失败时分别按实际所有权逆序回收。
+* unmap失败时停止对同一区域执行put；清理API失败则隔离已拥有的句柄、保留模块/设备引用、拒绝后续测试，不强行释放或自动复位。该保留状态需要维护处理，不能通过普通卸载强行清除。
+* 默认data工作集降为8MiB；新增`max_pinned_mb=32`，限制data+SQE的总映射请求。用户态在CUDA初始化之前检查，内核也独立检查并返回`-E2BIG`。这是软件预算，不能保证BAR1可用空间，也不会自动调大BAR1。
+* GPU映射前移到大批主机内存分配之前，并输出pin_data/pin_sq/host_alloc/start_workers等阶段日志。
 
-## 2. 两种发布模式
+已发生的Oops不能通过替换二进制修复。当前保留故障进程/模块，暂停测试，不反复kill、卸载、解绑或复位。可以把恢复安排到管理员认可的维护窗口；本代码没有可靠的在线恢复方法，也不能保证崩溃后的内核和NVIDIA状态完整。
 
-| 模式 | SQE 获取 | payload 搬运 |
-|---|---|---|
-| `sync` | 每条 64B SQE 提交一个 MEMMOVE 并等待完成 | 每个 512B/4KiB 请求提交一个 MEMMOVE 并等待完成 |
-| `batch` | 一个窗口的连续 SQE 合并成一个 MEMMOVE，完成后解析 | 多个 MEMMOVE 子描述符构成硬件 BATCH，最多 `depth` 个 batch 在途，复用 slot 前等待对应完成 |
+## 1. 当前故障能否不重启
 
-窗口最多 128 条命令；批量模式每个 batch 默认 32 项，默认最多 4 个 batch 在途。
-批量异步指 **DSA payload 的异步发布**，不是异步返回用户态的 ioctl，也没有与下一窗口 SQE 获取重叠。
-尾批只有一项时补一个 NOOP，以满足硬件 BATCH 至少两项的约束。NOOP 不计入操作数。
+服务器已报告旧模块的以下状态：
 
-`--direction` 沿用存储读写方向：
-
-* `read`：CPU → GPU，模拟读取主机 DRAM 中的 SSD 数据；SQE 始终仍是 GPU → CPU。
-* `write`：GPU → CPU，模拟写入 SSD。
-* `mixed`：按 block 奇偶划分固定读/写区域，各占一半。不同方向不访问同一个 block，避免混合异步测试发生数据依赖。
-
-随机地址使用带 seed 的仿射置换。在 2 的幂个 block 上按打散顺序遍历，遍历完重复；**不是独立均匀随机采样，也不是 Zipf 负载**。窗口内不重复，读写按 block 对齐，payload 不跨 64KiB GPU 映射页。固定模式测试数据不随轮次改变，校验确认最终数据与 SQE 正确，不能检测每一次重复访问是否都发生了独立的数据变化。
-
-## 3. 目标机器要求
-
-* x86-64 Linux，具有 Intel DSA 的 Xeon 平台，BIOS 已启用 DSA。
-* 支持 GPUDirect RDMA 和 persistent P2P API 的 NVIDIA GPU/驱动；本实现不支持 MIG/vGPU。
-* CUDA 12 或更新版本，`nvcc`，C/C++ 编译工具、内核构建工具。
-* 与**正在运行的内核**匹配的完整内核源码、配置和构建输出，包括 `drivers/dma/idxd/idxd.h`、`registers.h` 等内部头及导出的 IDXD 符号。
-* 与**当前内核和已加载 NVIDIA 驱动**匹配的 `nv-p2p.h` 和 NVIDIA `Module.symvers`。仅安装同名版本的源码不一定具有相同的符号 CRC。
-* DSA 到 GPU 的 PCIe P2P 路径必须可达，IOMMU/ACS 配置必须允许该访问。`nvidia-smi topo -m`、`lspci -tv` 可用于检查拓扑；映射成功也不能单独证明实际 P2P 传输可达。
-
-本实现针对传统离散 GPU 的 64KiB P2P 页面；其它页面大小会明确返回不支持。它不要求加载 `nvidia-peermem`，因为直接调用 `nvidia_p2p_*`；映射机制不是 dma-buf。
-
-参考 NVIDIA 官方 [GPUDirect RDMA 文档](https://docs.nvidia.com/cuda/gpudirect-rdma/)和 [nv-p2p.h 接口定义](https://github.com/NVIDIA/open-gpu-kernel-modules/blob/main/kernel-open/nvidia/nv-p2p.h)。persistent 映射会将页面保留到显式 put；相比带撤销回调的旧接口，便于测试在进程退出时保持在途 DMA 所需页面有效。
-
-## 4. 编译
-
-在完整 SwarmIO 工作区运行，本目录的 backend 依赖上级现有源码：
-
-```bash
-cd SwarmIO/tests/dsa_gpu
-
-# 以下是示例路径，必须替换成目标服务器上与运行版本匹配的路径。
-make all \
-  KDIR=/lib/modules/$(uname -r)/build \
-  IDXD_INCLUDE=/path/to/matching-linux-source/drivers/dma/idxd \
-  NVIDIA_INCLUDE=/path/to/matching-nvidia-source/kernel-open/nvidia \
-  NVIDIA_SYMVERS=/path/to/matching-nvidia-build/Module.symvers
+```text
+/proc/modules: dsa_gpu_test ... Unloading ... (OE-)
+/sys/module/dsa_gpu_test/initstate: going
+rmmod → test_exit → dsa_disable_devices → device_release_driver
+ → idxd_device_drv_remove → idxd_device_evl_free → mutex_lock(NULL)
 ```
 
-某些专有驱动源码布局为 `kernel/nvidia` 而不是 `kernel-open/nvidia`。
-可通过 `modinfo nvidia` 检查驱动，通过 `find /usr/src /var/lib/dkms -name nv-p2p.h -o -name Module.symvers` 查找候选文件；选择与已加载驱动及当前内核匹配的那一组。
+可以暂时停止DSA实验，保留故障模块/设备到维护窗口，不必为了安装新版测试程序立刻重启。其它业务是否可继续应由管理员结合新的Oops、hung task和业务状态评估；不能保证发生过Oops的内核仍完整可靠。
 
-分别编译：
+但本测试没有可验证安全的在线恢复办法来让已中断卸载的旧模块回到live状态。新模块加载被同名going对象拦截；livepatch可以影响后续函数调用，但不能自动续接已经崩溃的rmmod或重建丢失的清理状态。不应改模块名绕过、改引用计数、手动清模块链表、强制rmmod、解绑或复位受影响设备。
+
+`bash diagnose.sh`只读检查，发现going会停止，不继续读取DSA设备sysfs，避免等待异常卸载可能遗留的锁。`prepare_dsa.sh`及新内核模块也会在内核存在Oops的D标志时拒绝启动新的实验；它们不自动重启、不自动恢复异常设备。
+
+## 2. v3防御措施与边界
+
+旧版复制SwarmIO的设备接管逻辑，会在卸载时解绑整颗DSA，进入IDXD的EVL清理。本版删除了该路径：
+
+* 管理员在健康、空闲的设备上一次性配置标准DMAengine WQ。
+* 模块只读取配置，并通过DMAengine的独占通道申请API借用指定WQ；通道忙或配置不匹配时返回错误，不接管、不停用其它客户端。
+* 描述符仍直接使用idxd的MEMMOVE/BATCH接口，保留1024项批量发布；DMAengine用于通道所有权和引用管理，不替换数据热路径。
+* 模块卸载及加载失败回滚时，只归还成功借到的通道并放下设备引用。WQ、engine、group和父DSA驱动绑定均保留；不调用device_release_driver、device_attach、idxd_drv_enable_wq、idxd_drv_disable_wq、设备reset或disable。
+* 只在所有DMA已完成或成功DRAIN后回收描述符、GPU映射和主机内存。收到信号、提交错误或5秒DMA超时后停止新增任务；仍在途的资源继续保留，清理等待改为睡眠轮询，避免占满CPU。
+* DMA永久无响应时ioctl仍可能无法结束，设备通道和模块引用保持占用。这样选择保留资源而不是强制回收，不实现在线共享设备复位；正常rmmod会因仍被使用而拒绝。
+* 初始化和新ioctl遇到内核Oops标志时拒绝启动新的传输。普通NVIDIA/外部模块产生的O/E/P taint不在这个拒绝条件内。
+
+这些措施移除了本测试已知的整设备解绑触发路径，不等价于修复Linux/NVIDIA底层驱动，也不能承诺任何硬件/内核异常均不会导致Oops。运行过程中管理员仍不得强制解绑或重配正在使用的WQ。
+
+## 3. 默认资源与流水线
+
+预配置4组，每组1个engine和2条dedicated kernel WQ；8条WQ各分配16项，总容量128。WQ名称及driver_name均为dmaengine，最大batch1024，max_transfer使用硬件报告值。
+
+| group | engine | SQE WQ | payload WQ |
+|---|---|---|---|
+| 0 | 0 | wq0.0 | wq0.1 |
+| 1 | 1 | wq0.2 | wq0.3 |
+| 2 | 2 | wq0.4 | wq0.5 |
+| 3 | 3 | wq0.6 | wq0.7 |
+
+表中设备假定dsa0。模块参数device_id明确选择设备，不自动改用其它设备。exclusive=1表示调用者确认已获准测试；实际通过DMAengine通道申请实现队列级独占，不是锁住整个PCI设备。
+
+每组有独立fetch/worker线程，环形slot执行FREE→FETCHING→READY→COPYING→FREE，不再每128条整体等待。depth是每组slot数，两个阶段共享这些slot；默认depth8、最大16，每slot预留两个顶层描述符，分别来自两个WQ。默认最大参数4×16×1024提供65536条payload的软件在途预算，不能理解为65536条物理操作同时执行。
+
+sync模式强制每组depth1，一条SQE和一条payload依次完成；4组就是4条同步链并行。groups=1/2/4只选择已配置前1/2/4组，不修改全设备配置；预配置4组时，即使只借1组，每WQ仍是16项。
+
+## 4. 更新与编译
+
+先备份旧目录并同步整套新文件。仍在going的旧模块不能通过更新文件修复，不要尝试强制在线卸载它。
 
 ```bash
-make user
-make module IDXD_INCLUDE=/path/to/linux/drivers/dma/idxd \
-  NVIDIA_INCLUDE=/path/to/nvidia/header-dir \
-  NVIDIA_SYMVERS=/path/to/nvidia/Module.symvers
+cd ~/SwarmIO/tests/dsa_gpu
+KDIR=/lib/modules/$(uname -r)/build
+IDXD_INCLUDE=/home/zhaohq/kernel-src-dsa/linux-hwe-6.8-6.8.0/drivers/dma/idxd
+NVIDIA_INCLUDE=/usr/src/nvidia-595.99.02/nvidia
+NVIDIA_SYMVERS=/var/lib/dkms/nvidia/595.99.02/$(uname -r)/x86_64/module/Module.symvers
+make clean KDIR="$KDIR"
+make all KDIR="$KDIR" IDXD_INCLUDE="$IDXD_INCLUDE" \
+  NVIDIA_INCLUDE="$NVIDIA_INCLUDE" NVIDIA_SYMVERS="$NVIDIA_SYMVERS"
 make check
+modinfo -F version ./dsa_gpu_test.ko
 ```
 
-如果出现 `idxd_* undefined`，需检查运行内核是否导出了 SwarmIO 已使用的那些内部符号，不能通过忽略 modpost 错误解决。内部接口随内核版本变化，移植时应同时核对 `idxd` 头文件与运行内核实现。若出现 `nvidia_p2p_* disagrees about version`，应使用正确的 NVIDIA 符号表重新编译。
+版本应为v3.1-pin-ownership，用户态及模块均为ABI3。backend.c不再复制旧SwarmIO设备配置实现，config.c保留为历史文件，不再链接。编译仍依赖../../dsa/dsa.h及匹配的IDXD内部头；目标内核需要导出idxd_alloc_desc/submit_desc/free_desc等原有符号，以及DMAengine通道API。CUDA12+、NVIDIA persistent P2P API和64KiB GPU页映射要求与原版相同，不支持MIG/vGPU。
 
-## 5. 设备准备与加载
+## 5. 管理员一次性预配置
 
-该模块复用 SwarmIO 的 DSA 配置逻辑，接管扫描到的第一个 DSA，并配置 **1 group、1 engine、1 dedicated kernel WQ、WQ size 64**。它不是通过 `/dev/dsa/wq*` 提交的用户态程序。
-
-先停止 SwarmIO 及其它 DSA 工作负载。用以下只读命令核对设备：
+以下操作仅适用于未发生Oops、无going旧模块、确认空闲并获准测试的设备。不得在当前故障dsa0上直接运行--apply。
 
 ```bash
-sudo modprobe idxd
-accel-config list
-lsmod | grep -E 'swarmio|idxd|nvidia'
+# 默认只检查，不修改设备
+bash prepare_dsa.sh dsa0 --check
+
+# 健康内核中、设备本来就disabled且所有WQ均disabled/unbound时，才允许配置
+sudo bash prepare_dsa.sh dsa0 --apply
 ```
 
-在确认设备空闲后，用 `accel-config disable-wq dsaX/wqX.Y` 禁用所选 DSA 上所有已启用队列，再执行 `accel-config disable-device dsaX` 停用设备本身。将 X/Y 替换成实际编号；backend 选择编号最小的已发现 DSA。不要在其他服务使用 DSA 时进行该操作。模块检查所选设备已经解除驱动绑定、所有 WQ 均处于 disabled 状态，否则返回 `EBUSY`。设备随后由 backend 按新配置重新绑定启用。请在加载到卸载期间独占该 DSA，避免其它配置程序并发修改设备。
+脚本不执行disable-device、disable-wq、卸载、解绑或reset。设备已enabled且配置匹配时不作修改；已enabled但配置不匹配时拒绝，留给管理员评估。配置过程中若某一步失败，停止并保留当前状态，不以整设备停用作自动回滚。
+
+准备完成后保持DSA及WQ为enabled。**新版模块加载前不要再执行此前教程中的disable-wq/disable-device。**
 
 ```bash
-sudo insmod dsa_gpu_test.ko exclusive=1
-ls -l /dev/dsa_gpu_test
+sudo insmod dsa_gpu_test.ko exclusive=1 device_id=0 groups=4
 sudo dmesg | tail -40
 ```
 
-`exclusive=1` 表示调用者确认独占设备；不传会拒绝加载。设备节点默认 0600，ioctl 还要求 `CAP_SYS_RAWIO`。
-卸载时复用的 backend 会停用/解绑其接管的 DSA，**不会自动恢复加载前的 DSA 配置**；需要重新配置再运行其它工作负载。
+加载会验证前8条WQ已绑定标准dmaengine驱动、dedicated/kernel、每组2WQ、每组1engine、batch和transfer能力，并借到全部需要的通道。任一通道被占用会失败并归还此前已借到的通道，设备仍enabled。
 
-## 6. 运行例子
+可选cpus参数明确绑定8个不同在线CPU，顺序fetch0,worker0,fetch1,worker1,...。例如cpus=0,2,4,6,8,10,12,14只是示例，先用lscpu -e=CPU,NODE,SOCKET,CORE,ONLINE选择靠近DSA的不同物理核。默认按DSA的NUMA节点分布到不同在线逻辑CPU。
+
+## 6. 正确性与性能命令
+
+以下仅用于恢复健康且已加载配套v3.1模块的测试环境。先进行小工作集正确性验证，再逐步增加batch和depth。
 
 ```bash
-# 单次同步：512B 随机 CPU→GPU payload，每条先获取64B GPU SQE
-sudo ./dsa-gpu-bench --size 512 --mode sync --direction read
+# 只读取模块信息，不初始化CUDA或固定GPU页面
+sudo ./dsa-gpu-bench --info
+sudo ./dsa-gpu-bench --size 512 --mode sync --direction read --ops 129 --mb 1
+sudo ./dsa-gpu-bench --size 4096 --mode sync --direction write --ops 129 --mb 1
+sudo ./dsa-gpu-bench --size 4096 --mode batch --direction read \
+  --batch 32 --depth 1 --ops 129 --mb 1
 
-# 批量异步：4KiB 随机 CPU→GPU，32项/batch，最多4个batch在途
-sudo ./dsa-gpu-bench --size 4096 --mode batch --direction read --batch 32 --depth 4
+# 上述全部PASS且无新内核异常后，再逐步增加并发
+sudo ./dsa-gpu-bench --size 512 --mode batch --direction read \
+  --batch 128 --depth 4 --mb 8 --seconds 10 --warmup-ms 1000
 
-# GPU→CPU 与固定50%混合方向
-sudo ./dsa-gpu-bench --size 512 --mode batch --direction write
-sudo ./dsa-gpu-bench --size 4096 --mode batch --direction mixed
+sudo ./dsa-gpu-bench --size 4096 --mode batch --direction read \
+  --batch 128 --depth 4 --mb 8 --seconds 10 --warmup-ms 1000
 
-# 检查非完整窗口和只有1项的尾批
-sudo ./dsa-gpu-bench --size 4096 --mode batch --direction read --ops 129
-
-# 完整12组矩阵，GPU编号和访问区域可选
-sudo bash run_matrix.sh --gpu 0 --mb 2 --ops 65536 --seed 12345
+# 扫描：任一次失败就停止
+sudo bash run_matrix.sh | tee read-results.txt
+sudo env DG_DIRECTION=write bash run_matrix.sh | tee write-results.txt
 ```
 
-参数：`size` 只允许 512/4096；`mb` 是2的幂，范围1～64MiB；`ops` 范围1～1048576；`batch` 范围2～32；`depth` 范围1～16。默认2MiB数据区、65536次操作。两种模式均按窗口完成后才进入下一窗口，实际并发受窗口和 batch 大小约束，`depth` 大于窗口内 batch 数不会增加实际并发。
+read=CPU→GPU payload，write=GPU→CPU payload，mixed=按block划分固定50%方向；SQE始终GPU→CPU。组间数据区不重叠，组内采用带seed的仿射置换，打散遍历后循环，不是IID/Zipf。固定模式数据的最终校验不能判断每次重复请求是否都产生新的内容变化。
 
-## 7. 数据正确性与指标
+工作集需满足data_bytes/groups/block_bytes >= batch×depth，避免在途目标重叠。支持1～256MiB的2次幂数据区，batch为2～1024的2次幂，同时受总映射预算限制。SQE获取最多64KiB且不跨GPU映射页；实际payload不会扩大到2GiB。
 
-CUDA 初始化 GPU 数据；内核用同一个位置相关的64位模式初始化主机 DRAM。每个目标区域初始取反，避免“未执行第一次复制但仍通过”这一类错误。内核逐条检查取回 SQE 的序号、地址、长度和方向，然后在计时结束后逐64位字校验全部主机区域。CUDA 端在 ioctl 成功返回后，通过 CUDA API 建立顺序，再读取全部 GPU 数据逐字校验，包括没有访问的区域。
+4group×batch1024×depth16×4KiB需要至少256MiB数据区，另有4MiB SQE，共260MiB映射请求，超过默认32MiB软件预算。本次实际连256MiB数据区都固定失败，不能继续沿用该最大参数命令。512B的相同并发配置也需要32MiB数据+4MiB SQE，共36MiB，仍超过默认预算。硬件支持1024项batch不意味着BAR1足以固定相应工作集。
 
-计时区间内，SQE 与 payload 都由 DSA 搬运，无 CPU payload 复制回退。任何 DSA 或映射错误都会使测试失败。
+健康环境中可用`nvidia-smi -i 0 -q -d MEMORY`查看对应GPU的BAR1总量/使用量；显存空闲量不等于BAR1空闲量，检查与映射之间也存在其它客户端竞争。只有管理员确认足够BAR1余量和业务许可后，才能在正常加载时调大`max_pinned_mb`；不要在当前异常内核上通过调参重试。接口正常返回`-ENOMEM`时，新版应按所有权安全清理并报告失败，而不是把内存不足变成Oops。
 
-输出包括：
+IOPS=测量区间完成的payload条数/秒，每512B/4KiB算一次，不把整个BATCH算一次。payload_GBps使用相同时间区间；SQE_IOPS统计取回的逻辑命令数。mixed带宽是两个方向payload之和。各组完成数和CPU编号也会输出。
 
-* `SQE_ms`：SQE DMA 获取及等待耗时。
-* `payload_ms`：payload 描述符构造、提交及等待耗时；不是纯 PCIe 线速时间。
-* `total_ms`：窗口循环，包含 SQE 获取、命令校验、payload 搬运；不含分配/映射、初始化、最终 DRAIN、主机/GPU数据校验。
-* `end_to_end_IOPS`：完成 payload 请求数 / `total_ms`，每个请求含其 SQE 获取。
-* `payload_GBps`：payload字节数 / `payload_ms`，十进制GB/s，不包含 SQE 字节。
-* `host_errors` / `gpu_errors`：按64位字统计的错误数，均为0且完成数正确时输出 `PASS`。
+按秒模式先预热，再按CPU观察到整个batch完成的时间计数，结束后排空；预热及最终排空不计入性能分子，仍参与校验。ops模式是所有组的总请求数，包含流水线启动和排空，不支持预热。初始化、P2P映射、主机/GPU最终校验在计时外。
 
-同步与批量模式同时改变了 SQE 获取粒度和 payload 提交方式，性能差异包含两项优化，不能全部归因于 BATCH。比较时保持 size、ops、mb、seed、GPU 和 CPU/NUMA 放置相同。可以用 `numactl --cpunodebind=N --membind=N` 固定运行位置；本测试的主机缓冲区由内核 DMA coherent allocator 分配，实际位置还受设备和内核分配策略影响。
+扫描脚本自动增大工作集以覆盖在途地址，读取模块映射预算并跳过超预算点；比较候选点时应统一工作集、CPU/NUMA放置和方向，并多次测量。最大参数不保证最大吞吐，结果是该软件与GPU拓扑下单DSA的可达性能，不自动等于硬件理论上限。`--seconds`只限制测量窗口，不包含初始化、映射和最终清理耗时。
 
-## 8. 生命周期、错误处理与卸载
-
-每次 ioctl 内部完成 pin → DMA map → 搬运 → 等待全部已提交任务 → DRAIN → unmap → put。用户程序必须等 ioctl 返回后才能释放 GPU 缓冲区。程序的 RAII 分配对象保证正常/异常退出路径在 ioctl 返回后释放；persistent pin 保障进程收到信号时不会直接撤销在途 DMA 所需的 GPU 页面。
-
-等待记录每5秒告警，但**不会仅因超时就释放 DMA 引用的缓冲区**。若设备永久无响应，ioctl 可能一直等待；若 DRAIN 失败，模块会保留资源并进入等待状态。此时不要尝试强制卸载模块或复位 GPU，收集日志后安排重启。这里采用保留资源的测试策略，没有实现在线设备重置恢复。
-
-正常结束后：
+正常完成后可卸载测试模块：
 
 ```bash
 sudo rmmod dsa_gpu_test
+sudo accel-config list -i
 ```
 
-映射失败：检查 GPU P2P 能力、persistent API、MIG/vGPU 状态、BAR空间、IOMMU与拓扑。加载失败：检查 `dmesg`、内核/驱动符号版本和其它 WQ 是否启用。校验失败：保留全部输出与日志，不把失败结果作为有效带宽。
+DSA和WQ应仍enabled并保留dmaengine绑定。再次insmod只是重新借用通道，不要求停用设备，也不会执行EVL清理。
 
-## 9. 本次验证范围
+## 7. 内核EVL缺陷与在线修复边界
 
-开发环境为 macOS，未安装 nvcc，也没有运行 Linux 的 IDXD/DSA 或 NVIDIA GPU；**尚未进行 nvcc 编译、真实 Linux 模块编译、加载或硬件传输验证**。`make check` 会用本机C++编译器编译真实共用头，检查ABI大小、两种粒度、多个seed/方向、随机置换、窗口边界、GPU页边界、尾批补齐和数据模型。该检查不替代目标平台验收。
+上游52d2edea0d63c修复EVL对象未分配时的空指针访问，参见[上游修复](https://lists.openwall.net/linux-kernel/2026/01/15/2221)。fix_idxd_evl_guard.py仅准备free路径的源码空指针检查，不包含完整FLR恢复修复，不安装驱动，也不能恢复已going的模块。
 
-首次在目标机器运行时，先用 `--ops 1 --mode sync` 分别验证 read/write，再用 `--ops 129 --mode batch` 验证尾批，最后运行完整矩阵。只有编译成功、全部输出PASS并且内核无异常后，才进行性能比较。
+长期应由管理员在维护窗口部署确认包含完整修复的内核/IDXD驱动。新版测试避免主动进入整设备解绑路径，但管理员以后手动disable-device/卸载idxd仍可能触发旧内核缺陷。不能以新版测试替代底层驱动修复。
+
+Ubuntu 6.8.0-138不是原始上游v6.8源码。2024年的d5638de827cf（Convert spinlock to mutex to lock evl workqueue）修复可睡眠操作的锁上下文问题；2026年的52d2edea0d63c修复EVL对象不存在时的访问问题。这是两个独立修改，发行版可能已经回移前者、尚未包含后者，不能仅凭uname中的6.8判断补丁集合。spinlock/mutex两者都要求锁对象存在，换回spinlock不会解决NULL解引用。
+
+旧的gencfg.evl_en判断检查硬件寄存器位，不等于软件evl对象非NULL。如果目标源码仍有该判断，应进一步核对它是否在锁之前、实际运行驱动与源码是否匹配；不能在未检查完整目标函数时断言Ubuntu已经回移了哪组补丁。另一个EVL内存泄漏修复ee66bc295783会删除寄存器检查，其前提是空指针保护已经存在，移植时需一并核对依赖。
+
+## 8. 验证范围
+
+开发环境仍为macOS，无真实Linux DSA/NVIDIA硬件或nvcc。本机完成：
+
+* make check：共用头C++编译、ABI、WQ容量预算、1024项batch与GPU页边界、尾批、环形背压/在途地址不重叠、真实host_pages.h的C编译和部分分配失败回收、EVL源码补丁测试。
+* test_backend.py编译真实backend.c，在接口替身上检查通道独占申请、全部8个失败位置的部分回滚、重复清理、不接管已有客户端、设备/WQ配置和绑定不变；并检查源码没有整设备生命周期调用。
+* test_prepare.py在临时proc/sysfs替身上执行真实准备脚本，验证默认只读、已就绪时幂等、配置不匹配/going/Oops时拒绝操作且不改变任何模拟设备状态。
+* test_gpu_region.py编译实际gpu_region.h并注入失败，包含失败接口写出非NULL毒指针、get成功/map失败、data成功/SQ失败、版本/布局不兼容、重复清理、unmap/put失败保留所有权等情形；断言不对失败输出调用释放接口。
+* test_kernel_syntax.py及test_cuda_syntax.py使用接口/SDK声明替身做语法检查，不等于真实Linux/nvcc编译。
+* bash -n检查准备、诊断和扫描脚本。
+
+v3.1的真实Linux编译、加载、通道申请/归还、GPU传输及反复装卸尚需健康测试环境验证。公用服务器有going/Oops残留时，先暂停实验，不能在该状态上直接用新代码验证安全性。
