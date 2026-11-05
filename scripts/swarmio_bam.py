@@ -236,7 +236,7 @@ def environment(args, config):
     release = os.uname().release
     kernel = Path('/lib/modules') / release / 'build'
     driver_text = Path('/proc/driver/nvidia/version').read_text()
-    match = re.search(r'Kernel Module\s+(\d+\.\d+(?:\.\d+)?)', driver_text)
+    match = re.search(r'Kernel Module(?:\s+for\s+\S+)?\s+(\d+\.\d+(?:\.\d+)?)', driver_text)
     if not match:
         raise Error('无法确定当前加载的 NVIDIA 驱动版本')
     version = match[1]
