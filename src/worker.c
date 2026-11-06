@@ -455,6 +455,7 @@ static int __swarmio_xfer_data_using_dma(struct nvme_rw_command *cmd,
 	size_t io_size;
 	size_t mem_offs = 0;
 	bool is_memremap;
+	int ret;
 
 	offset = __cmd_io_offset(cmd);
 	length = __cmd_io_size(cmd);
@@ -548,10 +549,12 @@ static int __swarmio_xfer_data_using_dma(struct nvme_rw_command *cmd,
 #ifdef CONFIG_SWARMIO_PROFILE_REQ
 		w->nsecs_issued = ktime_get_ns();
 #endif
-		if (__swarmio_submit_dma(dma_ctx, cmd->opcode, paddr, offset,
-					 io_size,
-					 io_size < remaining ? NULL : w))
-			return -EIO;
+		ret = __swarmio_submit_dma(dma_ctx, cmd->opcode, paddr, offset,
+					 io_size, io_size < remaining ? NULL : w);
+		/* A full async batch pool is backpressure, not an I/O failure.
+		 * Preserve EAGAIN so the worker retries this unconsumed request. */
+		if (ret)
+			return ret;
 
 		remaining -= io_size;
 		offset += io_size;

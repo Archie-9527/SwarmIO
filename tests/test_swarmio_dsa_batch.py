@@ -16,6 +16,108 @@ from test_swarmio_dsa import pipeline
 ROOT = Path(__file__).resolve().parents[1]
 
 class BatchTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which('cc'),'no C compiler')
+    def test_real_transfer_wrapper_preserves_backpressure_through_worker_retry(self):
+        source=(ROOT/'src/worker.c').read_text()
+        issue=source[source.index('static inline int __dsa_dma_issue('):source.index('#include "swarmio_queue_diagnostics.h"')]
+        transfer=source[source.index('static inline int __swarmio_submit_dma('):source.index('void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)\n{')]
+        start=source.index('void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)\n{')
+        worker=source[start:source.index('\n#ifndef CONFIG_SWARMIO_COMMIT\nvoid swarmio_proc_irqs',start)]
+        pre=r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <errno.h>
+typedef unsigned long long u64,dma_addr_t;
+typedef unsigned char u8;
+#define CONFIG_SWARMIO_WORKER_BATCH_IO 1
+#define PAGE_SIZE 4096UL
+#define PAGE_SHIFT 12
+#define PAGE_MASK (~(PAGE_SIZE-1))
+#define PAGE_OFFSET_MASK (PAGE_SIZE-1)
+#define PRP_PFN(p) ((p)>>12)
+#define PTRS_PER_PRP_LIST 512
+#define MEMREMAP_WT 0
+#define BUG_ON(x) assert(!(x))
+#define min_t(t,a,b) ((t)(a)<(t)(b)?(t)(a):(t)(b))
+#define unlikely(x) (x)
+#define smp_load_acquire(p) (*(p))
+#define smp_store_release(p,v) (*(p)=(v))
+#define cpu_to_le16(x) (x)
+#define NVME_SC_INTERNAL 6
+enum { nvme_cmd_read=2,nvme_cmd_write=1,nvme_cmd_zone_append=0x7d };
+struct nvme_rw_command { u8 opcode; unsigned short length; u64 slba; struct { u64 prp1,prp2; } dptr; };
+struct swarmio_io_work {
+    struct { struct nvme_rw_command rw; } cmd;
+    struct { unsigned status; } cqe;
+    struct { bool enabled; } bar_timing;
+    bool is_internal,is_issued,is_copied,is_completed;
+};
+typedef struct { struct swarmio_io_work *pending[2]; unsigned count,attempts; int forced_error; } dma_ctx_t;
+struct swarmio_worker_local_queue { struct swarmio_io_work *works; unsigned short head,tail,size; };
+struct swarmio_worker { dma_ctx_t *dma_ctx; struct swarmio_worker_local_queue local_queue; u64 *paddr_list; };
+static struct { struct { u64 storage_start; } config; } storage={.config={0x200000000ULL}},*vdev=&storage;
+static bool worker_using_dma=true,complete;
+static int dma_batch_size=2,num_dma_descs_per_worker=1;
+static unsigned cqe_writes,errors;
+static unsigned long jiffies;
+static size_t __cmd_io_offset(struct nvme_rw_command *c) { return c->slba<<9; }
+static size_t __cmd_io_size(struct nvme_rw_command *c) { return (c->length+1)*512; }
+static bool pfn_valid(u64 p) { return false; }
+static void *kmap_atomic_pfn(u64 p) { assert(0); return NULL; }
+static void *memremap(u64 p,size_t n,int flags) { assert(0); return NULL; }
+static void memunmap(void *p) { assert(0); }
+static void kunmap_atomic(void *p) { assert(0); }
+static void __swarmio_dma_cb(void *p) { assert(0 && "batch callback is deferred to poll"); }
+static void __swarmio_mark_copied(struct swarmio_io_work *w) { assert(!w->is_copied); w->is_copied=true; }
+static void __swarmio_batch_cb(void *p,int status) { assert(!status); __swarmio_mark_copied(p); }
+static int dsa_dma_batch_enqueue(dma_ctx_t *c,u64 dst,u64 src,size_t n,void *p) {
+    struct swarmio_io_work *w=p; c->attempts++;
+    assert(src==storage.config.storage_start+(w->cmd.rw.slba<<9) && dst==w->cmd.rw.dptr.prp1 && n==512);
+    if(c->forced_error) return c->forced_error;
+    if(c->count==2) return -EAGAIN;
+    c->pending[c->count++]=w; return 0;
+}
+static void dsa_dma_batch_poll(dma_ctx_t *c,void (*cb)(void *,int)) {
+    if(!complete) return;
+    for(unsigned i=0;i<c->count;i++) cb(c->pending[i],0);
+    c->count=0;
+}
+static void dsa_dma_batch_flush_due(dma_ctx_t *c) {}
+static bool swarmio_dsa_faulted(void) { return false; }
+static bool swarmio_dsa_batch_idle(void) { return true; }
+static void __swarmio_complete(struct swarmio_io_work *w) { assert(w->is_copied && !w->is_completed); w->is_completed=true; cqe_writes++; errors+=!!w->cqe.status; }
+static int __swarmio_xfer_data(struct nvme_rw_command *cmd,void *timing) { assert(0 && "no CPU fallback"); return -EIO; }
+'''
+        checks=r'''
+int main(void) {
+    dma_ctx_t ctx={0}; struct swarmio_io_work works[4]={0}; u64 prps[512]; unsigned long stamp=0;
+    struct swarmio_worker w={.dma_ctx=&ctx,.local_queue={works,0,3,4},.paddr_list=prps};
+    for(unsigned i=0;i<3;i++) { works[i].cmd.rw.opcode=nvme_cmd_read; works[i].cmd.rw.slba=i; works[i].cmd.rw.dptr.prp1=0x10000+i*512; }
+    swarmio_proc_io(&w,&stamp); assert(ctx.count==2 && !cqe_writes);
+    swarmio_proc_io(&w,&stamp);
+    assert(ctx.count==2 && ctx.attempts==3 && !works[2].is_issued && !works[2].is_copied && !works[2].cqe.status);
+    assert(w.local_queue.head==0 && !cqe_writes && !errors);
+    complete=true; swarmio_proc_io(&w,&stamp);
+    assert(ctx.count==1 && works[2].is_issued && !works[2].is_copied && cqe_writes==2 && w.local_queue.head==2);
+    swarmio_proc_io(&w,&stamp);
+    assert(!ctx.count && cqe_writes==3 && !errors && w.local_queue.head==3);
+    /* Actual I/O failures still produce error completions instead of retrying. */
+    memset(works,0,sizeof(works)); w.local_queue.head=0; w.local_queue.tail=1; ctx.forced_error=-EIO;
+    works[0].cmd.rw.opcode=nvme_cmd_read; works[0].cmd.rw.dptr.prp1=0x10000;
+    swarmio_proc_io(&w,&stamp); assert(cqe_writes==4 && errors==1 && works[0].is_completed && !ctx.count);
+    /* Unsupported geometry is rejected before accepting a partial request. */
+    unsigned attempts=ctx.attempts; works[0].cmd.rw.length=15;
+    assert(__swarmio_xfer_data_using_dma(&works[0].cmd.rw,&ctx,&works[0],prps)==-EINVAL && ctx.attempts==attempts);
+    works[0].cmd.rw.length=0; works[0].cmd.rw.dptr.prp1=0x10f80;
+    assert(__swarmio_xfer_data_using_dma(&works[0].cmd.rw,&ctx,&works[0],prps)==-EINVAL && ctx.attempts==attempts);
+    return 0;
+}
+'''
+        compile_run(pre+issue+transfer+worker+checks)
+
     @unittest.skipUnless(shutil.which('make'),'no make')
     def test_kbuild_selects_batch_object_only_for_async_profile(self):
         source='include '+str(ROOT/'Kbuild')+'\nreport:\n\t@echo $(swarmio-objs)\n'

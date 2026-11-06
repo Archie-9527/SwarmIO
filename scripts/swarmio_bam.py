@@ -636,7 +636,7 @@ def verify_session(args):
     if session['manifest_sha256'] != digest(args.build_dir / 'manifest.json'):
         raise Error('加载记录与当前构建不一致')
     if session.get('run_state') not in ('not_started', 'completed'):
-        raise Error('上一轮没有正常结束；先保存现场并重启，不自动复用队列')
+        raise Error('上一轮没有正常结束；先保存 status，可用 unload --after-failure 检查是否能正常卸载，不自动复用队列')
     if module_state() != {'swarmio': 'Live', 'libnvm': 'Live'}:
         raise Error('两个模块必须均处于 Live 状态')
     device = virtual_device(session['bdf'])
@@ -879,6 +879,47 @@ def read_dsa_state(manifest):
     return values
 
 
+def check_failed_unload(args, session, states):
+    """Permit ordinary unload after a failed GPU run only when DMA is quiescent.
+
+    Does not repair mappings, change driver state, or mark the run successful.
+    Kernel module references still enforce the final rmmod ownership check.
+    """
+    if states != {'libnvm': 'Live', 'swarmio': 'Live'}:
+        raise Error('失败后卸载要求两个模块均处于 Live，不能恢复正在卸载或未知的模块组合')
+    manifest = manifest_for(args)
+    if not is_dsa_batch(manifest['config']):
+        raise Error('失败后卸载目前只支持有完整在途计数的 DSA batch 构建')
+    if session.get('manifest_sha256') != digest(args.build_dir / 'manifest.json'):
+        raise Error('失败会话与构建记录不一致，拒绝卸载未知实例')
+    if int(Path('/proc/sys/kernel/tainted').read_text()) & 128:
+        raise Error('内核记录过 Oops，不能按已排空的 GPU 失败处理')
+    first = read_dsa_state(manifest)
+    if (first['submitted'] != first['completed'] or first['errors'] or first['timeouts'] or
+        first['batches_submitted'] != first['batches_retired'] or
+        (is_dsa_sq(manifest['config']) and first['sq_submitted'] != first['sq_completed'])):
+        raise Error('DSA 计数未平衡或记录过 DMA 错误，拒绝失败后卸载')
+    time.sleep(0.5)
+    check_no_workload()
+    second = read_dsa_state(manifest)
+    if second != first:
+        raise Error('DSA 计数仍在变化，尚未静止；本次没有执行卸载')
+    if module_state() != states:
+        raise Error('检查期间模块状态改变；本次没有执行卸载')
+    refs = {}
+    for name in states:
+        refs[name] = int((MODULES / name / 'refcnt').read_text())
+        if refs[name]:
+            raise Error(name + ' 仍有文件/映射引用，拒绝卸载；不使用 rmmod -f')
+    if (MODULES / 'swarmio/parameters/sq_diag_faulted').read_text().strip() != 'N':
+        raise Error('检查期间 SQ 故障已锁存；本次没有执行卸载')
+    check_kernel_health(dmesg_text())
+    path = ROOT / 'results' / ('unload-check-' + dt.datetime.now().strftime('%Y%m%d-%H%M%S-%f') + '.json')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    save_json(path, {'previous_session': session, 'dsa_before': first, 'dsa_after': second, 'module_refs': refs})
+    print('失败会话检查通过：无负载、引用为 0、DMA 排空且计数稳定；执行普通卸载。记录：', path)
+
+
 def unload(args):
     linux_only(root=True)
     check_no_workload()
@@ -890,14 +931,18 @@ def unload(args):
         raise Error('SQ 故障已锁存，不执行自动卸载；先保存现场')
     if states:
         session = json.loads((args.build_dir / 'loaded.json').read_text())
-        if session.get('run_state') not in ('not_started', 'completed'):
-            raise Error('存在未正常结束的负载记录；保存现场并重启，不继续卸载')
+        failed = session.get('run_state') not in ('not_started', 'completed')
+        if failed and (not getattr(args, 'after_failure', False) or session.get('run_state') != 'incomplete'):
+            raise Error('存在未正常结束的负载记录；先保存 status，incomplete 会话可用 unload --after-failure 执行排空检查')
         if session['boot_id'] != Path('/proc/sys/kernel/random/boot_id').read_text().strip():
             raise Error('没有本次启动的加载记录，拒绝卸载未知模块')
         for name in states:
             refcount = MODULES / name / 'refcnt'
             if refcount.exists() and int(refcount.read_text()) != 0:
                 raise Error(name + ' 仍有引用，拒绝卸载')
+        if failed:
+            check_failed_unload(args, session, states)
+        previous_run_state = session['run_state']
         session['run_state'] = 'unloading'
         save_json(args.build_dir / 'loaded.json', session)
     # 有活动文件引用时不尝试卸载；不使用 rmmod -f，不通过超时发送 SIGKILL。
@@ -913,6 +958,9 @@ def unload(args):
             path.write_text(snapshot())
             raise Error('正常卸载仍在等待，rmmod PID=' + str(process.pid) + '；未强杀。现场：' + str(path) + '；请正常重启')
         if code:
+            if failed and getattr(args, 'after_failure', False) and module_state() == states:
+                session['run_state'] = previous_run_state
+                save_json(args.build_dir / 'loaded.json', session)
             raise Error('卸载 ' + name + ' 失败；不继续卸载后续模块')
         check_kernel_health(dmesg_text())
     session = args.build_dir / 'loaded.json'
@@ -953,7 +1001,9 @@ def main():
                    help='配合监控记录 GPU BAR map/copy/unmap 平均耗时和累计占比，默认关闭')
     p = commands.add_parser('status', help='只读收集队列、进程、线程栈和内核日志')
     p.add_argument('--output', type=Path)
-    commands.add_parser('unload', help='仅在无负载和无内核异常时正常卸载')
+    p = commands.add_parser('unload', help='仅在无负载和无内核异常时正常卸载')
+    p.add_argument('--after-failure', action='store_true',
+                   help='对 incomplete 的 DSA batch 会话检查引用及 DMA 稳定排空后执行普通卸载；不强制卸载')
     args = parser.parse_args()
     args.build_dir = args.build_dir.resolve()
     try:

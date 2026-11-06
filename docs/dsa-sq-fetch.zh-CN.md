@@ -76,3 +76,40 @@ SQ DMA提交次数取决于实际合并情况，只要求提交与完成相等�
 后续若瓶颈转移，依据新采样再决定是否优化SQ预取、CQ或worker空轮询，不在这一轮混合改动。
 
 本地为macOS，已执行真实C控制流/接口替身及回归检查；真实内核构建、GPU内容校验和吞吐仍需服务器验证。
+
+## 批次满槽错误修复与失败会话恢复
+
+2026-11-06修复：异步入队的-EAGAIN曾被数据搬运包装函数统一改成-EIO，
+导致worker将正常背压误报为NVME_SC_INTERNAL。DSA获取SQE加快后更容易填满单个worker的批次槽位。
+现在原样传递返回码，worker保留尚未入队的请求，下轮重试；真正的I/O错误仍返回错误CQE。
+回归测试覆盖真实入队包装、PRP搬运函数和worker循环的返回码链路。
+
+旧构建目录的源码副本和已加载模块不会随源码更新。请同步修复后使用新目录，
+例如将上述build/load/run命令中的目录改为 `build-dsa-sq-b32-d16-fix1`。
+如果上一轮GPU trap并被记录为incomplete，先保存status/after.log，再使用下述失败后普通卸载流程。
+成功后可直接构建、加载新目录，先完成64线程内容校验，再重复4096线程性能负载，无需重启。
+不要手工将失败会话的run_state改为completed；这会跳过已有的失败隔离检查。
+
+本异步微基准仍只接受单物理页内请求。启动时Linux nvme驱动对虚拟盘发出的多页扫描读
+可能收到错误；需与GPU测试期间的512B/4KiB请求故障分开分析，本修复没有扩大请求几何支持范围。
+
+## 失败后普通卸载，无需一律重启
+
+更新 `scripts/swarmio_bam.py` 即可对当前已加载的旧模块使用本流程，不必先重新编译模块。
+使用当前加载实例的原构建目录：
+
+```bash
+sudo python3 scripts/swarmio_bam.py --build-dir build-dsa-sq-b32-d16 status --output results/before-unload.log
+sudo python3 scripts/swarmio_bam.py --build-dir build-dsa-sq-b32-d16 unload --after-failure
+```
+
+`--after-failure`只放宽incomplete会话状态检查，不使用强制卸载。它要求两个模块Live、
+无测试进程、两个模块refcnt为0、无SQ故障及相关内核Oops、同一次启动和匹配的构建记录；
+DSA无故障/超时、所有在途计数为0、提交与完成平衡，并在0.5秒间隔的两次读取之间保持不变。
+通过后保存卸载检查JSON，依次执行普通 `rmmod libnvm`、`rmmod swarmio`。
+libnvm卸载失败时不继续卸载swarmio；不强杀等待中的rmmod，也不修改失败测试为成功。
+DSA队列仅归还通道，不卸载NVIDIA/idxd驱动，也不重置GPU/DSA。
+
+如果refcnt不为0，可能仍有设备文件、映射或persistent P2P引用；先定位占用，不能使用rmmod -f。
+若模块已处于Unloading、DMA没有结束或内核发生Oops，本恢复流程拒绝继续，需要按具体状态处理；
+确实无法在线恢复时再安排维护重启。普通卸载本身仍可能因内核退出路径阻塞，不能保证任何故障都能在线恢复。
