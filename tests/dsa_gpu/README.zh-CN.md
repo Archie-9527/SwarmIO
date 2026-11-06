@@ -1,5 +1,9 @@
 # 单DSA多group GPU搬运测试：共享服务器模式 v3.1
 
+更新：当前代码为 **v4.0 / ABI4**，新增无SQ的payload与预构造replay路径、最高64KiB搬运。
+测带宽请使用 [带宽实验指南](BANDWIDTH.zh-CN.md)。下文保留v3.1故障背景和原pipeline说明；
+更新后必须同时重编译内核模块与用户程序，版本检查以v4.0/ABI4为准。
+
 本版针对4group/4engine/8WQ、WQ总容量128、最大BATCH1024的DSA，仍测试GPU SQE→CPU解析→CPU/GPU payload搬运，payload为512B/4096B。CUDA端与内核使用ABI3，必须同步更新源码并重新编译两端。不能把新版测试直接加载到已有Oops残留的内核中验证。
 
 ## 0. v3.1修复GPU映射失败后的错误清理

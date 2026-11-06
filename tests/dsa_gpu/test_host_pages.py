@@ -15,7 +15,7 @@ typedef uint64_t dma_addr_t;
 struct device { int unused; };
 #define GFP_KERNEL 0
 #define pr_err(...) fprintf(stderr, __VA_ARGS__)
-static unsigned calls, live, fail_at;
+static unsigned calls, live, fail_at, chunk=4096;
 static void *kvcalloc(size_t n, size_t size, int flags) {
     (void)flags; return calloc(n, size);
 }
@@ -23,17 +23,17 @@ static void kvfree(void *p) { free(p); }
 static void *dma_alloc_coherent(struct device *dev, size_t bytes,
                                 dma_addr_t *dma, int flags) {
     (void)dev; (void)flags;
-    assert(bytes == 4096);
+    assert(bytes == chunk);
     calls++;
     if (calls == fail_at) return NULL;
     void *p = calloc(1, bytes);
-    if (p) { live++; *dma = 0x100000000ULL + calls * 0x3000ULL; }
+    if (p) { live++; *dma = 0x100000000ULL + calls * 0x30000ULL; }
     return p;
 }
 static void dma_free_coherent(struct device *dev, size_t bytes,
                               void *cpu, dma_addr_t dma) {
     (void)dev; (void)dma;
-    assert(bytes == 4096 && live); live--; free(cpu);
+    assert(bytes == chunk && live); live--; free(cpu);
 }
 #include "host_pages.h"
 int main(void) {
@@ -64,6 +64,17 @@ int main(void) {
     assert(!dg_host_alloc(&dev, 0));
     assert(!dg_host_alloc(&dev, 4097));
     dg_host_free(&dev, NULL, 65536);
+    for(chunk=8192;chunk<=65536;chunk*=2) {
+        calls=live=fail_at=0;
+        struct dg_host_page *h=dg_host_alloc_chunks(&dev,1ULL<<20,chunk); assert(h);
+        for(u64 i=0;i<(1ULL<<20)/8;i++) *dg_host_word_chunk(h,i,chunk)=i;
+        for(u64 i=0;i<(1ULL<<20)/8;i++) assert(*dg_host_word_chunk(h,i,chunk)==i);
+        for(u64 off=0;off<(1ULL<<20);off+=chunk)
+            assert(dg_host_dma_chunk(h,off,chunk)==h[off/chunk].dma);
+        dg_host_free_chunks(&dev,h,1ULL<<20,chunk); assert(!live);
+    }
+    assert(!dg_host_alloc_chunks(&dev,65536,0));
+    assert(!dg_host_alloc_chunks(&dev,65536,8193));
 }
 '''
 

@@ -3,7 +3,10 @@
 #define DSA_GPU_UAPI_H
 #include <linux/types.h>
 #include <linux/ioctl.h>
-#define DG_ABI 3
+#define DG_ABI 4
+#define DG_PIPELINE 0
+#define DG_PAYLOAD 1
+#define DG_REPLAY 2
 #define DG_GROUPS 4
 #define DG_ALIGN 65536ULL
 #define DG_MAX_BATCH 1024
@@ -26,7 +29,7 @@ struct dg_group_stats {
 struct dg_run {
     __u64 gpu_data, gpu_sq, data_bytes, sq_bytes, operations;
     __u32 abi, block_bytes, mode, batch_size, depth, direction, seed;
-    __u32 seconds, warmup_ms, reserved;
+    __u32 seconds, warmup_ms, path;
     __u64 elapsed_ns, completed, host_errors;
     struct dg_group_stats stats[DG_GROUPS];
 };

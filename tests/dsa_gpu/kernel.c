@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-only
-/* v3.1：单个DSA，最多4个group/4个engine/8个WQ，SQE与payload并行流水。
+/* v4.0：单个DSA，最多4个group/4个engine/8个WQ，SQE与payload并行流水。
  * 一个group有独立fetch线程/WQ和worker线程/WQ；环形slot替代128项窗口。
  * 地址来自针对DSA pdev建立的NVIDIA P2P DMA映射，不直接使用CUDA虚拟地址。
  */
@@ -37,7 +37,7 @@ unsigned int dg_device_id;
 static int cpus[DG_GROUPS * 2];
 static unsigned int nr_cpus;
 static struct dg_info info;
-#define DG_BUILD "v3.1-pin-ownership"
+#define DG_BUILD "v4.0-payload-replay"
 #define DG_TIMEOUT_NS (5ULL * 1000000000)
 module_param(exclusive, bool, 0444);
 module_param(groups, uint, 0444);
@@ -56,6 +56,11 @@ MODULE_PARM_DESC(cpus, "可选CPU列表：fetch0,worker0,fetch1,worker1,...，�
 static struct dg_region quarantined_regions[2];
 static atomic_t gpu_cleanup_fault = ATOMIC_INIT(0);
 enum dg_state { DG_FREE, DG_FETCHING, DG_READY, DG_COPYING };
+struct dg_bank {
+    struct dsa_hw_desc *children;
+    struct dsa_completion_record *comps;
+    dma_addr_t children_dma, comps_dma;
+};
 struct dg_slot {
     int state;
     u32 count, children_count;
@@ -81,6 +86,8 @@ struct dg_group {
     unsigned int id;
     struct idxd_wq *fetch_wq, *copy_wq;
     struct dg_slot *slots;
+    struct dg_bank *banks;
+    u64 num_banks;
     struct dg_thread fetch_thread, worker_thread;
     bool fetch_done, started;
     u64 cursor, limit;
@@ -97,6 +104,7 @@ struct dg_test {
     atomic_t error;
     u64 begin, measure_begin, deadline, blocks_per_group, sq_stride;
     u32 batch;
+    u32 host_chunk;
 };
 
 static void fail(struct dg_test *t, int error)
@@ -220,14 +228,14 @@ static int issue_copy(struct dg_group *g, struct dg_slot *s)
     u32 j, n = s->count;
     if (!r->mode) {
         struct dg_cmd *c = &s->cmds[0];
-        u64 h = dg_host_dma(t->host, c->offset), v = gpu_addr(&t->data, c->offset);
+        u64 h = dg_host_dma_chunk(t->host, c->offset, t->host_chunk), v = gpu_addr(&t->data, c->offset);
         prep_top(s->copy, DSA_OPCODE_MEMMOVE, c->write ? h : v, c->write ? v : h, c->bytes);
         s->children_count = 0;
     } else {
         memset(s->comps, 0, max(n, 2U) * sizeof(*s->comps));
         for (j = 0; j < n; j++) {
             struct dg_cmd *c = &s->cmds[j];
-            u64 h = dg_host_dma(t->host, c->offset), v = gpu_addr(&t->data, c->offset);
+            u64 h = dg_host_dma_chunk(t->host, c->offset, t->host_chunk), v = gpu_addr(&t->data, c->offset);
             prep(&s->children[j], DSA_OPCODE_MEMMOVE, c->write ? h : v,
                  c->write ? v : h, c->bytes, s->comps_dma + j * sizeof(*s->comps));
         }
@@ -344,13 +352,71 @@ static void worker_loop(struct dg_group *g)
         busy_pause(&spins);
     }
 }
+/* No GPU SQ fetch or CPU SQ validation. Replay references a descriptor bank
+ * covering the entire working set, rather than repeatedly copying one slot. */
+static void payload_loop(struct dg_group *g)
+{
+    struct dg_test *t = g->test;
+    struct dg_run *r = t->r;
+    unsigned int head = 0, tail = 0, pending = 0, spins = 0, k;
+    while (!atomic_read(&t->error)) {
+        u64 now = ktime_get_ns();
+        bool stopping = r->seconds ? now >= t->deadline : g->cursor >= g->limit;
+        struct dg_slot *s = &g->slots[tail];
+        int ret;
+        if (!stopping && s->state == DG_FREE) {
+            u64 index = g->cursor % t->blocks_per_group;
+            s->first = g->cursor;
+            s->count = min_t(u64, t->batch, t->blocks_per_group - index);
+            if (!r->seconds) s->count = min_t(u64, s->count, g->limit - g->cursor);
+            if (r->path == DG_REPLAY) {
+                struct dg_bank *b = &g->banks[index / t->batch];
+                s->children = b->children; s->comps = b->comps;
+                s->children_dma = b->children_dma; s->comps_dma = b->comps_dma;
+                s->children_count = t->batch;
+                memset(s->comps, 0, t->batch * sizeof(*s->comps));
+                prep_top(s->copy, DSA_OPCODE_BATCH, 0, s->children_dma, t->batch);
+                s->copy_start = ktime_get_ns();
+                ret = submit(g->copy_wq, s->copy, &s->copy_active);
+            } else {
+                for (k = 0; k < s->count; k++)
+                    s->cmds[k] = dg_command(g->id, index+k, r->data_bytes,
+                        r->block_bytes, groups, r->direction, r->seed);
+                ret = issue_copy(g, s);
+            }
+            if (ret) { fail(t, ret); return; }
+            s->state = DG_COPYING; pending++;
+            g->cursor += s->count; tail = (tail + 1) % r->depth;
+        }
+        s = &g->slots[head];
+        if (s->state == DG_COPYING) {
+            ret = poll_desc(s->copy, &s->copy_active);
+            if (!ret && ktime_get_ns() - s->copy_start > DG_TIMEOUT_NS) {
+                fail(t, -ETIMEDOUT); return;
+            }
+            if (ret < 0) { fail(t, ret); return; }
+            if (ret == 1) {
+                for (k = 0; k < s->children_count; k++)
+                    if (DSA_COMP_STATUS(READ_ONCE(s->comps[k].status)) != DSA_COMP_SUCCESS) {
+                        fail(t, -EIO); return;
+                    }
+                r->stats[g->id].executed += s->count;
+                if (measured(t, ktime_get_ns())) r->stats[g->id].measured += s->count;
+                s->state = DG_FREE; pending--; head = (head + 1) % r->depth;
+            }
+        }
+        if (stopping && !pending) break;
+        busy_pause(&spins);
+    }
+}
 static int thread_main(void *arg)
 {
     struct dg_thread *th = arg;
     complete(&th->ready);
     wait_for_completion(&th->g->test->start);
     if (!atomic_read(&th->g->test->error)) {
-        if (th->worker) worker_loop(th->g); else fetch_loop(th->g);
+        if (th->g->test->r->path) payload_loop(th->g);
+        else if (th->worker) worker_loop(th->g); else fetch_loop(th->g);
     }
     complete(&th->done);
     return 0;
@@ -383,14 +449,38 @@ static int alloc_group(struct dg_group *g)
     for (k = 0; k < t->r->depth; k++) {
         struct dg_slot *s = &g->slots[k];
         /* NONBLOCK防止depth超过驱动描述符池时在初始化中永久阻塞。 */
-        s->fetch = idxd_alloc_desc(g->fetch_wq, IDXD_OP_NONBLOCK);
-        if (IS_ERR(s->fetch)) { int ret = PTR_ERR(s->fetch); s->fetch = NULL; return ret; }
+        if (!t->r->path) {
+            s->fetch = idxd_alloc_desc(g->fetch_wq, IDXD_OP_NONBLOCK);
+            if (IS_ERR(s->fetch)) { int ret = PTR_ERR(s->fetch); s->fetch = NULL; return ret; }
+        }
         s->copy = idxd_alloc_desc(g->copy_wq, IDXD_OP_NONBLOCK);
         if (IS_ERR(s->copy)) { int ret = PTR_ERR(s->copy); s->copy = NULL; return ret; }
+        if (t->r->path == DG_REPLAY) continue;
         s->cmds = dma_alloc_coherent(t->dev, t->batch * sizeof(*s->cmds), &s->cmds_dma, GFP_KERNEL);
         s->children = dma_alloc_coherent(t->dev, n * sizeof(*s->children), &s->children_dma, GFP_KERNEL);
         s->comps = dma_alloc_coherent(t->dev, n * sizeof(*s->comps), &s->comps_dma, GFP_KERNEL);
         if (!s->cmds || !s->children || !s->comps) return -ENOMEM;
+    }
+    if (t->r->path == DG_REPLAY) {
+        u64 bank, j;
+        g->num_banks = t->blocks_per_group / t->batch;
+        g->banks = kvcalloc(g->num_banks, sizeof(*g->banks), GFP_KERNEL);
+        if (!g->banks) return -ENOMEM;
+        for (bank = 0; bank < g->num_banks; bank++) {
+            struct dg_bank *b = &g->banks[bank];
+            b->children = dma_alloc_coherent(t->dev, n * sizeof(*b->children), &b->children_dma, GFP_KERNEL);
+            b->comps = dma_alloc_coherent(t->dev, n * sizeof(*b->comps), &b->comps_dma, GFP_KERNEL);
+            if (!b->children || !b->comps) return -ENOMEM;
+            for (j = 0; j < t->batch; j++) {
+                struct dg_cmd c = dg_command(g->id, bank*t->batch+j, t->r->data_bytes,
+                    t->r->block_bytes, groups, t->r->direction, t->r->seed);
+                u64 h = dg_host_dma_chunk(t->host, c.offset, t->host_chunk);
+                u64 v = gpu_addr(&t->data, c.offset);
+                prep(&b->children[j], DSA_OPCODE_MEMMOVE, c.write ? h : v, c.write ? v : h,
+                     c.bytes, b->comps_dma + j * sizeof(*b->comps));
+            }
+            cond_resched();
+        }
     }
     return 0;
 }
@@ -413,26 +503,40 @@ static void free_group(struct dg_group *g)
     for (k = 0; k < t->r->depth; k++) {
         struct dg_slot *s = &g->slots[k];
         if (s->cmds) dma_free_coherent(t->dev, t->batch * sizeof(*s->cmds), s->cmds, s->cmds_dma);
-        if (s->children) dma_free_coherent(t->dev, n * sizeof(*s->children), s->children, s->children_dma);
-        if (s->comps) dma_free_coherent(t->dev, n * sizeof(*s->comps), s->comps, s->comps_dma);
+        if (t->r->path != DG_REPLAY) {
+            if (s->children) dma_free_coherent(t->dev, n * sizeof(*s->children), s->children, s->children_dma);
+            if (s->comps) dma_free_coherent(t->dev, n * sizeof(*s->comps), s->comps, s->comps_dma);
+        }
         if (s->fetch) idxd_free_desc(g->fetch_wq, s->fetch);
         if (s->copy) idxd_free_desc(g->copy_wq, s->copy);
+    }
+    if (g->banks) {
+        u64 bank;
+        for (bank = 0; bank < g->num_banks; bank++) {
+            struct dg_bank *b = &g->banks[bank];
+            if (b->children) dma_free_coherent(t->dev, n * sizeof(*b->children), b->children, b->children_dma);
+            if (b->comps) dma_free_coherent(t->dev, n * sizeof(*b->comps), b->comps, b->comps_dma);
+        }
+        kvfree(g->banks);
     }
     kfree(g->slots);
 }
 static int validate_run(struct dg_run *r)
 {
     u32 batch = r->mode ? r->batch_size : 1;
-    if (r->abi != DG_ABI || r->reserved || r->mode > 1 || r->direction > 2 ||
-        (r->block_bytes != 512 && r->block_bytes != 4096) ||
+    if (r->abi != DG_ABI || r->path > DG_REPLAY || r->mode > 1 || r->direction > 2 ||
+        (!is_power_of_2(r->block_bytes) || r->block_bytes < 512 || r->block_bytes > (r->path ? 65536 : 4096) || r->block_bytes > info.max_transfer) ||
+        (!r->path && r->block_bytes != 512 && r->block_bytes != 4096) ||
         !is_power_of_2(r->data_bytes) || r->data_bytes < (1ULL << 20) || r->data_bytes > (256ULL << 20) ||
         !is_power_of_2(r->batch_size) || r->batch_size < 2 || r->batch_size > info.max_batch ||
         !r->depth || r->depth > info.max_depth || (!r->mode && r->depth != 1) ||
         (u64)r->depth * batch > r->data_bytes / groups / r->block_bytes ||
-        r->sq_bytes != groups * dg_sq_stride(r->data_bytes, r->block_bytes, groups) ||
-        !r->gpu_data || !r->gpu_sq || ((r->gpu_data | r->gpu_sq) & (DG_ALIGN - 1)) ||
-        r->gpu_data > U64_MAX - r->data_bytes || r->gpu_sq > U64_MAX - r->sq_bytes ||
-        (r->gpu_data < r->gpu_sq + r->sq_bytes && r->gpu_sq < r->gpu_data + r->data_bytes) ||
+        !r->gpu_data || (r->gpu_data & (DG_ALIGN - 1)) || r->gpu_data > U64_MAX - r->data_bytes ||
+        (r->path && (r->gpu_sq || r->sq_bytes)) ||
+        (!r->path && (r->sq_bytes != groups * dg_sq_stride(r->data_bytes, r->block_bytes, groups) ||
+            !r->gpu_sq || (r->gpu_sq & (DG_ALIGN-1)) || r->gpu_sq > U64_MAX-r->sq_bytes ||
+            (r->gpu_data < r->gpu_sq+r->sq_bytes && r->gpu_sq < r->gpu_data+r->data_bytes))) ||
+        (r->path == DG_REPLAY && (!r->mode || (!r->seconds && r->operations % ((u64)groups * batch)))) ||
         r->seconds > 3600 || r->warmup_ms > 60000 ||
         (r->seconds && r->operations) ||
         (!r->seconds && (r->operations < groups || r->operations > (1ULL << 32) || r->warmup_ms)))
@@ -456,21 +560,24 @@ static long run_test(struct dg_run *r)
     r->elapsed_ns = r->completed = r->host_errors = 0;
     t.pdev = dsa_idxd_list[0]->pdev; t.dev = &t.pdev->dev;
     t.batch = r->mode ? r->batch_size : 1;
+    t.host_chunk = max((u32)DG_HOST_CHUNK, r->block_bytes);
     t.blocks_per_group = r->data_bytes / groups / r->block_bytes;
     t.sq_stride = dg_sq_stride(r->data_bytes, r->block_bytes, groups);
     atomic_set(&t.error, 0); init_completion(&t.start);
     /* 先验证GPU映射，BAR1不足时不再分配数万块主机内存。 */
     pr_info("dsa_gpu_test: stage=pin_data bytes=%llu\n", (unsigned long long)r->data_bytes);
     ret = pin(&t, &t.data, r->gpu_data, r->data_bytes); if (ret) goto out;
-    pr_info("dsa_gpu_test: stage=pin_sq bytes=%llu\n", (unsigned long long)r->sq_bytes);
-    ret = pin(&t, &t.sq, r->gpu_sq, r->sq_bytes); if (ret) goto out;
+    if (!r->path) {
+        pr_info("dsa_gpu_test: stage=pin_sq bytes=%llu\n", (unsigned long long)r->sq_bytes);
+        ret = pin(&t, &t.sq, r->gpu_sq, r->sq_bytes); if (ret) goto out;
+    }
     pr_info("dsa_gpu_test: stage=host_alloc bytes=%llu\n", (unsigned long long)r->data_bytes);
-    t.host = dg_host_alloc(t.dev, r->data_bytes);
+    t.host = dg_host_alloc_chunks(t.dev, r->data_bytes, t.host_chunk);
     t.g = kcalloc(groups, sizeof(*t.g), GFP_KERNEL);
     t.touched = bitmap_zalloc(r->data_bytes / r->block_bytes, GFP_KERNEL);
     if (!t.host || !t.g || !t.touched) { ret = -ENOMEM; goto out; }
     for (i = 0; i < r->data_bytes / 8; i++) {
-        *dg_host_word(t.host, i) = dg_pattern(i) ^ (dg_write(i * 8 / r->block_bytes, r->direction) ? U64_MAX : 0);
+        *dg_host_word_chunk(t.host, i, t.host_chunk) = dg_pattern(i) ^ (dg_write(i * 8 / r->block_bytes, r->direction) ? U64_MAX : 0);
         if (!(i & ((1U << 18) - 1))) cond_resched();
     }
     pr_info("dsa_gpu_test: stage=allocate_descriptors\n");
@@ -481,7 +588,7 @@ static long run_test(struct dg_run *r)
         ret = alloc_group(&t.g[g]); if (ret) goto out;
     }
     for (g = 0; g < groups; g++) {
-        ret = create_thread(&t.g[g].fetch_thread, &t.g[g], false); if (ret) goto join;
+        if (!r->path) { ret = create_thread(&t.g[g].fetch_thread, &t.g[g], false); if (ret) goto join; }
         ret = create_thread(&t.g[g].worker_thread, &t.g[g], true); if (ret) goto join;
     }
 join:
@@ -525,11 +632,11 @@ out:
         for (i = 0; i < r->data_bytes / 8; i++) {
             u64 b = i * 8 / r->block_bytes;
             bool unchanged = dg_write(b, r->direction) && !test_bit(b, t.touched);
-            if (*dg_host_word(t.host, i) != (dg_pattern(i) ^ (unchanged ? U64_MAX : 0))) r->host_errors++;
+            if (*dg_host_word_chunk(t.host, i, t.host_chunk) != (dg_pattern(i) ^ (unchanged ? U64_MAX : 0))) r->host_errors++;
         }
     }
     unpin(&t, &t.sq); unpin(&t, &t.data);
-    dg_host_free(t.dev, t.host, r->data_bytes);
+    dg_host_free_chunks(t.dev, t.host, r->data_bytes, t.host_chunk);
     kfree(t.g); bitmap_free(t.touched);
     pr_info("dsa_gpu_test: stage=return error=%d\n", ret ? ret : atomic_read(&t.error));
     return ret ? ret : atomic_read(&t.error);
@@ -635,4 +742,4 @@ MODULE_IMPORT_NS("IDXD");
 #else
 MODULE_IMPORT_NS(IDXD);
 #endif
-MODULE_DESCRIPTION("Single DSA multi-group GPU SQE/payload pipeline benchmark, ABI3");
+MODULE_DESCRIPTION("Single DSA GPU pipeline/payload/replay benchmark, ABI4");

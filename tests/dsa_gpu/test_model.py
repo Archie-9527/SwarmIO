@@ -18,7 +18,7 @@ int main() {
     static_assert(sizeof(dg_run)==232, "RUN ABI");
     for (unsigned groups : {1U,2U,4U}) {
         assert(groups*2*(128/(groups*2))==128);
-        for (unsigned size : {512U,4096U})
+        for (unsigned size : {512U,4096U,65536U})
         for (uint64_t bytes : {1ULL<<20,32ULL<<20,256ULL<<20})
         for (unsigned seed : {0U,12345U,0xffffffffU}) {
             auto blocks=bytes/groups/size;
@@ -115,4 +115,4 @@ with tempfile.TemporaryDirectory(prefix="dg-v2-model-") as tmp:
     subprocess.run([str(p/"test")],check=True)
 check_pipeline()
 subprocess.run([shutil.which("python3"),str(HERE/"test_host_pages.py")],check=True)
-print("PASS: ABI3, 4-group/8-WQ budget, GPU SQE/page boundaries, pin budgets, 1024-item batches, ring backpressure and tail requests")
+print("PASS: ABI4, 4-group/8-WQ budget, GPU SQE/page boundaries, pin budgets, 1024-item batches, ring backpressure and tail requests")
