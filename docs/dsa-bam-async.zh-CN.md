@@ -1,5 +1,7 @@
 # lab230-s6：SwarmIO + BaM 异步 DSA BATCH
 
+本文保留CPU合并获取SQE作为对照；复用DSA合并获取路径的新配置见 [DSA SQ获取说明](dsa-sq-fetch.zh-CN.md)。
+
 环境继续使用 Linux 6.8.0-138、NVIDIA 595.99.02、CUDA 13.2，
 `intel_iommu=off memmap=24G$4G`，GPU0/dsa0/CPU8–15。
 设备准备、驱动输入路径和正常装卸要求见 [同步基线说明](dsa-bam-lab230.zh-CN.md)。

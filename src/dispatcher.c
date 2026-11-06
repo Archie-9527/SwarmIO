@@ -31,10 +31,10 @@ extern int num_dma_descs_per_disp;
 extern int dma_timeout;
 extern int num_dsa_devs;
 
-static inline void __swarmio_disable_disp_dma(void)
+static inline void __swarmio_fault_disp_dma(void)
 {
-	SWARMIO_ERROR("disabling dispatcher DMA after DSA failure\n");
-	disp_using_dma = false;
+	WRITE_ONCE(sq_diag_faulted, true);
+	SWARMIO_ERROR("SQ DMA failed; stopping dispatch without CPU fallback\n");
 }
 
 #include "swarmio_queue_diagnostics.h"
@@ -438,6 +438,7 @@ int swarmio_dispatcher_init(struct nvme_vdev *vdev)
 
 	for (i = 0; i < num_service_units; i++) {
 		dispatcher = &vdev->dispatchers[i];
+		vdev->num_service_units_initialized = i + 1;
 
 		dispatcher->id = i;
 		dispatcher->num_workers = num_workers_per_service_unit;
@@ -501,6 +502,7 @@ int swarmio_dispatcher_init(struct nvme_vdev *vdev)
 					      dispatcher->thread_name);
 				goto err;
 			}
+			dispatcher->dma_ctx->sq_fetch = true;
 			/* CPU 构建不包含 idxd_wq 的内部定义；日志使用已有编号，避免解引用私有结构。 */
 			SWARMIO_DEBUG("%s assigned dsa%d/wq%d\n",
 				     dispatcher->thread_name, dev_id, wq_id);
@@ -526,7 +528,6 @@ int swarmio_dispatcher_init(struct nvme_vdev *vdev)
 		}
 		kthread_bind(dispatcher->task_struct, dispatcher->cpu_id);
 		wake_up_process(dispatcher->task_struct);
-		vdev->num_service_units_initialized++;
 	}
 
 	return 0;
@@ -626,8 +627,8 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 			dispatcher->dma_ctx, cmd_buffer_dma, sq_dma(sq_entry),
 			sizeof(struct nvme_command), NULL, NULL);
 		if (unlikely(ret)) {
-			__swarmio_disable_disp_dma();
-			src = __sq_entry_at(sq, sq_entry);
+			__swarmio_fault_disp_dma();
+			return false;
 		}
 	} else {
 		src = __sq_entry_at(sq, sq_entry);
@@ -745,7 +746,7 @@ void swarmio_prefetch_sq(int qid, struct swarmio_dispatcher *dispatcher)
 		    sq_dma(sq->fetched_pos),
 		    sizeof(struct nvme_command) * pref_size, &sq->dma_desc_id,
 		    NULL, NULL))) {
-		__swarmio_disable_disp_dma();
+		__swarmio_fault_disp_dma();
 		return;
 	}
 	sq->is_pref_issued = true;
@@ -821,8 +822,8 @@ int swarmio_dispatch_sq(int sqid, int new_db, int old_db,
 			}
 #endif
 			if (ret) {
-				__swarmio_disable_disp_dma();
-				sq_diag_copy(sq, sq->cmd_buffer + sq->fetched_pos, sq->fetched_pos, num_fetch);
+				__swarmio_fault_disp_dma();
+				return old_db;
 			}
 		} else {
 			sq_diag_copy(sq, sq->cmd_buffer + sq->fetched_pos, sq->fetched_pos, num_fetch);

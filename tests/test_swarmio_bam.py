@@ -247,7 +247,8 @@ class SQDiagnosticTests(unittest.TestCase):
         entry = modified[modified.index("static bool __dispatch_sq_entry("):]
         self.assertLess(entry.index("sq_diag_valid("), entry.index("nsid = cmd->common.nsid - 1"))
         self.assertNotIn("int num_fetch = new_db - sq->fetched_pos", function)
-        self.assertEqual(function.count("sq_diag_copy("), 2)
+        self.assertEqual(function.count("sq_diag_copy("), 1)
+        self.assertNotIn('__swarmio_disable_disp_dma', function)
 
     def test_c_guards_all_batch_commands_and_page_aware_io_copy(self):
         if not shutil.which("cc"):

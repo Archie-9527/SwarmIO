@@ -73,6 +73,7 @@ struct dsa_dev_cfg {
 
 struct dsa_dma_ctx_single {
 	struct idxd_desc **single_descs;
+	bool sq_fetch;
 
 	struct idxd_wq *wq;
 	void **data;
@@ -138,6 +139,10 @@ void swarmio_dsa_batch_retire(unsigned int count, u64 bytes);
 bool swarmio_dsa_batch_begin(void);
 void swarmio_dsa_batch_cancel(void);
 bool swarmio_dsa_batch_idle(void);
+bool swarmio_dsa_sq_begin(void);
+void swarmio_dsa_sq_end(void);
+void swarmio_dsa_sq_submit(u64 bytes);
+void swarmio_dsa_sq_complete(u64 bytes);
 #endif
 
 int dsa_set_params(const struct dsa_cfg_params *p);

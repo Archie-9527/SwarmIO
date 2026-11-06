@@ -56,10 +56,16 @@ int dsa_dma_wait_one_single(struct dsa_dma_ctx_single *ctx, int id,
     ctx->curr_desc = id; ctx->last_wait_time = jiffies;
     if (DSA_COMP_STATUS(status) != DSA_COMP_SUCCESS) {
         swarmio_dsa_error(false);
+        if (ctx->sq_fetch) swarmio_dsa_sq_end();
         pr_err("SwarmIO: DSA completion failed: wq=%d status=%#x\n", ctx->wq_id, status);
         return -EIO;
     }
-    swarmio_dsa_complete(d->hw->xfer_size);
+    if (ctx->sq_fetch) {
+        swarmio_dsa_sq_complete(d->hw->xfer_size);
+        swarmio_dsa_sq_end();
+    } else {
+        swarmio_dsa_complete(d->hw->xfer_size);
+    }
     if (timed_out) return -ETIMEDOUT;
     if (callback) callback(ctx->data[id]);
     return 0;
@@ -92,15 +98,23 @@ int dsa_dma_issue_async_single(struct dsa_dma_ctx_single *ctx, dma_addr_t dst,
     int id;
     if (swarmio_dsa_faulted()) return -EIO;
     if (!size || size > ctx->wq->max_xfer_bytes) return -EINVAL;
+    if (ctx->sq_fetch && size % 64) return -EINVAL;
     id = find_first_zero_bit(ctx->issued_mask, ctx->num_descs);
     if (id >= ctx->num_descs) return -EBUSY;
     d = ctx->single_descs[id];
     d->hw->src_addr = src; d->hw->dst_addr = dst; d->hw->xfer_size = size;
     WRITE_ONCE(d->completion->status, DSA_COMP_NONE);
     ctx->data[id] = data;
+    if (ctx->sq_fetch && !swarmio_dsa_sq_begin()) return -EIO;
     dma_wmb();
-    if (idxd_submit_desc(ctx->wq, d)) { swarmio_dsa_error(false); return -EIO; }
-    set_bit(id, ctx->issued_mask); swarmio_dsa_submit();
+    if (idxd_submit_desc(ctx->wq, d)) {
+        swarmio_dsa_error(false);
+        if (ctx->sq_fetch) swarmio_dsa_sq_end();
+        return -EIO;
+    }
+    set_bit(id, ctx->issued_mask);
+    if (ctx->sq_fetch) swarmio_dsa_sq_submit(size);
+    else swarmio_dsa_submit();
     if (id_out) *id_out = id;
     return 0;
 }

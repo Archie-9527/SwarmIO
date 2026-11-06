@@ -38,6 +38,10 @@ def is_dsa_batch(config):
     return is_dsa(config) and config['build'].get('CONFIG_SWARMIO_WORKER_BATCH_IO') == 'y'
 
 
+def is_dsa_sq(config):
+    return is_dsa(config) and bool(config['module'].get('disp_using_dma'))
+
+
 def output(command, **kwargs):
     return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT, **kwargs).strip()
 
@@ -127,7 +131,7 @@ def read_config(path, overrides=None):
         raise Error('backend 必须为 cpu 或 dsa')
     if not is_dsa(config) and build.get('CONFIG_SWARMIO_WORKER_BATCH_IO') != 'n':
         raise Error('CPU 配置不使用 DSA batch worker')
-    required = {'CONFIG_SWARMIO_WORKER_SKIP_IO': 'n', 'CONFIG_SWARMIO_DMA_DISPATCHER': 'n',
+    required = {'CONFIG_SWARMIO_WORKER_SKIP_IO': 'n', 'CONFIG_SWARMIO_DMA_DISPATCHER': 'y' if is_dsa_sq(config) else 'n',
                 'CONFIG_SWARMIO_DMA_WORKER': 'y' if is_dsa(config) else 'n', 'CONFIG_SWARMIO_COMMIT': 'n',
                 'CONFIG_SWARMIO_DISP_ALLOC_WORKER_RR': 'n',
                 'CONFIG_SWARMIO_SQ_DIAGNOSTICS': 'y', 'CONFIG_SWARMIO_QUEUE_DIAGNOSTICS': 'y'}
@@ -137,8 +141,14 @@ def read_config(path, overrides=None):
         raise Error('worker 本地队列必须能由 16 位索引表示，范围为 2..65535')
     if not 1 <= int(build['NR_MAX_IO_QUEUE']) <= 64 or not 1 <= params['qdiag_qid'] <= int(build['NR_MAX_IO_QUEUE']):
         raise Error('当前入口支持最多 64 个 I/O 队列，诊断 QID 必须在范围内')
-    if params['disp_using_dma'] or bool(params['worker_using_dma']) != is_dsa(config) or params['io_unit_shift'] != 9:
-        raise Error('运行参数与后端不符：dispatcher 使用 CPU，worker 按 backend 选择，时序单位为 512 B')
+    if bool(params['disp_using_dma']) != is_dsa_sq(config) or bool(params['worker_using_dma']) != is_dsa(config) or params['io_unit_shift'] != 9:
+        raise Error('运行参数与 SQ/payload 后端不符，时序单位必须为 512 B')
+    if is_dsa_sq(config):
+        if (not is_dsa_batch(config) or build.get('CONFIG_SWARMIO_DISP_COALESCE_SQE') != 'y' or
+            build.get('CONFIG_SWARMIO_DISP_PREFETCH_SQE') != 'n' or
+            not 1 <= params.get('num_dma_descs_per_disp', 0) <= 64 or
+            not 1 <= int(build['NR_MAX_FETCH_SQE']) <= 1024):
+            raise Error('DSA SQ 对照要求合并读取、关闭预取、async-batch payload 和有效 dispatcher 描述符数量')
     if is_dsa(config):
         if build.get('CONFIG_SWARMIO_WORKER_BATCH_IO') not in ('n', 'y') or params.get('num_workers_per_service_unit') != 1:
             raise Error('DSA 要求 single 或 async-batch，每个 service unit 一个 worker')
@@ -317,18 +327,26 @@ def dsa_environment(config, gpu):
     node_cpus = cpu_set((Path('/sys/devices/system/node') / f'node{node}/cpulist').read_text().strip())
     if not cpu_set(p['cpus']) <= node_cpus:
         raise Error('DSA 服务 CPU 必须与 DSA/GPU 位于同一 NUMA 节点')
-    queues = []
+    queues, fetch_queues = [], []
+    roles = [('payload', 1, p['num_dma_descs_per_worker'])]
+    if is_dsa_sq(config):
+        roles.append(('fetch', 0, p['num_dma_descs_per_disp']))
     for group in range(p['num_service_units']):
-        q = dev / f"wq{p['dsa_device_id']}.{group * 2 + 1}"
-        wanted = {'state': 'enabled', 'type': 'kernel', 'mode': 'dedicated', 'group_id': str(group)}
-        if any((q / k).read_text().strip() != v for k, v in wanted.items()) or (q / 'driver').resolve().name != 'dmaengine':
-            raise Error('payload 队列不是匹配的 dedicated kernel DMAengine WQ：' + q.name)
-        if int((q / 'size').read_text()) < p['num_dma_descs_per_worker']:
-            raise Error('payload WQ 描述符容量不足')
-        if is_dsa_batch(config) and int((q / 'max_batch_size').read_text()) < p['dma_batch_size']:
-            raise Error('payload WQ 的 max_batch_size 不足：' + q.name)
-        queues.append(q.name)
-    return {'device': dev.name, 'pci': bdf, 'numa_node': node, 'gpu_pci': gpu_bdf, 'payload_wqs': queues}
+        for role, offset, count in roles:
+            q = dev / f"wq{p['dsa_device_id']}.{group * 2 + offset}"
+            wanted = {'state': 'enabled', 'type': 'kernel', 'mode': 'dedicated', 'group_id': str(group)}
+            if any((q / k).read_text().strip() != v for k, v in wanted.items()) or (q / 'driver').resolve().name != 'dmaengine':
+                raise Error(role + ' 队列不是匹配的 dedicated kernel DMAengine WQ：' + q.name)
+            if int((q / 'size').read_text()) < count:
+                raise Error(role + ' WQ 描述符容量不足')
+            if role == 'payload' and is_dsa_batch(config) and int((q / 'max_batch_size').read_text()) < p['dma_batch_size']:
+                raise Error('payload WQ 的 max_batch_size 不足：' + q.name)
+            if role == 'fetch' and int((q / 'max_transfer_size').read_text()) < int(config['build']['NR_MAX_FETCH_SQE']) * 64:
+                raise Error('fetch WQ 的 max_transfer_size 不足：' + q.name)
+            (queues if role == 'payload' else fetch_queues).append(q.name)
+    report = {'device': dev.name, 'pci': bdf, 'numa_node': node, 'gpu_pci': gpu_bdf, 'payload_wqs': queues}
+    if fetch_queues: report['fetch_wqs'] = fetch_queues
+    return report
 
 
 def source_inventory(root):
@@ -427,6 +445,9 @@ def build(args, config):
             expected_mode = 'borrowed-batch-v1' if is_dsa_batch(config) else 'borrowed-single-v1'
             if output(['modinfo', '-F', 'swarmio_dsa_mode', str(swarmio)]) != expected_mode:
                 raise Error('DSA 模块提交模式与配置不符')
+            expected_sq = 'dsa-coalesced-v1' if is_dsa_sq(config) else 'cpu-coalesced-v1'
+            if output(['modinfo', '-F', 'swarmio_sq_backend', str(swarmio)]) != expected_sq:
+                raise Error('DSA 模块 SQ 获取模式与配置不符')
         execute(['cmake', '-S', str(ROOT / 'bam'), '-B', str(out / 'bam'),
                  '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CUDA_ARCHITECTURES=' + env['gpu']['cuda_arch'],
                  '-DCMAKE_CUDA_COMPILER=' + env['nvcc_path'], '-DCUDA_TOOLKIT_ROOT_DIR=' + env['cuda_root'],
@@ -602,7 +623,8 @@ def load(args):
                'bdf': device.name, 'manifest_sha256': digest(args.build_dir / 'manifest.json'),
                'run_state': 'not_started'})
     print('已就绪：', device.name, '-> /dev/libnvm0；',
-          ('CPU SQ fetch + DSA ' + ('async-batch' if is_dsa_batch(config) else 'synchronous') + ' payload') if dsa else 'CPU full-I/O',
+          (('DSA coalesced SQ fetch' if is_dsa_sq(config) else 'CPU SQ fetch') + ' + DSA ' +
+           ('async-batch' if is_dsa_batch(config) else 'synchronous') + ' payload') if dsa else 'CPU full-I/O',
           '；GPU', manifest['environment']['gpu']['name'])
 
 
@@ -708,7 +730,7 @@ def run(args):
         os.pathsep + child_env['LD_LIBRARY_PATH'] if child_env.get('LD_LIBRARY_PATH') else '')
     record = {'command': command, 'gpu': manifest['environment']['gpu'], 'state': 'running',
               'payload_backend': ('dsa-borrowed-batch' if is_dsa_batch(manifest['config']) else 'dsa-borrowed-single') if is_dsa(manifest['config']) else 'cpu',
-              'sq_backend': 'cpu', 'benchmark': bench,
+              'sq_backend': 'dsa-coalesced' if is_dsa_sq(manifest['config']) else 'cpu', 'benchmark': bench,
               'build_manifest_sha256': digest(args.build_dir / 'manifest.json'),
               'bar_latency_requested': bar_latency}
     print('输出目录：', directory, flush=True)
@@ -791,6 +813,15 @@ def run(args):
                 if batches['batches_submitted'] <= 0 or batches['batches_submitted'] != batches['batches_retired']:
                     record['state'] = 'dsa_mismatch'
                 print('DSA 实际批次统计：', batches, flush=True)
+            if is_dsa_sq(manifest['config']):
+                sq = {k: final[k] - dsa_before[k] for k in ('sq_submitted', 'sq_completed', 'sq_bytes', 'sq_entries')}
+                sq['average_sqes_per_dma'] = sq['sq_entries'] / sq['sq_completed'] if sq['sq_completed'] else 0
+                sq['max_sqes_since_load'] = final['sq_max_entries']
+                record['dsa_sq_delta'] = sq
+                if (sq['sq_submitted'] <= 0 or sq['sq_submitted'] != sq['sq_completed'] or
+                    sq['sq_entries'] != expected or sq['sq_bytes'] != expected * 64):
+                    record['state'] = 'dsa_mismatch'
+                print('DSA 合并 SQ 获取统计：', sq, flush=True)
         except (Error, OSError, ValueError) as exc:
             record.update(state='dsa_mismatch', dsa_error=str(exc))
     try:
@@ -817,11 +848,11 @@ def read_dsa_state(manifest):
     needed = {'device', 'borrowed', 'fault', 'submitted', 'completed', 'bytes', 'errors', 'timeouts'}
     if not needed <= values.keys() or values['fault'] or values['device'] != manifest['config']['module']['dsa_device_id']:
         raise Error('DSA 状态缺失、设备不匹配或已有 DMA 故障')
-    if values['borrowed'] != manifest['config']['module']['num_service_units']:
+    if values['borrowed'] != manifest['config']['module']['num_service_units'] * (2 if is_dsa_sq(manifest['config']) else 1):
         raise Error('DSA 借用通道数量不匹配')
     if is_dsa_batch(manifest['config']):
         required = {'batches_submitted', 'batches_retired', 'active_batches', 'pending_batches', 'peak_batches', 'max_batch'}
-        if (values.get('version') != 2 or values.get('mode') != 1 or not required <= values.keys() or
+        if (values.get('version') not in (2, 3) or values.get('mode') != 1 or not required <= values.keys() or
             values['active_batches'] or values['pending_batches']):
             raise Error('DSA async-batch 状态不符或仍有在途 DMA')
         for key in ('dma_batch_size', 'num_dma_descs_per_worker', 'dma_batch_flush_us'):
@@ -829,6 +860,17 @@ def read_dsa_state(manifest):
                 raise Error('DSA batch 运行参数与构建记录不一致：' + key)
     elif values.get('mode', 0) != 0:
         raise Error('期望同步 DSA 模块，但加载了 batch 模式')
+    if is_dsa_sq(manifest['config']):
+        required = {'sq_submitted', 'sq_completed', 'sq_bytes', 'sq_entries', 'sq_max_entries', 'sq_pending'}
+        if values.get('version') != 3 or values.get('sq_fetch') != 1 or not required <= values.keys() or values['sq_pending']:
+            raise Error('DSA SQ 获取状态不符或仍有在途 SQ DMA')
+        p = MODULES / 'swarmio/parameters'
+        if (p / 'disp_using_dma').read_text().strip() not in ('Y', '1'):
+            raise Error('dispatcher DMA 未启用')
+        if int((p / 'num_dma_descs_per_disp').read_text()) != manifest['config']['module']['num_dma_descs_per_disp']:
+            raise Error('dispatcher 描述符数量与构建记录不一致')
+    elif values.get('sq_fetch', 0) != 0:
+        raise Error('期望 CPU SQ 获取，但加载了 DSA SQ 模式')
     if (MODULES / 'swarmio/parameters/worker_using_dma').read_text().strip() not in ('Y', '1'):
         raise Error('worker DMA 未启用')
     expected_peer = manifest['environment']['dsa']['pci']

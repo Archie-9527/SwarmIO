@@ -89,6 +89,7 @@ class DSATests(unittest.TestCase):
 #include <assert.h>
 #include <stdio.h>
 #define PAGE_SIZE 4096
+#define NR_MAX_FETCH_SQE 1024
 #define module_param_cb(...)
 typedef struct { long long counter; } atomic64_t;
 #define ATOMIC64_INIT(x) {x}
@@ -126,7 +127,7 @@ struct device *bus_find_device_by_name(const int *bus,struct device *start,const
 }
 void put_device(struct device *dev) { assert(dev==&d.idxd_dev.conf_dev && refs); refs--; }
 struct dma_chan *dma_request_channel(dma_cap_mask_t m,bool (*filter)(struct dma_chan *,void *),void *arg) {
-    struct idxd_wq *q=arg; (void)m; assert(q->id%2==1); attempt++;
+    struct idxd_wq *q=arg; (void)m; assert(disp_using_dma || q->id%2==1); attempt++;
     if(attempt==fail_at) return NULL;
     assert(!q->client_count && filter(&q->idxd_chan->chan,arg)); q->client_count++; acquired++;
     return &q->idxd_chan->chan;
@@ -177,17 +178,35 @@ int main(void) {
     assert(dsa_enable_devices()==-EINVAL && acquired==1 && released==1 && !refs);
     setup(); domain=&d; assert(dsa_enable_devices()==-EOPNOTSUPP && !attempt && !refs);
     setup(); pasid=true; assert(dsa_enable_devices()==-EOPNOTSUPP && !attempt && !refs);
+    setup(); disp_using_dma=true;
+    assert(!dsa_enable_devices() && acquired==8 && refs==1);
+    dsa_disable_devices(); assert(released==8 && !refs); unchanged();
+    for(unsigned n=1;n<=8;n++) {
+        setup(); fail_at=n; assert(dsa_enable_devices()==-EBUSY);
+        assert(acquired==n-1 && released==n-1 && !refs); unchanged();
+    }
+    setup(); queues[0].client_count=1;
+    assert(dsa_enable_devices()==-EBUSY && !acquired && !refs);
+    setup(); queues[0].max_xfer_bytes=4096;
+    assert(dsa_enable_devices()==-EINVAL && !acquired && !refs);
+    disp_using_dma=false;
     assert(swarmio_dsa_batch_begin()); swarmio_dsa_batch_submit(32);
     assert(swarmio_dsa_batch_begin()); swarmio_dsa_batch_submit(32);
     assert(!swarmio_dsa_batch_idle());
     swarmio_dsa_batch_retire(32,16384); swarmio_dsa_batch_retire(32,16384);
     assert(swarmio_dsa_batch_idle());
+    assert(swarmio_dsa_sq_begin()); swarmio_dsa_sq_submit(512);
+    assert(!swarmio_dsa_batch_idle());
+    swarmio_dsa_sq_complete(512); swarmio_dsa_sq_end();
+    assert(swarmio_dsa_batch_idle());
     swarmio_dsa_submit(); swarmio_dsa_complete(512); swarmio_dsa_error(false);
     assert(swarmio_dsa_faulted());
     assert(!swarmio_dsa_batch_begin() && swarmio_dsa_batch_idle());
+    assert(!swarmio_dsa_sq_begin() && swarmio_dsa_batch_idle());
     char out[4096]; state_get(out,NULL);
     assert(strstr(out,"submitted=65 completed=65 bytes=33280 errors=1"));
     assert(strstr(out,"batches_submitted=2 batches_retired=2 active_batches=0 peak_batches=2 max_batch=32 pending_batches=0"));
+    assert(strstr(out,"sq_submitted=1 sq_completed=1 sq_bytes=512 sq_entries=8 sq_max_entries=8 sq_pending=0"));
 }
 '''
         if not shutil.which('cc'): self.skipTest('no C compiler')

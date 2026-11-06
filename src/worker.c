@@ -1027,6 +1027,11 @@ MODULE_INFO(swarmio_skip_io, "1");
 MODULE_INFO(swarmio_skip_io, "0");
 #endif
 #ifdef CONFIG_SWARMIO_HAS_DSA
+#ifdef CONFIG_SWARMIO_DMA_DISPATCHER
+MODULE_INFO(swarmio_sq_backend, "dsa-coalesced-v1");
+#else
+MODULE_INFO(swarmio_sq_backend, "cpu-coalesced-v1");
+#endif
 #ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
 MODULE_INFO(swarmio_build_profile, "dsa-payload-async-batch-v1");
 MODULE_INFO(swarmio_dsa_mode, "borrowed-batch-v1");

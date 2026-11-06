@@ -24,6 +24,9 @@ static atomic64_t batches_submitted = ATOMIC64_INIT(0), batches_retired = ATOMIC
 static atomic_t active_batches = ATOMIC_INIT(0), peak_batches = ATOMIC_INIT(0);
 static atomic_t pending_batches = ATOMIC_INIT(0);
 static atomic_t max_batch = ATOMIC_INIT(0);
+static atomic64_t sq_submitted = ATOMIC64_INIT(0), sq_completed = ATOMIC64_INIT(0);
+static atomic64_t sq_bytes = ATOMIC64_INIT(0), sq_entries = ATOMIC64_INIT(0);
+static atomic_t sq_pending = ATOMIC_INIT(0), sq_max_entries = ATOMIC_INIT(0);
 
 void swarmio_dsa_error(bool timeout)
 {
@@ -64,7 +67,25 @@ void swarmio_dsa_batch_cancel(void) { atomic_dec(&pending_batches); }
 bool swarmio_dsa_batch_idle(void)
 {
     smp_mb();
-    return !atomic_read(&pending_batches);
+    return !atomic_read(&pending_batches) && !atomic_read(&sq_pending);
+}
+bool swarmio_dsa_sq_begin(void)
+{
+    atomic_inc_return(&sq_pending);
+    if (!swarmio_dsa_faulted()) return true;
+    atomic_dec(&sq_pending);
+    return false;
+}
+void swarmio_dsa_sq_end(void) { atomic_dec(&sq_pending); }
+void swarmio_dsa_sq_submit(u64 bytes)
+{
+    atomic64_inc(&sq_submitted);
+    update_max(&sq_max_entries, bytes / 64);
+}
+void swarmio_dsa_sq_complete(u64 bytes)
+{
+    atomic64_inc(&sq_completed);
+    atomic64_add(bytes, &sq_bytes); atomic64_add(bytes / 64, &sq_entries);
 }
 void swarmio_dsa_batch_retire(unsigned int count, u64 bytes)
 {
@@ -81,12 +102,15 @@ static int state_get(char *buf, const struct kernel_param *kp)
 #endif
     for (i = 0; i < DSA_MAX_WQS; ++i) borrowed += !!channels[i];
     return scnprintf(buf, PAGE_SIZE,
-        "version=2 device=%u borrowed=%u fault=%d submitted=%lld completed=%lld bytes=%lld errors=%lld timeouts=%lld "
-        "mode=%u batches_submitted=%lld batches_retired=%lld active_batches=%d peak_batches=%d max_batch=%d pending_batches=%d\n",
+        "version=3 device=%u borrowed=%u fault=%d submitted=%lld completed=%lld bytes=%lld errors=%lld timeouts=%lld "
+        "mode=%u batches_submitted=%lld batches_retired=%lld active_batches=%d peak_batches=%d max_batch=%d pending_batches=%d "
+        "sq_fetch=%u sq_submitted=%lld sq_completed=%lld sq_bytes=%lld sq_entries=%lld sq_max_entries=%d sq_pending=%d\n",
         device_id, borrowed, atomic_read(&fault), atomic64_read(&submitted),
         atomic64_read(&completed), atomic64_read(&bytes_done), atomic64_read(&errors), atomic64_read(&timeouts),
         mode, atomic64_read(&batches_submitted), atomic64_read(&batches_retired),
-        atomic_read(&active_batches), atomic_read(&peak_batches), atomic_read(&max_batch), atomic_read(&pending_batches));
+        atomic_read(&active_batches), atomic_read(&peak_batches), atomic_read(&max_batch), atomic_read(&pending_batches),
+        !!disp_using_dma, atomic64_read(&sq_submitted), atomic64_read(&sq_completed),
+        atomic64_read(&sq_bytes), atomic64_read(&sq_entries), atomic_read(&sq_max_entries), atomic_read(&sq_pending));
 }
 static const struct kernel_param_ops state_ops = { .get = state_get };
 module_param_cb(dsa_state, &state_ops, NULL, 0444);
@@ -152,7 +176,7 @@ int dsa_enable_devices(void)
             strcmp(dev->driver->name, "dmaengine") ||
             wq->type != IDXD_WQT_KERNEL || !wq_dedicated(wq) ||
             wq->group != idxd->groups[i / 2] || !wq->idxd_chan || !wq->descs || !wq->portal ||
-            wq->size < 2 || wq->max_xfer_bytes < PAGE_SIZE) goto fail;
+            wq->size < 2 || wq->max_xfer_bytes < (i % 2 ? PAGE_SIZE : 64 * NR_MAX_FETCH_SQE)) goto fail;
         channels[i] = dma_request_channel(mask, match_channel, wq);
         if (!channels[i]) { ret = -EBUSY; goto fail; }
     }

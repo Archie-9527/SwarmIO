@@ -36,8 +36,13 @@ ifneq ($(filter y,$(CONFIG_SWARMIO_DMA_DISPATCHER) $(CONFIG_SWARMIO_DMA_WORKER))
 ccflags-y += -DCONFIG_SWARMIO_HAS_DSA=1
 swarmio-objs += dsa/config.o dsa/dsa.o dsa/single.o
 ifeq ($(CONFIG_SWARMIO_WORKER_BATCH_IO),y)
-ifneq ($(CONFIG_SWARMIO_DMA_WORKER):$(CONFIG_SWARMIO_DMA_DISPATCHER):$(CONFIG_SWARMIO_COMMIT),y:n:n)
-$(error asynchronous DSA batches require DMA_WORKER=y DMA_DISPATCHER=n COMMIT=n)
+ifneq ($(CONFIG_SWARMIO_DMA_WORKER):$(CONFIG_SWARMIO_COMMIT),y:n)
+$(error asynchronous DSA batches require DMA_WORKER=y COMMIT=n)
+endif
+ifeq ($(CONFIG_SWARMIO_DMA_DISPATCHER),y)
+ifneq ($(CONFIG_SWARMIO_DISP_COALESCE_SQE):$(CONFIG_SWARMIO_DISP_PREFETCH_SQE),y:n)
+$(error DSA SQ comparison requires COALESCE_SQE=y PREFETCH_SQE=n)
+endif
 endif
 swarmio-objs += dsa/batch.o
 endif

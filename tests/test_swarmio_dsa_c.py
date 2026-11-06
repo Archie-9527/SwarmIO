@@ -124,18 +124,23 @@ struct idxd_desc { struct dsa_hw_desc *hw; struct completion *completion; u64 co
 struct idxd_wq { int size; u64 max_xfer_bytes; };
 struct idxd_device { int max_wqs; struct idxd_wq **wqs; };
 struct dsa_dma_ctx_single {
-    struct idxd_desc **single_descs; struct idxd_wq *wq; void **data;
+    struct idxd_desc **single_descs; struct idxd_wq *wq; void **data; bool sq_fetch;
     unsigned long issued_mask[1],last_wait_time;
     int num_descs,curr_desc,dev_id,wq_id,timeout;
 };
 static unsigned long jiffies;
 static unsigned calls,allocs,frees,fail_at,mode,errors,timeouts,submitted,completed,bytes,callbacks;
+static unsigned sq_pending,sq_submitted,sq_completed,sq_bytes;
 static bool fault;
 static struct idxd_desc *pending;
 static void swarmio_dsa_error(bool t) { fault=true; errors++; timeouts+=t; }
 static bool swarmio_dsa_faulted(void) { return fault; }
 static void swarmio_dsa_submit(void) { submitted++; }
 static void swarmio_dsa_complete(u64 n) { completed++; bytes+=n; }
+static bool swarmio_dsa_sq_begin(void) { sq_pending++; if(!fault) return true; sq_pending--; return false; }
+static void swarmio_dsa_sq_end(void) { assert(sq_pending); sq_pending--; }
+static void swarmio_dsa_sq_submit(u64 n) { sq_submitted++; }
+static void swarmio_dsa_sq_complete(u64 n) { sq_completed++; sq_bytes+=n; }
 static struct idxd_desc *idxd_alloc_desc(struct idxd_wq *q,int type) {
     if(++calls==fail_at) return (void *)(intptr_t)-ENOMEM;
     struct idxd_desc *d=calloc(1,sizeof(*d)); d->hw=calloc(1,sizeof(*d->hw));
@@ -168,16 +173,23 @@ int main(void) {
         assert(allocs==f-1 && frees==allocs && !c.single_descs && !c.data);
         dsa_dma_ctx_single_remove(&c);
     }
-    for(unsigned m=0;m<4;m++) {
+    for(unsigned role=0;role<2;role++) for(unsigned m=0;m<4;m++) {
         struct dsa_dma_ctx_single c={0}; fail_at=0; mode=m;
         allocs=frees=calls=errors=timeouts=submitted=completed=bytes=callbacks=jiffies=0; fault=false;
+        sq_pending=sq_submitted=sq_completed=sq_bytes=0;
         assert(!dsa_dma_ctx_single_init(&c,0,0,2,1));
+        c.sq_fetch=role;
         int r=dsa_dma_issue_sync_single(&c,44,55,512,(void *)42,callback);
         assert(!c.issued_mask[0]);
-        if(m==0) assert(!r && callbacks==1 && completed==1 && bytes==512 && !fault);
-        if(m==1) assert(r==-EIO && errors==1 && !submitted && !callbacks);
-        if(m==2) assert(r==-EIO && errors==1 && submitted==1 && !completed && !callbacks);
-        if(m==3) assert(r==-ETIMEDOUT && timeouts==1 && completed==1 && !callbacks && jiffies>=4);
+        unsigned nsubmit=role ? sq_submitted : submitted,ncomplete=role ? sq_completed : completed;
+        unsigned nbytes=role ? sq_bytes : bytes;
+        assert(!sq_pending);
+        if(role) assert(!submitted && !completed && !bytes);
+        else assert(!sq_submitted && !sq_completed && !sq_bytes);
+        if(m==0) assert(!r && callbacks==1 && ncomplete==1 && nbytes==512 && !fault);
+        if(m==1) assert(r==-EIO && errors==1 && !nsubmit && !callbacks);
+        if(m==2) assert(r==-EIO && errors==1 && nsubmit==1 && !ncomplete && !callbacks);
+        if(m==3) assert(r==-ETIMEDOUT && timeouts==1 && ncomplete==1 && !callbacks && jiffies>=4);
         if(m) assert(dsa_dma_issue_sync_single(&c,44,55,512,NULL,NULL)==-EIO);
         dsa_dma_ctx_single_remove(&c); assert(allocs==frees);
     }

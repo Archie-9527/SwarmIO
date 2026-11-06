@@ -192,3 +192,4 @@ __pycache__/
 !/configs/bam-cpu.json
 !/configs/bam-dsa-lab230.json
 !/configs/bam-dsa-async-lab230.json
+!/configs/bam-dsa-sq-lab230.json
