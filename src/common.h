@@ -44,6 +44,9 @@
 #ifndef NR_MAX_QUEUE_SIZE
 #define NR_MAX_QUEUE_SIZE 1024
 #endif
+#if NR_MAX_IO_QUEUE < 1 || NR_MAX_IO_QUEUE > 512
+#error "Supported IO queue count is 1..512"
+#endif
 #ifndef NR_WORKER_QUEUE_SIZE
 #define NR_WORKER_QUEUE_SIZE 4096
 #endif

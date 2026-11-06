@@ -193,3 +193,7 @@ __pycache__/
 !/configs/bam-dsa-lab230.json
 !/configs/bam-dsa-async-lab230.json
 !/configs/bam-dsa-sq-lab230.json
+!/configs/bam-dsa-scale-lab230.json
+!/configs/bam-dsa-scale-su8-lab230.json
+!/configs/bam-dsa-scale-su16-lab230.json
+!/configs/bam-dsa-scale-d30-lab230.json

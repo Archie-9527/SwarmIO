@@ -4,8 +4,20 @@
 set -euo pipefail
 dev=${1:-dsa0}
 apply=${2:---check}
+fetch_size=
+payload_size=
+if (($# >= 2)); then shift 2; else shift "$#"; fi
+while (($#)); do
+    case "$1" in
+        --fetch-size|--payload-size)
+            (($# >= 2)) && [[ $2 =~ ^[0-9]+$ ]] || { echo 'WQ容量需要正整数'; exit 1; }
+            if [[ $1 == --fetch-size ]]; then fetch_size=$2; else payload_size=$2; fi
+            shift 2 ;;
+        *) echo "未知参数: $1"; exit 1 ;;
+    esac
+done
 [[ $dev =~ ^dsa[0-9]+$ ]] || { echo '设备名必须是dsa加编号'; exit 1; }
-[[ $apply == --check || $apply == --apply ]] || { echo '用法: bash prepare_dsa.sh dsa0 [--check|--apply]'; exit 1; }
+[[ $apply == --check || $apply == --apply ]] || { echo '用法: bash prepare_dsa.sh dsa0 [--check|--apply] [--fetch-size N --payload-size N]'; exit 1; }
 [[ $(uname -s) == Linux ]] || { echo '需要在Linux服务器执行'; exit 1; }
 # 任何已有Oops都拒绝实验性重配置；该标志不代表正常的专有模块taint。
 tainted=$(cat /proc/sys/kernel/tainted)
@@ -24,6 +36,11 @@ id=${dev#dsa}
 g=4
 total=$(cat "$base/max_work_queues_size")
 size=$((total / 8))
+fetch_size=${fetch_size:-$size}
+payload_size=${payload_size:-$size}
+((fetch_size >= 2 && payload_size >= 2 && 4*(fetch_size+payload_size) <= total)) || {
+    echo "WQ容量超限：4*(${fetch_size}+${payload_size}) 必须不超过 ${total}，每WQ至少2"; exit 1;
+}
 transfer=$(cat "$base/max_transfer_size")
 [[ $(cat "$base/max_groups") -ge 4 && $(cat "$base/max_engines") -ge 4 &&
    $(cat "$base/max_work_queues") -ge 8 && $(cat "$base/max_batch_size") -ge 1024 &&
@@ -32,7 +49,8 @@ state=$(cat "$base/state")
 matches=1
 for ((i=0;i<8;i++)); do
     q=$base/wq$id.$i
-    for pair in "group_id:$((i/2))" "size:$size" 'mode:dedicated' 'type:kernel' \
+    if ((i%2)); then wq_size=$payload_size; else wq_size=$fetch_size; fi
+    for pair in "group_id:$((i/2))" "size:$wq_size" 'mode:dedicated' 'type:kernel' \
                 'name:dmaengine' 'driver_name:dmaengine' 'max_batch_size:1024' "max_transfer_size:$transfer"; do
         attr=${pair%%:*}; wanted=${pair#*:}
         actual=$(cat "$q/$attr" 2>/dev/null || true)
@@ -44,7 +62,7 @@ for ((i=0;i<4;i++)); do
     [[ $(cat "$base/engine$id.$i/group_id" 2>/dev/null || true) == "$i" ]] || matches=0
 done
 if [[ $state == enabled && $matches == 1 ]]; then
-    echo "${dev}已有匹配配置：4group/4engine/8个DMAengine WQ，每WQ容量${size}；未修改。"
+    echo "${dev}已有匹配配置：4group/4engine/8个DMAengine WQ，fetch/payload容量${fetch_size}/${payload_size}；未修改。"
     exit 0
 fi
 if [[ $state != disabled ]]; then
@@ -56,7 +74,7 @@ for q in "$base"/wq*; do
     [[ $(cat "$q/state") == disabled && ! -L $q/driver ]] || { echo "${q}并非完全停用，拒绝配置"; exit 1; }
 done
 if [[ $apply != --apply ]]; then
-    echo "${dev}可准备配置：4group/4engine/8WQ，每WQ容量${size}，batch=1024。"
+    echo "${dev}可准备配置：4group/4engine/8WQ，fetch/payload容量${fetch_size}/${payload_size}，batch=1024。"
     echo '当前仅检查；确认该设备获准用于测试后，由管理员使用--apply。'
     exit 0
 fi
@@ -71,10 +89,11 @@ for ((i=0;i<4;i++)); do
     accel-config config-engine "$dev/engine$id.$i" --group-id="$i"
 done
 for ((i=0;i<8;i++)); do
-    accel-config config-wq "$dev/wq$id.$i" --group-id="$((i/2))" --wq-size="$size" \
+    if ((i%2)); then wq_size=$payload_size; else wq_size=$fetch_size; fi
+    accel-config config-wq "$dev/wq$id.$i" --group-id="$((i/2))" --wq-size="$wq_size" \
         --priority=1 --mode=dedicated --type=kernel --name=dmaengine --driver-name=dmaengine \
         --max-batch-size=1024 --max-transfer-size="$transfer" --block-on-fault=0
 done
 accel-config enable-device "$dev"
 for ((i=0;i<8;i++)); do accel-config enable-wq "$dev/wq$id.$i"; done
-echo "${dev}配置完成。之后测试模块只借还DMA通道，保留该配置和驱动绑定。"
+echo "${dev}配置完成，fetch/payload容量${fetch_size}/${payload_size}。之后测试模块只借还DMA通道，保留该配置和驱动绑定。"

@@ -9,6 +9,7 @@
 #include <linux/ktime.h>
 #include <linux/highmem.h>
 #include <linux/sched/clock.h>
+#include <linux/vmalloc.h>
 
 #include "committer.h"
 #include "common.h"
@@ -857,12 +858,10 @@ int swarmio_worker_init(struct nvme_vdev *vdev)
 
 	swarmio_metrics_init();
 
-	local_queue_size =
-		min_t(size_t, NR_WORKER_QUEUE_SIZE,
-		      KMALLOC_MAX_SIZE / sizeof(struct swarmio_io_work));
-	if (local_queue_size != NR_WORKER_QUEUE_SIZE)
-		SWARMIO_WARN("worker queue size clipped from %u to %zu\n",
-			     NR_WORKER_QUEUE_SIZE, local_queue_size);
+	/* CPU-only request metadata need not be physically contiguous. */
+	if (NR_WORKER_QUEUE_SIZE < 2 || NR_WORKER_QUEUE_SIZE > 65535)
+		return -EINVAL;
+	local_queue_size = NR_WORKER_QUEUE_SIZE;
 
 	vdev->num_workers_initialized = 0;
 	vdev->workers = kzalloc(sizeof(struct swarmio_worker) * num_workers,
@@ -901,9 +900,8 @@ int swarmio_worker_init(struct nvme_vdev *vdev)
 		/* allocate and initialize work queue */
 		local_queue = &worker->local_queue;
 		local_queue->size = local_queue_size;
-		local_queue->works = kzalloc(sizeof(struct swarmio_io_work) *
-						     local_queue->size,
-					     GFP_KERNEL);
+		local_queue->works = kvcalloc(local_queue->size,
+					    sizeof(struct swarmio_io_work), GFP_KERNEL);
 		if (!local_queue->works) {
 			ret = -ENOMEM;
 			goto err;
@@ -1002,7 +1000,7 @@ void swarmio_worker_exit(struct nvme_vdev *vdev)
 
 		kfree(worker->dma_ctx);
 		kfree(worker->paddr_list);
-		kfree(worker->local_queue.works);
+		kvfree(worker->local_queue.works);
 	}
 
 	kfree(vdev->workers);

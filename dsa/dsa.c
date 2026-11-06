@@ -11,6 +11,8 @@ struct idxd_device *dsa_idxd_list[DSA_MAX_DEVS];
 extern unsigned int dsa_num_devs, dsa_num_groups_per_dev, dsa_num_wqs_per_group;
 extern unsigned int dsa_num_engines_per_group;
 extern bool disp_using_dma, worker_using_dma;
+extern unsigned int num_service_units;
+extern int num_dma_descs_per_disp, num_dma_descs_per_worker;
 static unsigned int device_id;
 module_param_named(dsa_device_id, device_id, uint, 0444);
 static struct device *held;
@@ -166,7 +168,11 @@ int dsa_enable_devices(void)
     for (i = 0; i < groups * 2; ++i) {
         struct idxd_wq *wq;
         struct device *dev;
+        unsigned int owners, needed;
+        if (i / 2 >= num_service_units) continue;
         if ((i % 2 == 0 && !disp_using_dma) || (i % 2 && !worker_using_dma)) continue;
+        owners = (num_service_units + groups - 1 - i / 2) / groups;
+        needed = owners * (i % 2 ? num_dma_descs_per_worker : num_dma_descs_per_disp);
         wq = idxd->wqs[i];
         if (!wq) goto fail;
         /* wq_confdev() is a struct device lvalue in the target 6.8 headers. */
@@ -176,7 +182,8 @@ int dsa_enable_devices(void)
             strcmp(dev->driver->name, "dmaengine") ||
             wq->type != IDXD_WQT_KERNEL || !wq_dedicated(wq) ||
             wq->group != idxd->groups[i / 2] || !wq->idxd_chan || !wq->descs || !wq->portal ||
-            wq->size < 2 || wq->max_xfer_bytes < (i % 2 ? PAGE_SIZE : 64 * NR_MAX_FETCH_SQE)) goto fail;
+            wq->size < 2 || wq->size < needed ||
+            wq->max_xfer_bytes < (i % 2 ? PAGE_SIZE : 64 * NR_MAX_FETCH_SQE)) goto fail;
         channels[i] = dma_request_channel(mask, match_channel, wq);
         if (!channels[i]) { ret = -EBUSY; goto fail; }
     }

@@ -404,6 +404,9 @@ static void PCI_EXTCAP_SETTINGS(struct pci_ext_cap *ext_cap)
 
 int vdev_pci_init(struct nvme_vdev *vdev)
 {
+	/* QID 512 needs the third BAR page. Doorbells must not overlap MSI-X. */
+	BUILD_BUG_ON(PAGE_SIZE + NR_MAX_DBS_SIZE > VDEV_PCI_MSIX_TO);
+	BUILD_BUG_ON(MB(1) + sizeof(struct nvme_command) * NR_MAX_IO_QUEUE * NR_MAX_QUEUE_SIZE > GB(4ULL));
 	PCI_HEADER_SETTINGS(vdev->pcihdr, vdev->config.memmap_start);
 	PCI_PMCAP_SETTINGS(vdev->pmcap);
 	PCI_MSIXCAP_SETTINGS(vdev->msixcap);

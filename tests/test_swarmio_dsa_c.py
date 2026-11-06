@@ -71,6 +71,8 @@ void cq_dequeue(nvm_queue_t*,uint32_t,nvm_queue_t*,uint32_t,uint32_t);
             subprocess.run(['c++','-std=c++17',str(unit),'-o',str(binary)],check=True)
             for args,ok in [([],True),(['--verify=true'],True),(['--verify=true','--reqs=2'],False),
                             (['--pages=1'],False),(['--access_type=1'],False),(['--threads=-64'],False),
+                            (['--num_queues=128'],True),(['--num_queues=256'],True),
+                            (['--num_queues=512'],True),(['--num_queues=513'],False),
                             (['--reqs=18446744073709551615'],False)]:
                 with self.subTest(args=args):
                     self.assertEqual(subprocess.run([str(binary),*args]).returncode,0 if ok else 1)

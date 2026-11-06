@@ -102,6 +102,12 @@ static void admin_create_cq(int eid)
 	unsigned int num_pages, i;
 	int dbs_idx;
 
+	if (!cmd->cqid || cmd->cqid > NR_MAX_IO_QUEUE || cmd->cqid > vdev->num_cq ||
+	    cmd->qsize >= NR_MAX_QUEUE_SIZE || vdev->cqes[cmd->cqid] ||
+	    ((cmd->cq_flags & NVME_CQ_IRQ_ENABLED) && cmd->irq_vector >= VDEV_PCI_MSIX_TS)) {
+		__make_cq_entry(eid, NVME_SC_INVALID_FIELD | NVME_STATUS_DNR);
+		return;
+	}
 	cq = kzalloc(sizeof(struct nvme_completion_queue), GFP_KERNEL);
 	if (!cq) {
 		__make_cq_entry(eid, NVME_SC_INTERNAL | NVME_STATUS_DNR);
@@ -175,6 +181,10 @@ static void admin_delete_cq(int eid)
 	unsigned int qid;
 
 	qid = __admin_sq_entry_at(queue, eid)->delete_queue.qid;
+	if (!qid || qid > NR_MAX_IO_QUEUE) {
+		__make_cq_entry(eid, NVME_SC_INVALID_FIELD | NVME_STATUS_DNR);
+		return;
+	}
 
 	cq = vdev->cqes[qid];
 	vdev->cqes[qid] = NULL;
@@ -195,6 +205,12 @@ static void admin_create_sq(int eid)
 		sizeof(struct nvme_command) * NR_MAX_QUEUE_SIZE;
 	unsigned long cmd_buffer_start;
 
+	if (!cmd->sqid || cmd->sqid > NR_MAX_IO_QUEUE || cmd->sqid > vdev->num_sq ||
+	    !cmd->cqid || cmd->cqid > NR_MAX_IO_QUEUE || !vdev->cqes[cmd->cqid] ||
+	    cmd->qsize >= NR_MAX_QUEUE_SIZE || vdev->sqes[cmd->sqid]) {
+		__make_cq_entry(eid, NVME_SC_INVALID_FIELD | NVME_STATUS_DNR);
+		return;
+	}
 	sq = kzalloc(sizeof(struct nvme_submission_queue), GFP_KERNEL);
 	if (!sq) {
 		__make_cq_entry(eid, NVME_SC_INTERNAL | NVME_STATUS_DNR);
@@ -283,6 +299,10 @@ static void admin_delete_sq(int eid)
 	unsigned int qid;
 
 	qid = cmd->qid;
+	if (!qid || qid > NR_MAX_IO_QUEUE) {
+		__make_cq_entry(eid, NVME_SC_INVALID_FIELD | NVME_STATUS_DNR);
+		return;
+	}
 
 	sq = vdev->sqes[qid];
 	vdev->sqes[qid] = NULL;

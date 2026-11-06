@@ -66,6 +66,16 @@ class SQFetchTests(unittest.TestCase):
                 with self.assertRaises(pipeline.Error): pipeline.dsa_environment(c,{'pci':'00000000:2a:00.0'})
                 old=pipeline.read_config(ROOT/'configs/bam-dsa-async-lab230.json')
                 self.assertNotIn('fetch_wqs',pipeline.dsa_environment(old,{'pci':'00000000:2a:00.0'}))
+                # Eight service units still borrow only eight unique channels.
+                shared=json.loads(json.dumps(c))
+                shared['module'].update(num_service_units=8,num_dma_descs_per_worker=8,cpus='4-19')
+                (q/'max_transfer_size').write_text('2147483648')
+                cpus.write_text('0-39')
+                report=pipeline.dsa_environment(shared,{'pci':'00000000:2a:00.0'})
+                self.assertEqual(len(report['payload_wqs']),4)
+                self.assertEqual([x['required_descriptors'] for x in report['wq_capacity']], [4,16]*4)
+                shared['module']['num_dma_descs_per_worker']=9
+                with self.assertRaises(pipeline.Error): pipeline.dsa_environment(shared,{'pci':'00000000:2a:00.0'})
 
     def test_runtime_fetch_mode_and_pending_dma_are_checked(self):
         c=pipeline.read_config(ROOT/'configs/bam-dsa-sq-lab230.json')

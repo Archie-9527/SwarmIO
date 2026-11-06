@@ -54,7 +54,7 @@ static unsigned int write_min_delay = 1;
 static unsigned int num_sched_insts = 8;
 static unsigned int io_unit_shift = 12;
 
-static unsigned int num_service_units = 1;
+unsigned int num_service_units = 1;
 static unsigned int num_workers_per_service_unit = 1;
 
 static char *cpus;
@@ -120,7 +120,7 @@ module_param(cpus, charp, 0444);
 MODULE_PARM_DESC(
 	cpus,
 	"Comma-separated list of CPU IDs and CPU ID ranges (e.g., 1,2,3-4)");
-module_param(num_service_units, uint, 0644);
+module_param(num_service_units, uint, 0444);
 MODULE_PARM_DESC(
 	num_service_units,
 	"Number of service units (i.e., groups of a dispatcher and workers)");
@@ -242,7 +242,6 @@ static int __validate_configs(void)
 static int __init __validate_dsa_params(void)
 {
 	unsigned int total_dsa_groups;
-	unsigned int num_worker_wqs;
 	unsigned int max_workers_per_wq;
 	unsigned int required_worker_wq_size;
 	unsigned int i;
@@ -265,18 +264,19 @@ static int __init __validate_dsa_params(void)
 	}
 
 	total_dsa_groups = dsa_num_devs * dsa_num_grps_per_dev;
-	if (num_service_units > total_dsa_groups) {
-		SWARMIO_ERROR(
-			"num_service_units %u exceeds total DSA groups %u\n",
-			num_service_units, total_dsa_groups);
+	if (dsa_num_devs != 1 || !total_dsa_groups || total_dsa_groups > 4 ||
+	    num_service_units > 32 || num_workers_per_service_unit != 1) {
+		SWARMIO_ERROR("DSA requires one device, 1..4 groups and 1..32 single-worker service units\n");
 		return -EINVAL;
 	}
+	/* Each owner has private descriptors on a WQ borrowed once per group. */
+	max_workers_per_wq = DIV_ROUND_UP(num_service_units, total_dsa_groups);
 
 	if (disp_using_dma) {
-		if (dsa_wq_sizes[0] < num_dma_descs_per_disp) {
+		if (dsa_wq_sizes[0] < max_workers_per_wq * num_dma_descs_per_disp) {
 			SWARMIO_ERROR(
-				"WQ0 size %u is smaller than required: %d\n",
-				dsa_wq_sizes[0], num_dma_descs_per_disp);
+			"WQ0 size %u is smaller than required: %u\n",
+				dsa_wq_sizes[0], max_workers_per_wq * num_dma_descs_per_disp);
 			return -EINVAL;
 		}
 	}
@@ -288,9 +288,6 @@ static int __init __validate_dsa_params(void)
 			return -EINVAL;
 		}
 
-		num_worker_wqs = dsa_num_wqs_per_grp - 1;
-		max_workers_per_wq = DIV_ROUND_UP(num_workers_per_service_unit,
-						  num_worker_wqs);
 		required_worker_wq_size =
 			max_workers_per_wq * num_dma_descs_per_worker;
 

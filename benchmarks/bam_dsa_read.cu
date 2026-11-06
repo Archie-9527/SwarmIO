@@ -47,7 +47,7 @@ static Config parse(int argc, char **argv) {
     if (!c.threads || c.threads%64 || c.threads>0x7fffffff || !c.reqs || c.pages<c.threads ||
         (c.page_size!=512 && c.page_size!=4096) || !c.num_blks ||
         c.reqs>UINT64_MAX/c.threads || c.threads*c.reqs>UINT64_MAX/c.page_size ||
-        c.pages>UINT64_MAX/c.page_size || !c.num_queues || c.num_queues>64 ||
+        c.pages>UINT64_MAX/c.page_size || !c.num_queues || c.num_queues>512 ||
         c.queue_depth<2 || c.queue_depth>1024 || (c.queue_depth & (c.queue_depth-1))) throw error("invalid geometry");
     if (c.verify && c.reqs!=1) throw error("--verify requires reqs=1 to check every requested byte");
     return c;

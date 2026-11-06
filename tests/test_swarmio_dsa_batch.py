@@ -393,6 +393,43 @@ int main(void) {
     assert(submits==1 && submitted==1024 && max_batch==1024);
     finish(&c,0,-1,0); dsa_dma_batch_poll(&c,callback);
     assert(callbacks==1024 && completed==1024 && bytes==524288); free(many); dsa_dma_ctx_batch_remove(&c);
+    /* Two service-unit contexts share one WQ, with disjoint child lists and
+     * callbacks; saturating either owner must not steal the other's slots. */
+    for(unsigned bs=64;bs<=128;bs*=2) {
+        reset(); memset(&c,0,sizeof(c)); struct dsa_dma_ctx_batch other={0};
+        assert(!dsa_dma_ctx_batch_init(&c,0,0,bs,8,1));
+        assert(!dsa_dma_ctx_batch_init(&other,0,0,bs,8,1));
+        unsigned cap=bs*8;
+        struct request *load=calloc(2*cap+1,sizeof(*load)); assert(load);
+        for(unsigned round=0;round<3;round++) {
+            memset(load,0,(2*cap+1)*sizeof(*load));
+            for(unsigned k=0;k<cap;k++) {
+                assert(!enqueue(&c,&load[k])); assert(!enqueue(&other,&load[cap+k]));
+            }
+            assert(c.active==8 && other.active==8 && active==16);
+            assert(enqueue(&c,&load[2*cap])==-EAGAIN && enqueue(&other,&load[2*cap])==-EAGAIN);
+            for(int slot=7;slot>=0;slot--) finish(&other,slot,-1,0);
+            dsa_dma_batch_poll(&other,callback);
+            assert(c.active==8 && !other.active && !load[0].done && load[cap].done);
+            for(int slot=7;slot>=0;slot--) finish(&c,slot,-1,0);
+            dsa_dma_batch_poll(&c,callback);
+            assert(!active && callbacks==(round+1)*2*cap && completed==submitted);
+        }
+        free(load); dsa_dma_ctx_batch_remove(&other); dsa_dma_ctx_batch_remove(&c);
+        assert(!live && !descs);
+    }
+    /* Larger legal depth allocates every slot, including the final child. */
+    reset(); memset(&c,0,sizeof(c)); q.size=64;
+    assert(!dsa_dma_ctx_batch_init(&c,0,0,128,64,1));
+    many=calloc(8193,sizeof(*many)); assert(many);
+    for(unsigned k=0;k<8192;k++) assert(!enqueue(&c,&many[k]));
+    assert(c.active==64 && enqueue(&c,&many[8192])==-EAGAIN);
+    for(int slot=63;slot>=0;slot--) finish(&c,slot,-1,0);
+    dsa_dma_batch_poll(&c,callback); assert(callbacks==8192 && completed==8192);
+    memset(many,0,sizeof(*many)); assert(!enqueue(&c,many));
+    now=5000; dsa_dma_batch_flush_due(&c); finish(&c,0,-1,0); dsa_dma_batch_poll(&c,callback);
+    assert(callbacks==8193 && completed==submitted && !active);
+    free(many); dsa_dma_ctx_batch_remove(&c); q.size=16;
     /* Submission rejection reports accepted requests once, without fallback. */
     reset(); memset(&c,0,sizeof(c)); memset(r,0,sizeof(r)); assert(!dsa_dma_ctx_batch_init(&c,0,0,2,2,1));
     submit_fail=2; for(unsigned i=0;i<4;i++) assert(!enqueue(&c,&r[i]));

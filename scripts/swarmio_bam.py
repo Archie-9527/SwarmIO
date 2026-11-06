@@ -42,6 +42,33 @@ def is_dsa_sq(config):
     return is_dsa(config) and bool(config['module'].get('disp_using_dma'))
 
 
+def gpu_pin_limit_mb(config):
+    return config.get('libnvm', {}).get('max_gpu_pinned_mb', 32)
+
+
+def buffer_budget(bench):
+    """Current BaM single-segment GPU queues, 64 KiB P2P pages; not all VRAM."""
+    align = lambda n: (n + 65535) // 65536 * 65536
+    data = align(bench['pages'] * bench['page_size'])
+    queues = bench['num_queues'] * (align(bench['queue_depth'] * 64) + align(bench['queue_depth'] * 16))
+    return {'payload_bytes': data, 'queue_bytes': queues, 'gpu_pinned_bytes': data + queues,
+            'queue_metadata_bytes': bench['num_queues'] * (65536 + 4 * bench['queue_depth']) * 32}
+
+
+def dsa_wq_requirements(config):
+    """Unique WQs are borrowed once; each service unit owns private descriptors."""
+    p = config['module']
+    result = []
+    for group in range(p['dsa_num_grps_per_dev']):
+        owners = len(range(group, p['num_service_units'], p['dsa_num_grps_per_dev']))
+        if not owners:
+            continue
+        if is_dsa_sq(config):
+            result.append(('fetch', group, group * 2, owners * p['num_dma_descs_per_disp']))
+        result.append(('payload', group, group * 2 + 1, owners * p['num_dma_descs_per_worker']))
+    return result
+
+
 def output(command, **kwargs):
     return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT, **kwargs).strip()
 
@@ -117,10 +144,19 @@ def validate_benchmark(bench, config):
             raise Error('DSA 基线仅支持读，pages 必须覆盖所有线程')
         if bench.get('verify') and (bench['reqs'] != 1 or bench['num_blks'] * bench['page_size'] > config['module']['verify_bytes']):
             raise Error('逐请求内容校验要求 reqs=1 且访问范围不超过 verify_bytes')
+        budget = buffer_budget(bench)
+        limit = gpu_pin_limit_mb(config) * 1024 * 1024
+        if budget['gpu_pinned_bytes'] > limit:
+            raise Error(f"GPU pin 预算不足：需要 {budget['gpu_pinned_bytes'] / 2**20:.2f} MiB，"
+                        f"配置为 {gpu_pin_limit_mb(config)} MiB；调整 libnvm.max_gpu_pinned_mb 后重新构建/加载")
 
 
-def read_config(path, overrides=None):
+def read_config(path, overrides=None, gpu_pinned_mb=None):
     config = json.loads(Path(path).read_text())
+    if gpu_pinned_mb is not None:
+        config.setdefault('libnvm', {})['max_gpu_pinned_mb'] = gpu_pinned_mb
+    if type(gpu_pin_limit_mb(config)) is not int or not 1 <= gpu_pin_limit_mb(config) <= 65536:
+        raise Error('libnvm.max_gpu_pinned_mb 必须为 1..65536 的整数 MiB')
     build, params = config['build'], config['module']
     for key, value in (overrides or {}).items():
         if value is not None:
@@ -139,8 +175,8 @@ def read_config(path, overrides=None):
         raise Error('构建必须为所选后端的 full-I/O / single-owner / 诊断开启配置')
     if not 1 < int(build['NR_WORKER_QUEUE_SIZE']) <= 65535:
         raise Error('worker 本地队列必须能由 16 位索引表示，范围为 2..65535')
-    if not 1 <= int(build['NR_MAX_IO_QUEUE']) <= 64 or not 1 <= params['qdiag_qid'] <= int(build['NR_MAX_IO_QUEUE']):
-        raise Error('当前入口支持最多 64 个 I/O 队列，诊断 QID 必须在范围内')
+    if not 1 <= int(build['NR_MAX_IO_QUEUE']) <= (512 if is_dsa(config) else 64) or not 1 <= params['qdiag_qid'] <= int(build['NR_MAX_IO_QUEUE']):
+        raise Error('DSA 基线最多 512 个 I/O 队列（旧 CPU 基线 64），诊断 QID 必须在范围内')
     if bool(params['disp_using_dma']) != is_dsa_sq(config) or bool(params['worker_using_dma']) != is_dsa(config) or params['io_unit_shift'] != 9:
         raise Error('运行参数与 SQ/payload 后端不符，时序单位必须为 512 B')
     if is_dsa_sq(config):
@@ -158,10 +194,19 @@ def read_config(path, overrides=None):
                                     not 1 <= params.get('dma_batch_flush_us', 0) <= 100000):
             raise Error('异步 DSA 要求 batch=2..1024，flush_us=1..100000')
         if (params.get('dsa_num_devs') != 1 or params.get('dsa_num_wqs_per_grp') != 2 or
-            params.get('dsa_num_engs_per_grp') != 1 or params.get('dsa_num_grps_per_dev') != params['num_service_units'] or
-            not 1 <= params['num_service_units'] <= 4 or type(params.get('dsa_device_id')) is not int or
+            params.get('dsa_num_engs_per_grp') != 1 or not 1 <= params.get('dsa_num_grps_per_dev', 0) <= 4 or
+            not 1 <= params['num_service_units'] <= min(32, int(build['NR_MAX_IO_QUEUE'])) or type(params.get('dsa_device_id')) is not int or
             params['dsa_device_id'] < 0 or params.get('verify_bytes', 0) <= 0 or params['verify_bytes'] % 8):
-            raise Error('DSA 配置要求指定单设备、1..4 group，每组两个 WQ、一个 engine，且配置校验区')
+            raise Error('DSA 要求单设备、1..4 group、1..32 service unit，每组两个 WQ、一个 engine，且配置校验区')
+        try:
+            sizes = [int(x) for x in params['dsa_wq_sizes'].split(',')]
+        except (ValueError, AttributeError):
+            raise Error('dsa_wq_sizes 必须是 fetch,payload 两个整数')
+        if len(sizes) != 2 or any(x < 2 for x in sizes):
+            raise Error('dsa_wq_sizes 必须是至少 2 的 fetch,payload 两个整数')
+        for role, group, index, needed in dsa_wq_requirements(config):
+            if sizes[index % 2] < needed:
+                raise Error(f'{role} WQ{index} 共享容量不足：group{group} 共需 {needed} 个描述符，配置只有 {sizes[index % 2]}')
     if params['num_service_units'] <= 0 or params['num_workers_per_service_unit'] <= 0:
         raise Error('服务单元和 worker 数必须为正数')
     needed = params['num_service_units'] * (1 + params['num_workers_per_service_unit'])
@@ -301,6 +346,7 @@ def environment(args, config):
         report['idxd_include'] = str(idxd)
         report['idxd_headers_sha256'] = {p.name: digest(p) for p in idxd.glob('*.h')}
         report['dsa'] = dsa_environment(config, gpu)
+        report['buffer_budget'] = dict(buffer_budget(config['benchmark']), limit_mb=gpu_pin_limit_mb(config))
     return report
 
 
@@ -328,23 +374,23 @@ def dsa_environment(config, gpu):
     if not cpu_set(p['cpus']) <= node_cpus:
         raise Error('DSA 服务 CPU 必须与 DSA/GPU 位于同一 NUMA 节点')
     queues, fetch_queues = [], []
-    roles = [('payload', 1, p['num_dma_descs_per_worker'])]
-    if is_dsa_sq(config):
-        roles.append(('fetch', 0, p['num_dma_descs_per_disp']))
-    for group in range(p['num_service_units']):
-        for role, offset, count in roles:
-            q = dev / f"wq{p['dsa_device_id']}.{group * 2 + offset}"
-            wanted = {'state': 'enabled', 'type': 'kernel', 'mode': 'dedicated', 'group_id': str(group)}
-            if any((q / k).read_text().strip() != v for k, v in wanted.items()) or (q / 'driver').resolve().name != 'dmaengine':
-                raise Error(role + ' 队列不是匹配的 dedicated kernel DMAengine WQ：' + q.name)
-            if int((q / 'size').read_text()) < count:
-                raise Error(role + ' WQ 描述符容量不足')
-            if role == 'payload' and is_dsa_batch(config) and int((q / 'max_batch_size').read_text()) < p['dma_batch_size']:
-                raise Error('payload WQ 的 max_batch_size 不足：' + q.name)
-            if role == 'fetch' and int((q / 'max_transfer_size').read_text()) < int(config['build']['NR_MAX_FETCH_SQE']) * 64:
-                raise Error('fetch WQ 的 max_transfer_size 不足：' + q.name)
-            (queues if role == 'payload' else fetch_queues).append(q.name)
+    details = []
+    for role, group, index, count in dsa_wq_requirements(config):
+        q = dev / f"wq{p['dsa_device_id']}.{index}"
+        wanted = {'state': 'enabled', 'type': 'kernel', 'mode': 'dedicated', 'group_id': str(group)}
+        if any((q / k).read_text().strip() != v for k, v in wanted.items()) or (q / 'driver').resolve().name != 'dmaengine':
+            raise Error(role + ' 队列不是匹配的 dedicated kernel DMAengine WQ：' + q.name)
+        if int((q / 'size').read_text()) < count:
+            raise Error(f'{role} {q.name} 描述符容量不足：共享上下文共需 {count}')
+        if role == 'payload' and is_dsa_batch(config) and int((q / 'max_batch_size').read_text()) < p['dma_batch_size']:
+            raise Error('payload WQ 的 max_batch_size 不足：' + q.name)
+        if role == 'fetch' and int((q / 'max_transfer_size').read_text()) < int(config['build']['NR_MAX_FETCH_SQE']) * 64:
+            raise Error('fetch WQ 的 max_transfer_size 不足：' + q.name)
+        (queues if role == 'payload' else fetch_queues).append(q.name)
+        details.append({'wq': q.name, 'role': role, 'required_descriptors': count,
+                        'size': int((q / 'size').read_text())})
     report = {'device': dev.name, 'pci': bdf, 'numa_node': node, 'gpu_pci': gpu_bdf, 'payload_wqs': queues}
+    report['wq_capacity'] = details
     if fetch_queues: report['fetch_wqs'] = fetch_queues
     return report
 
@@ -606,7 +652,7 @@ def load(args):
         (device / 'driver/unbind').write_text(device.name)
     try:
         subprocess.run(['insmod', str(args.build_dir / ARTIFACTS[1]), 'max_num_ctrls=64'] +
-                       (['dma_peer_bdf=' + dsa['pci'], 'max_gpu_pinned_mb=32'] if dsa else []), check=True)
+                       (['dma_peer_bdf=' + dsa['pci'], 'max_gpu_pinned_mb=' + str(gpu_pin_limit_mb(config))] if dsa else []), check=True)
     except subprocess.CalledProcessError:
         if previous and not (device / 'driver').exists():
             (previous / 'bind').write_text(device.name)
@@ -738,6 +784,9 @@ def run(args):
         p = manifest['config']['module']
         record['dsa_submission'] = {k: p[k] for k in ('dma_batch_size', 'num_dma_descs_per_worker', 'dma_batch_flush_us')}
         print('DSA async-batch：', record['dsa_submission'], flush=True)
+    if is_dsa(manifest['config']):
+        record['buffer_budget'] = dict(buffer_budget(bench), limit_mb=gpu_pin_limit_mb(manifest['config']))
+        print('GPU pin 预算：', record['buffer_budget'], flush=True)
     dsa_before = read_dsa_state(manifest) if is_dsa(manifest['config']) else None
     if dsa_before is not None: record['dsa_before'] = dsa_before
     (directory / 'before.log').write_text(snapshot())
@@ -848,7 +897,7 @@ def read_dsa_state(manifest):
     needed = {'device', 'borrowed', 'fault', 'submitted', 'completed', 'bytes', 'errors', 'timeouts'}
     if not needed <= values.keys() or values['fault'] or values['device'] != manifest['config']['module']['dsa_device_id']:
         raise Error('DSA 状态缺失、设备不匹配或已有 DMA 故障')
-    if values['borrowed'] != manifest['config']['module']['num_service_units'] * (2 if is_dsa_sq(manifest['config']) else 1):
+    if values['borrowed'] != len(dsa_wq_requirements(manifest['config'])):
         raise Error('DSA 借用通道数量不匹配')
     if is_dsa_batch(manifest['config']):
         required = {'batches_submitted', 'batches_retired', 'active_batches', 'pending_batches', 'peak_batches', 'max_batch'}
@@ -876,6 +925,12 @@ def read_dsa_state(manifest):
     expected_peer = manifest['environment']['dsa']['pci']
     if (MODULES / 'libnvm/parameters/dma_peer_bdf').read_text().strip() != expected_peer:
         raise Error('GPU 内存映射的 DMA peer 与 DSA 不一致')
+    if 'libnvm' in manifest['config']:
+        if int((MODULES / 'libnvm/parameters/max_gpu_pinned_mb').read_text()) != gpu_pin_limit_mb(manifest['config']):
+            raise Error('libnvm GPU pin 上限与构建记录不一致')
+        for key in ('num_service_units', 'dsa_num_grps_per_dev'):
+            if int((MODULES / 'swarmio/parameters' / key).read_text()) != manifest['config']['module'][key]:
+                raise Error('DSA 服务单元/group 数与构建记录不一致：' + key)
     return values
 
 
@@ -984,6 +1039,7 @@ def main():
         p.add_argument('--dsa-batch-size', type=int, help='async-batch 每批最大搬运数，2..1024；写入构建配置')
         p.add_argument('--dsa-depth', type=int, help='async-batch 每 worker 在途批次槽位数，不超过 WQ 容量')
         p.add_argument('--dsa-flush-us', type=int, help='async-batch 尾批最大等待时间，微秒')
+        p.add_argument('--gpu-pinned-mb', type=int, help='libnvm GPU P2P pin 总预算，MiB；默认 32，加载后只读')
         p.add_argument('--cuda-root', type=Path, help='CUDA 工具链目录，例如 /usr/local/cuda-12.4；sudo 下也可显式选择')
         if name == 'build':
             p.add_argument('--jobs', type=int, default=8)
@@ -1009,7 +1065,8 @@ def main():
     try:
         if args.command in ('doctor', 'build'):
             config = read_config(args.config, {'dma_batch_size': args.dsa_batch_size,
-                                 'num_dma_descs_per_worker': args.dsa_depth, 'dma_batch_flush_us': args.dsa_flush_us})
+                                 'num_dma_descs_per_worker': args.dsa_depth, 'dma_batch_flush_us': args.dsa_flush_us},
+                                 gpu_pinned_mb=args.gpu_pinned_mb)
             if args.command == 'doctor':
                 report = environment(args, config)
                 print(json.dumps(report, indent=2, ensure_ascii=False))

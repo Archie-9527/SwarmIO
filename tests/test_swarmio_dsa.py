@@ -113,6 +113,8 @@ int test_taint(unsigned int x) { (void)x; return 0; }
         unit=r'''
 #include "mock.h"
 unsigned int dsa_num_devs,dsa_num_groups_per_dev,dsa_num_wqs_per_group,dsa_num_engines_per_group;
+unsigned int num_service_units=4;
+int num_dma_descs_per_disp=2,num_dma_descs_per_worker=2;
 bool disp_using_dma=false,worker_using_dma=true;
 int dsa_bus_type;
 static struct idxd_device d;
@@ -142,6 +144,7 @@ void dma_release_channel(struct dma_chan *chan) {
 static void setup(void) {
     memset(&d,0,sizeof(d)); memset(queues,0,sizeof(queues));
     refs=acquired=released=attempt=fail_at=0; domain=NULL; pasid=false;
+    num_service_units=4; num_dma_descs_per_worker=2;
     d.pdev=&pci; d.idxd_dev.conf_dev.driver=&parent_driver;
     d.state=IDXD_DEV_ENABLED; d.max_wqs=8; d.max_groups=4; d.wqs=qp; d.groups=gp;
     for(unsigned i=0;i<4;i++) gp[i]=&gs[i];
@@ -189,6 +192,17 @@ int main(void) {
     assert(dsa_enable_devices()==-EBUSY && !acquired && !refs);
     setup(); queues[0].max_xfer_bytes=4096;
     assert(dsa_enable_devices()==-EINVAL && !acquired && !refs);
+    /* More service units share a channel, never borrow/reset it twice. */
+    setup(); num_service_units=8; num_dma_descs_per_worker=8;
+    assert(!dsa_enable_devices() && acquired==8 && refs==1);
+    int dev,wq; dsa_assign_wq_by_group_disagg(7,1,&dev,&wq);
+    assert(dev==0 && wq==7);
+    dsa_disable_devices(); assert(released==8 && !refs); unchanged();
+    setup(); num_service_units=8; num_dma_descs_per_worker=9;
+    assert(dsa_enable_devices()==-EINVAL && acquired==1 && released==1 && !refs);
+    setup(); num_service_units=1;
+    assert(!dsa_enable_devices() && acquired==2);
+    dsa_disable_devices(); assert(released==2 && !refs);
     disp_using_dma=false;
     assert(swarmio_dsa_batch_begin()); swarmio_dsa_batch_submit(32);
     assert(swarmio_dsa_batch_begin()); swarmio_dsa_batch_submit(32);
