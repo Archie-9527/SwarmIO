@@ -617,6 +617,51 @@ def check_no_workload():
         raise Error('仍有 I/O 进程运行：' + ', '.join(map(str, pids)))
 
 
+def validate_dsa_topology(current, recorded):
+    # Older manifests predate the capacity report. dsa_environment has already
+    # checked live WQ state, ownership, sizes and transfer limits against config.
+    # Only that additive field may be absent; device and WQ identities stay strict.
+    if current is None and recorded is None:
+        return
+    if not isinstance(current, dict) or not isinstance(recorded, dict):
+        raise Error('DSA/GPU 构建拓扑记录缺失或格式无效')
+    keys = set(current) | set(recorded)
+    if 'wq_capacity' not in recorded:
+        keys.discard('wq_capacity')
+    differences = {k: {'recorded': recorded.get(k), 'current': current.get(k)}
+                   for k in sorted(keys) if recorded.get(k) != current.get(k)
+                   or (k in recorded) != (k in current)}
+    if differences:
+        raise Error('DSA/GPU 拓扑与构建记录不同：\n' +
+                    json.dumps(differences, indent=2, ensure_ascii=False))
+
+
+def load_preflight(args, manifest):
+    config = manifest['config']
+    verify_gpu(manifest)
+    dsa = dsa_environment(config, manifest['environment']['gpu']) if is_dsa(config) else None
+    if dsa is not None:
+        validate_dsa_topology(dsa, manifest['environment'].get('dsa'))
+    params = config['module']
+    expected = 'memmap=' + str(params['memmap_size']) + '$' + str(params['memmap_start'])
+    if expected not in Path('/proc/cmdline').read_text().split():
+        raise Error('未发现配置要求的启动预留：' + expected)
+    if not cpu_set(params['cpus']) <= cpu_set(Path('/sys/devices/system/cpu/online').read_text().strip()):
+        raise Error('配置中的服务 CPU 不全在线')
+    return dsa
+
+
+def check_load(args):
+    """Read-only check of an existing build, even while another build is loaded."""
+    linux_only(root=True)
+    manifest = manifest_for(args)
+    check_no_workload()
+    check_kernel_health(dmesg_text())
+    dsa = load_preflight(args, manifest)
+    print(json.dumps({'load_preflight': 'PASS', 'build_dir': str(args.build_dir),
+                      'dsa': dsa}, indent=2, ensure_ascii=False))
+
+
 def load(args):
     linux_only(root=True)
     manifest = manifest_for(args)
@@ -625,16 +670,8 @@ def load(args):
     check_kernel_health(dmesg_text())
     if module_state():
         raise Error('已有 swarmio/libnvm；load 不自动卸载或替换活动模块')
-    verify_gpu(manifest)
-    dsa = dsa_environment(config, manifest['environment']['gpu']) if is_dsa(config) else None
-    if dsa is not None and dsa != manifest['environment']['dsa']:
-        raise Error('DSA/GPU 拓扑与构建记录不同，请重新 doctor/build')
+    dsa = load_preflight(args, manifest)
     params = config['module']
-    expected = 'memmap=' + str(params['memmap_size']) + '$' + str(params['memmap_start'])
-    if expected not in Path('/proc/cmdline').read_text().split():
-        raise Error('未发现配置要求的启动预留：' + expected)
-    if not cpu_set(params['cpus']) <= cpu_set(Path('/sys/devices/system/cpu/online').read_text().strip()):
-        raise Error('配置中的服务 CPU 不全在线')
     for module in (args.build_dir / ARTIFACTS[0], args.build_dir / ARTIFACTS[1]):
         for dependency in filter(None, output(['modinfo', '-F', 'depends', str(module)]).split(',')):
             subprocess.run(['modprobe', dependency], check=True)
@@ -1045,6 +1082,7 @@ def main():
             p.add_argument('--jobs', type=int, default=8)
     p = commands.add_parser('load', help='加载两个模块并绑定虚拟控制器')
     p.add_argument('--bdf', help='可选；必须属于 SwarmIO 虚拟设备')
+    commands.add_parser('check-load', help='只读检查已有构建能否加载；不卸载或插入模块')
     p = commands.add_parser('run', help='运行单轮读/写检查')
     for name in ('threads', 'reqs', 'queue-depth', 'num-queues', 'page-size', 'num-blks', 'pages'):
         p.add_argument('--' + name, type=int)
@@ -1075,7 +1113,7 @@ def main():
             else:
                 build(args, config)
         else:
-            {'load': load, 'run': run, 'status': status, 'unload': unload}[args.command](args)
+            {'load': load, 'check-load': check_load, 'run': run, 'status': status, 'unload': unload}[args.command](args)
         return 0
     except (Error, OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
         print('ERROR:', exc, file=sys.stderr)

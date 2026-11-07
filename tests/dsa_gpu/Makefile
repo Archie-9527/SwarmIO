@@ -22,6 +22,7 @@ check:
 	python3 test_evl_guard.py
 	python3 test_backend.py
 	python3 test_prepare.py
+	python3 test_errno_stub.py
 	python3 test_gpu_region.py
 	python3 test_payload.py
 diagnose:

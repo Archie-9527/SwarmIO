@@ -3,7 +3,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from test_kernel_syntax import MOCK
+from test_kernel_syntax import MOCK, write_header_stub
 
 HERE=Path(__file__).resolve().parent
 C=r'''
@@ -106,7 +106,7 @@ with tempfile.TemporaryDirectory(prefix='dg-gpu-region-') as tmp:
     (p/'linux').mkdir()
     (p/'mock.h').write_text(MOCK)
     for name in ('errno.h','string.h'):
-        (p/'linux'/name).write_text('#include "mock.h"\n')
+        write_header_stub(p/'linux'/name, name)
     (p/'nv-p2p.h').write_text('#include "mock.h"\n')
     (p/'test.c').write_text(C)
     subprocess.run([shutil.which('cc'),'-std=gnu11','-Wall','-Wextra','-Werror',

@@ -2,9 +2,28 @@
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 
 HERE = Path(__file__).resolve().parent
+
+
+def write_header_stub(path, name, platform=None):
+    """Do not replace the error definitions needed by glibc's errno.h.
+
+    Linux libc may include <linux/errno.h> while mock.h is still being parsed.
+    Forward that include to the real UAPI header, rather than re-entering the
+    mock's include guard. macOS has no Linux UAPI, so use its native errno.h.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if name == 'errno.h':
+        text = '#include_next <linux/errno.h>\n' if (platform or sys.platform).startswith('linux') else '#include <errno.h>\n'
+    else:
+        text = '#include "mock.h"\n'
+    path.write_text(text)
+
+
 MOCK = r'''
 #ifndef DG_MOCK_H
 #define DG_MOCK_H
@@ -171,8 +190,7 @@ def check():
              "kthread.h completion.h cpu.h sched.h sched/task.h types.h ioctl.h dma-mapping.h slab.h vmalloc.h device.h dmaengine.h panic.h errno.h string.h")
         for name in headers.split():
             dest=p/"linux"/name
-            dest.parent.mkdir(parents=True,exist_ok=True)
-            dest.write_text('#include "mock.h"\n')
+            write_header_stub(dest, name)
         (p/"mock.h").write_text(MOCK)
         (p/"dsa.h").write_text('#include "mock.h"\n')
         (p/"nv-p2p.h").write_text('#include "mock.h"\n')
