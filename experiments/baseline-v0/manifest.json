@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "recorded_date": "2026-11-10",
+  "baseline_id": "v0-single-dsa",
+  "release_branch": "release/v0-single-dsa",
+  "source_anchor": {
+    "swarmio_commit": "2d9baa8ccee73868a14bc4c20fe044a5a6ff8e56",
+    "swarmio_tree": "6a4a462eaf007d0529def27dc83917eb5b7fc06d",
+    "swarmio_remote": "https://github.com/Archie-9527/SwarmIO.git",
+    "bam_commit": "bd9141524f23a179e8b1719cabcefb42e500a7bf",
+    "bam_tree": "99c07cee2d9664a6c99ae039bcaf64f8688a4c05",
+    "bam_remote": "https://github.com/Archie-9527/bam.git",
+    "configuration": {
+      "path": "configs/bam-dsa-scale-lab230.json",
+      "sha256": "15c306cdbda6a07b05974abe6d1e2e92757fd4adc662c39bcef6874de75e6ab8"
+    }
+  },
+  "historical_evidence_note": "Historical results are not a new measurement of the source anchor. Original build manifest is not included; its recorded digest is preserved without asserting a verified source association.",
+  "topology_source": "User-provided nvidia-smi topo -m, lscpu and DSA sysfs outputs; no server probing in this task.",
+  "topology": [
+    {
+      "socket": 0,
+      "numa_node": 0,
+      "gpu_reported_index": 0,
+      "dsa_device_id": 0,
+      "dsa_pci": "0000:75:01.0",
+      "candidate_service_cpus": "8-15"
+    },
+    {
+      "socket": 1,
+      "numa_node": 1,
+      "gpu_reported_index": 1,
+      "dsa_device_id": 2,
+      "dsa_pci": "0000:f2:01.0",
+      "candidate_service_cpus": "28-35"
+    }
+  ],
+  "reference_runs": [
+    {
+      "run_id": "20261106-155117-147482",
+      "historical_build_manifest_sha256": "81159b113efc74098997677e5ffa7f766a809b01af4b12fb75971e75669b7e43",
+      "historical_build_manifest_in_archive": false,
+      "historical_source_commit_verified": false,
+      "benchmark": {
+        "threads": 131072,
+        "blk_size": 64,
+        "reqs": 1024,
+        "pages": 131072,
+        "page_size": 512,
+        "num_blks": 262144,
+        "queue_depth": 1024,
+        "num_queues": 256,
+        "random": true,
+        "access_type": 0
+      },
+      "dsa_submission": {
+        "dma_batch_size": 128,
+        "num_dma_descs_per_worker": 16,
+        "dma_batch_flush_us": 5
+      },
+      "bam_kernel_average": {
+        "elapsed_s": 10.993033203125,
+        "logical_ops": 134217728,
+        "logical_bytes": 68719476736,
+        "logical_iops": 12209344.365652038,
+        "logical_bandwidth_gib_s": 5.821869070840854
+      },
+      "files": [
+        {
+          "path": "experiments/baseline-v0/reference/20261106-155117-147482/run.json",
+          "sha256": "5c1032e00b0e55d4f46611fbbe24eff3f771021d5f005ccbd9dc4e4ae47b807b"
+        },
+        {
+          "path": "experiments/baseline-v0/reference/20261106-155117-147482/monitor-summary.json",
+          "sha256": "4e6a0c78abe936cd1fd31c3d8c10e1e216064095ef991b26b81dba796282ac63"
+        }
+      ]
+    },
+    {
+      "run_id": "20261106-160417-117097",
+      "historical_build_manifest_sha256": "81159b113efc74098997677e5ffa7f766a809b01af4b12fb75971e75669b7e43",
+      "historical_build_manifest_in_archive": false,
+      "historical_source_commit_verified": false,
+      "benchmark": {
+        "threads": 131072,
+        "blk_size": 64,
+        "reqs": 1024,
+        "pages": 131072,
+        "page_size": 512,
+        "num_blks": 262144,
+        "queue_depth": 1024,
+        "num_queues": 256,
+        "random": true,
+        "access_type": 0
+      },
+      "dsa_submission": {
+        "dma_batch_size": 128,
+        "num_dma_descs_per_worker": 16,
+        "dma_batch_flush_us": 5
+      },
+      "bam_kernel_average": {
+        "elapsed_s": 11.000752929688,
+        "logical_ops": 134217728,
+        "logical_bytes": 68719476736,
+        "logical_iops": 12200776.515740423,
+        "logical_bandwidth_gib_s": 5.817783601637088
+      },
+      "files": [
+        {
+          "path": "experiments/baseline-v0/reference/20261106-160417-117097/run.json",
+          "sha256": "d41c2aa91f3562cc326fdebc5d35c7dabbbc8cdd216025c14699e516341f3540"
+        },
+        {
+          "path": "experiments/baseline-v0/reference/20261106-160417-117097/monitor-summary.json",
+          "sha256": "caf908a1a010a69eaf848ba56e52e2d0f8d5136e7d0824e227c8a03480cca6a5"
+        }
+      ]
+    }
+  ],
+  "validation_scope": {
+    "evidence_integrity_and_counts_checked_locally": true,
+    "new_linux_build_performed": false,
+    "new_gpu_dsa_verification_performed": false,
+    "new_performance_measurement_performed": false
+  },
+  "release_tag": "research-v0.0.0",
+  "initial_development_branch": "dev/v1-numa",
+  "branch_status": "Local release branches, baseline tags and V1 development branches created in both repositories; not pushed."
+}

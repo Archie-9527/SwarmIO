@@ -1,0 +1,49 @@
+{
+  "interval_s": 0.1,
+  "gpu_uuid": "GPU-649010bf-1b36-22c3-5399-2f1250bd3e7e",
+  "warnings": [],
+  "run_state": "completed",
+  "bar_latency_requested": false,
+  "bar_latency_boundary": null,
+  "bam_kernel_average": {
+    "elapsed_s": 11.000752929688,
+    "logical_ops": 134217728,
+    "logical_bytes": 68719476736,
+    "logical_iops": 12200776.515740423,
+    "logical_bandwidth_gib_s": 5.817783601637088
+  },
+  "samples": 126,
+  "notes": [
+    "GPU 指标为所选 GPU 整卡数据；显存占用不等于 BaM 独占用量。",
+    "GPU busy 为采样窗口内执行 kernel 的时间比例，包含轮询；不是 SM occupancy 或算术单元利用率。",
+    "GPU memory busy 是显存读写忙碌时间比例，memory used 是已占用 MiB，两者含义不同。",
+    "nvidia-smi 的驱动刷新窗口可能比打点间隔长；重复值并不表示采样失效。",
+    "host CPU busy 按整机归一到 100%；进程/SwarmIO CPU 以一个核为 100%，多核可超过 100%。",
+    "SwarmIO 轮询线程即使没有 I/O 也可能占用 CPU。主机 RAM 不包含 memmap 预留的仿真 SSD 内存。",
+    "NVMe 曲线为全部队列成功读写 CQE 数与真实命令字节数的差分，包含 BaM 额外读；不是逻辑 IOPS。",
+    "完成计数表示 CPU 已发布 CQE，不证明 GPU 已观察到它；各队列顺序聚合存在微小采样偏差。",
+    "资源图从 benchmark 进程启动附近开始，包含初始化与清理；BaM 平均吞吐只覆盖其 kernel 计时区间。",
+    "采样自身会产生开销。此工具不测 PCIe 链路吞吐、DRAM 带宽或 GPU warp/SM occupancy。",
+    "BAR 延迟仅统计启用打点且成功完成的 GPU 数据命令，包含 BaM 额外读；不保存逐请求时间序列。",
+    "map/copy/unmap 为 CPU 调用耗时（含可能的抢占与等待），不是 PCIe 传输到达 GPU 的完成延迟；未增加读回或 flush。",
+    "BAR span 是各数据段从 ioremap 开始至 iounmap 返回的累计时间；不含 SQ/CQ 常驻映射和 PRP 列表映射。",
+    "CPU xfer 是整个 CPU 数据搬运函数耗时；host request 是 dispatcher 开始复制 SQE 至 CPU 发布 CQE，含排队和仿真延迟，不含 GPU 端完整请求生命周期。",
+    "占比按同一批请求的累计耗时相除；累计阶段耗时/整轮墙钟时间可超过 100%，不能当成可相加的墙钟时间占比。"
+  ],
+  "actual_interval_s": {
+    "min": 0.02134559400019498,
+    "median": 0.10000009499981388,
+    "max": 0.10014256999966165
+  },
+  "sample_cost_s": {
+    "mean": 0.007173036349177849,
+    "max": 0.03929013700053474
+  },
+  "nvme_monitor_window": {
+    "elapsed_s": 12.389357865,
+    "ops": 134217728,
+    "bytes": 68719476736,
+    "iops": 10833307.864902811,
+    "bandwidth_gib_s": 5.16572373623982
+  }
+}
