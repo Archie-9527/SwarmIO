@@ -178,9 +178,9 @@ int dsa_dma_wait_oldest_batch(struct dsa_dma_ctx_batch *ctx,
 			      void (*callback)(void *));
 int dsa_dma_wait_all_batch(struct dsa_dma_ctx_batch *ctx,
 			   void (*callback)(void *));
-inline bool __dsa_dma_is_issue_timeout_batch(struct dsa_dma_ctx_batch *ctx);
-inline bool __dsa_dma_is_wait_timeout_batch(struct dsa_dma_ctx_batch *ctx);
-inline bool __dsa_dma_all_busy_batch(struct dsa_dma_ctx_batch *ctx);
+bool __dsa_dma_is_issue_timeout_batch(struct dsa_dma_ctx_batch *ctx);
+bool __dsa_dma_is_wait_timeout_batch(struct dsa_dma_ctx_batch *ctx);
+bool __dsa_dma_all_busy_batch(struct dsa_dma_ctx_batch *ctx);
 
 /* single */
 int dsa_dma_ctx_single_init(struct dsa_dma_ctx_single *ctx, int dev_id,
@@ -199,6 +199,6 @@ int dsa_dma_wait_one_single(struct dsa_dma_ctx_single *ctx, int desc_id,
 			    void (*callback)(void *));
 int dsa_dma_wait_all_single(struct dsa_dma_ctx_single *ctx,
 			    void (*callback)(void *));
-inline bool __dsa_dma_should_sync_single(struct dsa_dma_ctx_single *ctx);
+bool __dsa_dma_should_sync_single(struct dsa_dma_ctx_single *ctx);
 
 #endif

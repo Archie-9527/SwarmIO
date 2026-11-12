@@ -146,7 +146,7 @@ done
 
 if [[ $unload -eq 1 ]]; then
     echo "Unloading swarmio..."
-    sudo modprobe -r swarmio || true
+    sudo modprobe -r swarmio
     exit 0
 fi
 

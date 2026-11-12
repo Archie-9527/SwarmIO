@@ -247,7 +247,7 @@ int dsa_dma_wait_all_single(struct dsa_dma_ctx_single *ctx,
 	return 0;
 }
 
-inline bool __dsa_dma_should_sync_single(struct dsa_dma_ctx_single *ctx)
+bool __dsa_dma_should_sync_single(struct dsa_dma_ctx_single *ctx)
 {
 	unsigned long next_wait_time =
 		ctx->last_wait_time + usecs_to_jiffies(5);

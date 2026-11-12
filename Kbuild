@@ -32,7 +32,8 @@ swarmio-objs := src/main.o nvmev/nvme_vdev.o src/proc.o nvmev/pci.o nvmev/admin.
 			  src/worker.o dsa/config.o dsa/dsa.o dsa/batch.o dsa/single.o src/simple_timing_model.o
 ccflags-y += -Wno-unused-variable -Wno-unused-function
 ccflags-y += -I$(src) -I$(src)/src
-ccflags-y += -I/usr/src/linux-source-$(shell uname -r | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')/drivers/dma/idxd
+IDXD_INCLUDE ?= /usr/src/linux-source-$(shell uname -r | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')/drivers/dma/idxd
+ccflags-y += -I$(IDXD_INCLUDE)
 
 ccflags-$(CONFIG_SWARMIO_PROFILE_REQ) += -DCONFIG_SWARMIO_PROFILE_REQ=1
 

@@ -124,12 +124,14 @@ while true; do
 done
 
 if [[ $clean -eq 1 ]]; then
-    sudo make clean
+    sudo make clean ${KERNELDIR:+KERNELDIR="$KERNELDIR"}
 fi
 
 # set -x
 
 sudo make install -j$(nproc) \
+    ${KERNELDIR:+KERNELDIR="$KERNELDIR"} \
+    ${IDXD_INCLUDE:+IDXD_INCLUDE="$IDXD_INCLUDE"} \
     max_queues="$max_queues" \
     max_fetch_sqes="$max_fetch_sqes" \
     worker_queue_size="$worker_queue_size" \

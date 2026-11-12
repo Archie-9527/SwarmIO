@@ -6,7 +6,7 @@ script_dir=$(dirname $(realpath $0))
 cd "${script_dir}/.."
 
 ############ CONFIG ############
-VDEV_BDF="0001:10:00.0"
+VDEV_BDF="${VDEV_BDF:-0001:10:00.0}"
 ############ CONFIG ############
 
 usage() {
@@ -101,8 +101,8 @@ for num_service_units in "${num_service_units_list[@]}"; do
         echo " Running bam-block-bench with N=$num_service_units, J=$num_gpu_threads"
 
         # assuming swarmio is running on node 2,3
-        sudo numactl \
-            --cpunodebind=0,1 --membind=0,1 \
+        sudo --preserve-env=BAM_GPU,BAM_CACHE_SIZE,BAM_DATA_SIZE,BAM_REQS,BAM_QUEUE_DEPTH,BAM_RANDOM numactl \
+            --cpunodebind="${BAM_CPU_NODES:-0,1}" --membind="${BAM_MEMORY_NODES:-0,1}" \
             scripts/run_bam-block-bench.sh \
                 -j $num_gpu_threads -q $num_queues -l $block_size > $OUTFILE
 

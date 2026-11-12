@@ -184,3 +184,8 @@ Makefile.local
 *.csv
 
 !bam*.patch
+!/configs/baseline-single-dsa.conf
+!/configs/baseline-dual-cpu-dsa.conf
+
+__pycache__/
+*.pyc

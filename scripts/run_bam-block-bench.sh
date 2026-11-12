@@ -38,19 +38,20 @@ while true; do
     esac
 done
 
-cache_size_bytes=$(echo "32G" | numfmt --from=iec)
+# Environment overrides change workload geometry, not the author's GPU kernel.
+cache_size_bytes=$(numfmt --from=iec "${BAM_CACHE_SIZE:-32G}")
 num_pages=$((cache_size_bytes / page_size))
-data_size_bytes=$(echo "112G" | numfmt --from=iec)
+data_size_bytes=$(numfmt --from=iec "${BAM_DATA_SIZE:-112G}")
 num_blocks=$((data_size_bytes / page_size))
 
 set -x
 
 sudo bam/Release/bin/nvm-block-bench \
-    --threads=$num_threads --blk_size=64 --reqs=32 \
+    --threads=$num_threads --blk_size=64 --reqs="${BAM_REQS:-32}" \
     --pages=$num_pages --page_size=$page_size \
     --num_blks=$num_blocks \
-    --queue_depth=1024 --num_queues=$num_queues \
-    --gpu=0 --n_ctrls=1 \
-    --random=true
+    --queue_depth="${BAM_QUEUE_DEPTH:-1024}" --num_queues=$num_queues \
+    --gpu="${BAM_GPU:-0}" --n_ctrls=1 \
+    --random="${BAM_RANDOM:-true}"
 
 set +x

@@ -41,6 +41,7 @@ mkdir -p $build_dir && cd $build_dir
 
 cmake .. \
     -DCMAKE_INSTALL_PREFIX=$install_dir \
-    -DCMAKE_BUILD_TYPE=$build_type
+    -DCMAKE_BUILD_TYPE=$build_type \
+    ${CMAKE_ARGS:-}
 
 make -j"$(nproc)" install

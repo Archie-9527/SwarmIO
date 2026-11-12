@@ -484,20 +484,20 @@ int dsa_dma_wait_all_batch(struct dsa_dma_ctx_batch *ctx,
 	return 0;
 }
 
-inline bool __dsa_dma_is_issue_timeout_batch(struct dsa_dma_ctx_batch *ctx)
+bool __dsa_dma_is_issue_timeout_batch(struct dsa_dma_ctx_batch *ctx)
 {
 	return (ctx->curr_num_filled > 0 &&
 		local_clock() >
 			ctx->start_issue_time + ctx->batch_issue_timeout_ns);
 }
 
-inline bool __dsa_dma_is_wait_timeout_batch(struct dsa_dma_ctx_batch *ctx)
+bool __dsa_dma_is_wait_timeout_batch(struct dsa_dma_ctx_batch *ctx)
 {
 	return (local_clock() >
 		ctx->last_wait_time + ctx->batch_sync_timeout_ns);
 }
 
-inline bool __dsa_dma_all_busy_batch(struct dsa_dma_ctx_batch *ctx)
+bool __dsa_dma_all_busy_batch(struct dsa_dma_ctx_batch *ctx)
 {
 	return (ctx->curr_desc >= ctx->num_descs);
 }

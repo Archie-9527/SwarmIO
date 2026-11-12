@@ -1,3 +1,7 @@
+> `v2-baseline`：从作者 SwarmIO `25594a1` 和 BaM `315fadf` + 作者 `bam_rev.patch` 建立的 Linux 6.8 最小兼容基线。
+> 未移植 `swarmio_bam.py`、自写 CUDA benchmark 或重写的 DSA 引擎。
+> 当前仅完成本地检查，服务器构建和性能结果待验证。手工步骤及差异白名单见 [基线复现说明](docs/v2-baseline.zh-CN.md)。
+
 # SwarmIO 
 SwarmIO is an IOPS-scalable NVMe SSD emulation framework built for end-to-end modeling of next-generation GPU-centric storage systems.
 
@@ -273,10 +277,9 @@ Initialize the BaM submodule from the top-level SwarmIO repository:
 $ git submodule update --init bam
 ```
 
-Apply the SwarmIO compatibility patch and build BaM from the submodule directory:
+The author compatibility patch is already applied in the `v2-baseline` BaM commit. Build BaM from the submodule directory:
 
 ```bash
-$ git -C bam apply ../bam_rev.patch
 $ scripts/build_bam.sh --clean
 ```
 

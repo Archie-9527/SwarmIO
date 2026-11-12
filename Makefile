@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0
 
-KERNELDIR := /lib/modules/$(shell uname -r)/build
+KERNELDIR ?= /lib/modules/$(shell uname -r)/build
 PWD       := $(shell pwd)
-MODDIR := /lib/modules/$(shell uname -r)/extra
+MODDIR ?= /lib/modules/$(shell uname -r)/extra
 
 max_queues ?= 64
 max_fetch_sqes ?= 1024
@@ -41,10 +41,8 @@ default:
 
 install: default
 	@mkdir -p $(MODDIR)
-	@if [ ! -f $(MODDIR)/swarmio.ko ]; then \
-		cp swarmio.ko $(MODDIR); \
-		depmod -a; \
-	fi
+	cp swarmio.ko $(MODDIR)/swarmio.ko
+	depmod -a
 
 .PHONY: clean
 clean:
