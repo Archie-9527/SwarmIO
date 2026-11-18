@@ -16,6 +16,7 @@
 #include <linux/wait.h>
 #include <linux/atomic.h>
 #include <linux/cpumask.h>
+#include <linux/kthread.h>
 
 #include <linux/nvme.h>
 
@@ -196,9 +197,12 @@ static inline void __thread_wait_on_flag(int *flag, atomic_t *num_waiting,
 					 wait_queue_head_t *wait_q)
 {
 	if (unlikely(READ_ONCE(*flag))) {
-		atomic_inc(num_waiting);
-		wait_event_interruptible(*wait_q, READ_ONCE(*flag) == 0);
+		atomic_inc_return(num_waiting);
+		wake_up_all(wait_q);
+		wait_event(*wait_q, smp_load_acquire(flag) == 0 ||
+			   kthread_should_stop());
 		atomic_dec(num_waiting);
+		wake_up_all(wait_q);
 	}
 }
 

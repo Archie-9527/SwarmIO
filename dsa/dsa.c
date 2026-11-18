@@ -149,6 +149,8 @@ int dsa_set_params(const struct dsa_cfg_params *p)
 	int wq_id, eng_id;
 
 	ret = dsa_validate_params(p);
+	if (ret)
+		return ret;
 
 	SWARMIO_DEBUG("set params for %u devices\n", p->num_devs);
 
@@ -256,53 +258,43 @@ static int dsa_engines_config(struct idxd_device *idxd)
 	return 0;
 }
 
-static int dsa_wqs_enable(struct idxd_device *idxd)
-{
-	int i, rc;
-	struct idxd_wq *wq;
-	int num_enabled = 0;
-
-	int num_wqs = __num_wqs_per_dev();
-	if (num_wqs <= 0)
-		return -EINVAL;
-
-	for (i = 0; i < num_wqs; i++) {
-		wq = idxd->wqs[i];
-		mutex_lock(&wq->wq_lock);
-		rc = idxd_drv_enable_wq(wq);
-		mutex_unlock(&wq->wq_lock);
-		if (rc) {
-			SWARMIO_WARN("failed to enable %s: %d\n", wq->name, rc);
-			continue;
-		}
-		SWARMIO_DEBUG("enabled wq %d\n", wq->id);
-		num_enabled++;
-	}
-
-	if (num_enabled == 0) {
-		return -ENODEV;
-	}
-
-	return 0;
-}
-
-static void dsa_wqs_disable(struct idxd_device *idxd)
+static void dsa_wqs_disable(struct idxd_device *idxd, int num_wqs)
 {
 	int i;
 	struct idxd_wq *wq;
-
-	int num_wqs = __num_wqs_per_dev();
-	if (num_wqs <= 0)
-		return;
 
 	for (i = 0; i < num_wqs; i++) {
 		wq = idxd->wqs[i];
 		mutex_lock(&wq->wq_lock);
 		__idxd_wq_quiesce(wq);
 		idxd_drv_disable_wq(wq);
-		SWARMIO_DEBUG("disabled wq %d\n", wq->id);
 		mutex_unlock(&wq->wq_lock);
+		SWARMIO_DEBUG("disabled wq %d\n", wq->id);
 	}
+}
+
+static int dsa_wqs_enable(struct idxd_device *idxd)
+{
+	int i, ret;
+	struct idxd_wq *wq;
+	int num_wqs = __num_wqs_per_dev();
+
+	if (num_wqs <= 0)
+		return -EINVAL;
+
+	for (i = 0; i < num_wqs; i++) {
+		wq = idxd->wqs[i];
+		mutex_lock(&wq->wq_lock);
+		ret = idxd_drv_enable_wq(wq);
+		mutex_unlock(&wq->wq_lock);
+		if (ret) {
+			SWARMIO_WARN("failed to enable %s: %d\n", wq->name, ret);
+			dsa_wqs_disable(idxd, i);
+			return ret;
+		}
+		SWARMIO_DEBUG("enabled wq %d\n", wq->id);
+	}
+	return 0;
 }
 
 /**
@@ -390,7 +382,7 @@ void dsa_disable_devices(void)
 		idxd = dsa_idxd_list[i];
 		dev = &idxd->idxd_dev.conf_dev;
 
-		dsa_wqs_disable(idxd);
+		dsa_wqs_disable(idxd, __num_wqs_per_dev());
 		if (dev->driver)
 			device_release_driver(dev);
 		dsa_idxd_list[i] = NULL;

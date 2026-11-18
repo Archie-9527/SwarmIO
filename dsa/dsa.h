@@ -16,6 +16,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/idxd.h>
 #include <linux/bitmap.h>
+#include <linux/sched.h>
 
 #include <idxd.h>
 
@@ -163,20 +164,29 @@ static inline void __dsa_prep_hw_desc(struct dsa_hw_desc *hw, char opcode,
  * @brief 轮询 IDXD 描述符的设备完成记录。
  * @param desc 已提交的 IDXD 描述符。
  * @param timeout 软件轮询时限，单位为毫秒。
- * @warning 超时只结束本次轮询。调用方仍需检查 status，设备也可能仍在执行。
+ * @return 观察到设备完成记录时返回 0，轮询超时返回 -ETIMEDOUT。
  */
-static inline void __dsa_sync_wait(struct idxd_desc *desc, int timeout)
+static inline int __dsa_sync_wait(struct idxd_desc *desc, int timeout)
 {
-	unsigned long timeout_jiffies = jiffies + msecs_to_jiffies(timeout);
+	unsigned long last_tick = jiffies;
+	unsigned long timeout_jiffies = last_tick + msecs_to_jiffies(timeout);
 
-	while (desc->completion->status == DSA_COMP_NONE) {
-		if (time_after(jiffies, timeout_jiffies)) {
+	while (READ_ONCE(desc->completion->status) == DSA_COMP_NONE) {
+		unsigned long now = jiffies;
+
+		if (unlikely(time_after_eq(now, timeout_jiffies))) {
 			SWARMIO_WARN_RL("wq %d polling timed out!\n",
 					desc->wq->id);
-			break;
+			return -ETIMEDOUT;
+		}
+		if (unlikely(now != last_tick)) {
+			last_tick = now;
+			cond_resched();
 		}
 		cpu_relax();
 	}
+	dma_rmb();
+	return 0;
 }
 
 int dsa_set_params(const struct dsa_cfg_params *p);
@@ -196,6 +206,8 @@ void dsa_assign_wq_by_group_disagg(int team_id, int local_id, int *dev_id,
 int dsa_dma_ctx_batch_init(struct dsa_dma_ctx_batch *ctx, int dev_id, int wq_id,
 			   int batch_size, int num_descs, int timeout);
 void dsa_dma_ctx_batch_remove(struct dsa_dma_ctx_batch *ctx);
+bool dsa_dma_batch_idle(const struct dsa_dma_ctx_batch *ctx);
+void dsa_dma_batch_reset(struct dsa_dma_ctx_batch *ctx);
 
 int dsa_dma_issue_async_batch(struct dsa_dma_ctx_batch *ctx, dma_addr_t dma_dst,
 			      dma_addr_t dma_src, size_t size, void *data,
@@ -213,6 +225,8 @@ bool __dsa_dma_all_busy_batch(struct dsa_dma_ctx_batch *ctx);
 int dsa_dma_ctx_single_init(struct dsa_dma_ctx_single *ctx, int dev_id,
 			    int wq_id, int num_descs, int timeout);
 void dsa_dma_ctx_single_remove(struct dsa_dma_ctx_single *ctx);
+bool dsa_dma_single_idle(const struct dsa_dma_ctx_single *ctx);
+void dsa_dma_single_reset(struct dsa_dma_ctx_single *ctx);
 
 int dsa_dma_issue_async_single(struct dsa_dma_ctx_single *ctx,
 			       dma_addr_t dma_dst, dma_addr_t dma_src,

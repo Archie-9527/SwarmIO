@@ -16,6 +16,7 @@ usage()     {
     echo "  -l, --block-size NUM           I/O block size (default: 4096)"
     echo "  -m, --num-sched-insts NUM      Number of scheduling instances (default: 1)"
     echo "  -u, --unload                   Unload module"
+    echo "  --prepare-unload              Stop and drain I/O, then keep the module loaded"
     echo "  --memmap-start NUM             Reserved mem start address (default: 132G)"
     echo "  --memmap-size NUM              Reserved mem size (default: 124G)"
     echo "  --num-service-units NUM        Number of service units (default: 1)"
@@ -36,7 +37,7 @@ usage()     {
 }
 
 OPTIONS="i:L:T:l:m:uh"
-LONGOPTS="input-config:,target-latency:,target-miops:,unload,\
+LONGOPTS="input-config:,target-latency:,target-miops:,unload,prepare-unload,\
 memmap-start:,memmap-size:,num-service-units:,num-workers-per-service-unit:,cpus:,use-disp-dma,use-worker-dma,\
 dsa-num-devs:,dsa-num-grps-per-dev:,dsa-num-wqs-per-grp:,dsa-num-engs-per-grp:,\
 dsa-wq-sizes:,dsa-wq-priorities:,dma-batch-size:,num-dma-descs-per-worker:,help,\
@@ -66,6 +67,7 @@ dsa_wq_priorities="1,1"
 dma_batch_size=32
 num_dma_descs_per_worker=2
 unload=0
+prepare_unload=0
 
 parse_config() {
     local config_file=$1
@@ -122,6 +124,7 @@ while true; do
         -m|--num-sched-insts)      num_sched_insts="$2"; shift 2 ;;
         -T|--target-miops)        target_miops="$2"; shift 2 ;;
         -u|--unload)              unload=1; shift ;;
+        --prepare-unload)         prepare_unload=1; shift ;;
         --memmap-start)           memmap_start="$2"; shift 2 ;;
         --memmap-size)            memmap_size="$2"; shift 2 ;;
         --num-service-units)         num_service_units="$2"; shift 2 ;;
@@ -144,9 +147,24 @@ while true; do
     esac
 done
 
-if [[ $unload -eq 1 ]]; then
+if (( unload || prepare_unload )); then
+    unload_param=/sys/module/swarmio/parameters/prepare_unload
+    if [[ -d /sys/module/swarmio ]]; then
+        if [[ ! -e "$unload_param" ]]; then
+            echo "Loaded swarmio has no prepare_unload interface. Verify the module version." >&2
+            exit 1
+        fi
+        echo "Stopping and draining SwarmIO I/O..."
+        printf '1\n' | sudo tee "$unload_param" > /dev/null
+    fi
+fi
+
+if (( unload )); then
     echo "Unloading swarmio..."
     sudo modprobe -r swarmio
+    exit 0
+fi
+if (( prepare_unload )); then
     exit 0
 fi
 

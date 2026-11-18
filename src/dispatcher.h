@@ -16,6 +16,13 @@
 struct swarmio_worker;
 struct nvme_vdev;
 
+#define SWARMIO_STOP_TIMEOUT_MS 6000
+
+void swarmio_io_fault(struct nvme_vdev *vdev, int error);
+int swarmio_pause_io(struct nvme_vdev *vdev);
+void swarmio_resume_io(struct nvme_vdev *vdev);
+bool swarmio_queue_busy(struct nvme_vdev *vdev, unsigned int qid, bool sq);
+
 /// @brief 一个服务单元中负责取 SQE 和派发 work 的内核线程状态。
 struct swarmio_dispatcher {
 	struct swarmio_worker **workers; /**< 属于本服务单元的 worker 指针数组。 */

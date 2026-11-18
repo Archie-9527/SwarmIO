@@ -3,6 +3,8 @@
 日期：2026-11-12。检查对象：SwarmIO `e99f01b`、BaM `5b11a4b`。
 本轮仅分析、补充文档，没有修改执行代码，没有连接服务器。
 
+2026-11-18 更新：本文记录的是补丁前的源码行为。稳定性补丁和当前卸载步骤见 [基线说明](v2-baseline.zh-CN.md)。
+
 ## 1. 证据与结论边界
 
 旧分支 `7721b3e:README.md` 记录过 `__fill_cq_result` 空指针、worker Oops/`exited with irqs disabled`，

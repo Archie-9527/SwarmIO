@@ -24,16 +24,16 @@ usage() {
     exit 1
 }
 
-cleanup() {
-    if [[ -e "/sys/bus/pci/devices/${VDEV_BDF}" ]]; then
-        if lsmod | grep -q "^libnvm"; then
-            scripts/load_bam.sh -u "${VDEV_BDF}" || true
-        fi
-        scripts/load.sh --unload || true
+on_exit() {
+    local status=$?
+    if (( status != 0 )); then
+        echo "BaM run failed. Modules are left in place for diagnosis." >&2
     fi
 }
 
-trap cleanup EXIT
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 OPTIONS="i:j:n:l:q:h"
 LONGOPTS="input-config:,num-gpu-threads:,num-service-units:,num-queues:,block-size:,help,target-miops:,build"
@@ -139,8 +139,9 @@ for num_service_units in "${num_service_units_list[@]}"; do
         fi
     done
 
+    scripts/load.sh --prepare-unload
     echo "Unloading BaM"
-    scripts/load_bam.sh -u "${VDEV_BDF}"
+    scripts/load_bam.sh -u --no-rebind "${VDEV_BDF}"
 
     echo "Unloading SwarmIO"
     scripts/load.sh --unload

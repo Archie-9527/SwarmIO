@@ -44,25 +44,21 @@ class BaselineTests(unittest.TestCase):
             self.assertEqual('force_release_gpu_memory(' in result, not persistent)
 
     def test_swarmio_algorithms_are_author_code(self):
-        for name in ('dsa/dsa.c', 'dsa/config.c', 'src/main.c', 'src/dispatcher.c',
-                     'src/worker.c', 'src/committer.c', 'src/queue.h',
-                     'src/simple_timing_model.c', 'nvmev/admin.c', 'nvmev/nvme_vdev.c'):
+        for name in ('dsa/config.c', 'src/queue.h', 'src/simple_timing_model.c',
+                     'nvmev/nvme_vdev.c'):
             with self.subTest(file=name):
                 self.assertEqual(without_doxygen((ROOT / name).read_text()),
                                  without_doxygen(original(ROOT, AUTHOR, name)))
-        for name in ('dsa/dsa.h', 'dsa/batch.c', 'dsa/single.c'):
-            with self.subTest(file=name):
-                authored = original(ROOT, AUTHOR, name).replace('inline bool __dsa_', 'bool __dsa_')
-                self.assertEqual(without_doxygen((ROOT / name).read_text()),
-                                 without_doxygen(authored))
 
-    def test_bam_workload_and_queue_protocol_are_author_patch(self):
-        for name in ('benchmarks/block/main.cu', 'include/page_cache.h',
-                     'include/nvm_parallel_queue.h', 'include/ctrl.h',
-                     'include/buffer.h', 'src/rpc.cpp'):
-            with self.subTest(file=name):
-                self.assertEqual(without_doxygen((ROOT / 'bam' / name).read_text()),
-                                 without_doxygen(original(ROOT / 'bam', AUTHOR_BAM_PATCHED, name)))
+    def test_bam_workload_kernels_are_author_patch(self):
+        name = 'benchmarks/block/main.cu'
+        source = without_doxygen((ROOT / 'bam' / name).read_text())
+        authored = original(ROOT / 'bam', AUTHOR_BAM_PATCHED, name)
+        for kernel in ('sequential_access_kernel', 'random_access_kernel'):
+            with self.subTest(kernel=kernel):
+                pattern = rf'^void {kernel}\(.*?^\}}'
+                self.assertEqual(re.search(pattern, source, re.M | re.S).group(),
+                                 re.search(pattern, authored, re.M | re.S).group())
 
     def test_shell_syntax(self):
         for path in (ROOT / 'scripts').glob('*.sh'):

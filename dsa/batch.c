@@ -103,7 +103,7 @@ static int dsa_alloc_and_prep_batch_desc(struct dsa_batch_desc *batch_desc,
 	}
 
 	// alloc populate batch desc
-	desc = idxd_alloc_desc(wq, IDXD_OP_BLOCK);
+	desc = idxd_alloc_desc(wq, IDXD_OP_NONBLOCK);
 	if (IS_ERR(desc)) {
 		SWARMIO_ERROR("allocate desc for wq %d failed\n", wq->id);
 		return -ENODEV;
@@ -338,6 +338,7 @@ int dsa_dma_issue_async_batch(struct dsa_dma_ctx_batch *ctx, dma_addr_t dma_dst,
 	set_bit(i, ctx->issued_mask);
 
 	ctx->curr_desc = find_first_zero_bit(ctx->issued_mask, ctx->num_descs);
+	ctx->curr_num_filled = 0;
 
 	return 0;
 }
@@ -411,7 +412,7 @@ int dsa_dma_issue_async_remaining_batch(struct dsa_dma_ctx_batch *ctx)
 int dsa_dma_wait_oldest_batch(struct dsa_dma_ctx_batch *ctx,
 			      void (*callback)(void *))
 {
-	int j;
+	int j, ret;
 	struct dsa_batch_desc *batch_desc;
 	u64 now;
 	s64 delta_ns;
@@ -423,7 +424,9 @@ int dsa_dma_wait_oldest_batch(struct dsa_dma_ctx_batch *ctx,
 				      node);
 
 	/* wait for oldest issued batch */
-	__dsa_sync_wait(batch_desc->idxd_desc, ctx->timeout);
+	ret = __dsa_sync_wait(batch_desc->idxd_desc, ctx->timeout);
+	if (ret)
+		return ret;
 	clear_bit(batch_desc->id, ctx->issued_mask);
 	list_del(&batch_desc->node);
 	if (batch_desc->idxd_desc->completion->status != DSA_COMP_SUCCESS) {
@@ -469,7 +472,7 @@ int dsa_dma_wait_oldest_batch(struct dsa_dma_ctx_batch *ctx,
 int dsa_dma_wait_all_batch(struct dsa_dma_ctx_batch *ctx,
 			   void (*callback)(void *))
 {
-	int i, j;
+	int i, j, ret;
 	struct dsa_batch_desc *batch_desc;
 	u64 now;
 	s64 delta_ns;
@@ -479,7 +482,9 @@ int dsa_dma_wait_all_batch(struct dsa_dma_ctx_batch *ctx,
 		batch_desc = &ctx->batch_descs[i];
 
 		/* poll completion for batch desc */
-		__dsa_sync_wait(batch_desc->idxd_desc, ctx->timeout);
+		ret = __dsa_sync_wait(batch_desc->idxd_desc, ctx->timeout);
+		if (ret)
+			return ret;
 		clear_bit(i, ctx->issued_mask);
 		list_del(&batch_desc->node);
 		if (batch_desc->idxd_desc->completion->status !=
@@ -526,6 +531,32 @@ int dsa_dma_wait_all_batch(struct dsa_dma_ctx_batch *ctx,
 }
 
 /// @brief 检查部分填充批次是否达到提前提交阈值。
+/// @brief 在提交线程暂停时检查全部已提交的外层 BATCH。
+bool dsa_dma_batch_idle(const struct dsa_dma_ctx_batch *ctx)
+{
+	int i;
+
+	for_each_set_bit(i, ctx->issued_mask, ctx->num_descs) {
+		if (READ_ONCE(ctx->batch_descs[i].idxd_desc->completion->status) ==
+		    DSA_COMP_NONE)
+			return false;
+	}
+	return true;
+}
+
+/// @brief 硬件排空后丢弃旧批次及尚未提交的尾批。
+void dsa_dma_batch_reset(struct dsa_dma_ctx_batch *ctx)
+{
+	int i;
+
+	for (i = 0; i < ctx->num_descs; i++)
+		ctx->batch_descs[i].num_filled = 0;
+	INIT_LIST_HEAD(&ctx->issued_descs);
+	bitmap_zero(ctx->issued_mask, ctx->num_descs);
+	ctx->curr_desc = 0;
+	ctx->curr_num_filled = 0;
+}
+
 bool __dsa_dma_is_issue_timeout_batch(struct dsa_dma_ctx_batch *ctx)
 {
 	return (ctx->curr_num_filled > 0 &&

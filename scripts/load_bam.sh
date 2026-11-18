@@ -6,7 +6,7 @@ script_dir=$(dirname $(realpath $0))
 cd "${script_dir}/.."
 
 usage() {
-    echo "Usage: $0 [-u] <BDF1> [<BDF2> ...]"
+    echo "Usage: $0 [-u [--no-rebind]] <BDF1> [<BDF2> ...]"
     exit 1
 }
 
@@ -64,10 +64,13 @@ unload_bam_module() {
 # ================================
 bdf_list=()
 unload=0
+rebind=1
 
 for arg in "$@"; do
     if [[ "$arg" == "-u" ]]; then
         unload=1
+    elif [[ "$arg" == "--no-rebind" ]]; then
+        rebind=0
     else
         bdf_list+=("$arg")
     fi
@@ -79,9 +82,11 @@ fi
 
 if [[ "$unload" == "1" ]]; then
     unload_bam_module
-    for bdf in "${bdf_list[@]}"; do
-        bind_nvme_device "$bdf"
-    done
+    if (( rebind )); then
+        for bdf in "${bdf_list[@]}"; do
+            bind_nvme_device "$bdf"
+        done
+    fi
 else
     for bdf in "${bdf_list[@]}"; do
         unbind_nvme_device "$bdf"

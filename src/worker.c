@@ -56,13 +56,6 @@ static inline int __dsa_dma_issue(dma_ctx_t *ctx, dma_addr_t dma_dst,
 #endif
 }
 
-/// @brief 发生 DSA 错误后关闭全局 worker DMA 开关。
-static inline void __swarmio_disable_worker_dma(void)
-{
-	SWARMIO_ERROR("disabling worker DMA after DSA failure\n");
-	worker_using_dma = false;
-}
-
 #ifndef CONFIG_SWARMIO_COMMIT
 /**
  * @brief 在 CQ 有空位时写入 SQ head、SQ ID、CID 和阶段位。
@@ -82,9 +75,15 @@ static bool __fill_cq_result(struct swarmio_io_work *w)
 	int pos;
 #endif
 	struct nvme_completion_queue *cq = vdev->cqes[cqid];
+	struct nvme_submission_queue *sq = vdev->sqes[sqid];
 	struct nvme_completion *cqe_src, *cqe_dst;
 	int cq_tail, next_cq_tail, cq_head, phase;
 	u32 dword2, dword3;
+
+	if (unlikely(!cq || !sq)) {
+		swarmio_io_fault(vdev, -EIO);
+		return false;
+	}
 
 #ifndef CONFIG_SWARMIO_DISP_ALLOC_WORKER_RR
 	if (new_db != old_db) {
@@ -129,7 +128,7 @@ static bool __fill_cq_result(struct swarmio_io_work *w)
 	cqe_src = &w->cqe;
 
 	/* write cqe */
-	cqe_src->sq_head = vdev->sqes[sqid]->sq_head;
+	cqe_src->sq_head = sq->sq_head;
 	cqe_src->status = (u16)phase & 0x1;
 	memcpy((u32 *)cqe_dst + 2, (u32 *)cqe_src + 2, sizeof(u32) * 2);
 
@@ -411,6 +410,7 @@ static int __swarmio_xfer_data_using_dma(struct nvme_rw_command *cmd,
 	/* Loop for data transfer */
 	while (remaining) {
 		size_t page_size = 0;
+		int ret;
 		mem_offs = 0;
 		io_size = 0;
 
@@ -436,10 +436,11 @@ static int __swarmio_xfer_data_using_dma(struct nvme_rw_command *cmd,
 #ifdef CONFIG_SWARMIO_PROFILE_REQ
 		w->nsecs_issued = ktime_get_ns();
 #endif
-		if (__swarmio_submit_dma(dma_ctx, cmd->opcode, paddr, offset,
-					 io_size,
-					 io_size < remaining ? NULL : w))
-			return -EIO;
+		ret = __swarmio_submit_dma(dma_ctx, cmd->opcode, paddr, offset,
+					   io_size,
+					   io_size < remaining ? NULL : w);
+		if (ret)
+			return ret;
 
 		remaining -= io_size;
 		offset += io_size;
@@ -480,6 +481,9 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 	/* loop1: dma issue */
 	i = local_queue->head;
 	do {
+		if (unlikely(READ_ONCE(vdev->stop_flag) ||
+			     atomic_read(&vdev->io_error)))
+			return;
 		w = local_queue->works + i;
 
 		/* issue i/o */
@@ -494,9 +498,8 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 						&w->cmd.rw, ctx, w,
 						worker->paddr_list);
 					if (unlikely(ret)) {
-						__swarmio_disable_worker_dma();
-						__swarmio_xfer_data(&w->cmd.rw);
-						__swarmio_mark_copied(w);
+						swarmio_io_fault(vdev, ret);
+						return;
 					}
 #else
 #ifdef CONFIG_SWARMIO_PROFILE_REQ
@@ -633,8 +636,10 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 			int ret;
 
 			ret = dsa_dma_issue_async_remaining_batch(ctx);
-			if (unlikely(ret))
-				__swarmio_disable_worker_dma();
+			if (unlikely(ret)) {
+				swarmio_io_fault(vdev, ret);
+				return;
+			}
 		}
 
 		if (__dsa_dma_is_wait_timeout_batch(ctx)) {
@@ -642,7 +647,7 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 
 			ret = dsa_dma_wait_oldest_batch(ctx, __swarmio_dma_cb);
 			if (unlikely(ret))
-				__swarmio_disable_worker_dma();
+				swarmio_io_fault(vdev, ret);
 		}
 	}
 #endif
@@ -696,16 +701,19 @@ void swarmio_proc_irqs(struct swarmio_worker *worker)
 static int swarmio_worker_thread_fn(void *data)
 {
 	struct swarmio_worker *worker = (struct swarmio_worker *)data;
-	static unsigned long last_io_time = 0;
+	unsigned long last_io_time = jiffies;
 
 	SWARMIO_DEBUG("%s started on cpu %d (node %d)\n", worker->thread_name,
 		      smp_processor_id(), cpu_to_node(smp_processor_id()));
 
 	while (!kthread_should_stop()) {
-		swarmio_proc_io(worker, &last_io_time);
+		if (likely(READ_ONCE(vdev->is_threads_initialized) &&
+			   !atomic_read(&vdev->io_error))) {
+			swarmio_proc_io(worker, &last_io_time);
 #ifndef CONFIG_SWARMIO_COMMIT
-		swarmio_proc_irqs(worker);
+			swarmio_proc_irqs(worker);
 #endif
+		}
 		if (CONFIG_SWARMIO_IDLE_TIMEOUT != 0 &&
 		    time_after(jiffies,
 			       last_io_time +
@@ -750,6 +758,7 @@ int swarmio_worker_init(struct nvme_vdev *vdev)
 
 	for (i = 0; i < num_workers; i++) {
 		worker = &vdev->workers[i];
+		vdev->num_workers_initialized++;
 		worker->id = i % num_workers_per_service_unit;
 		worker->disp_id = i / num_workers_per_service_unit;
 		worker->dispatcher = NULL;
@@ -821,6 +830,8 @@ int swarmio_worker_init(struct nvme_vdev *vdev)
 			if (ret) {
 				SWARMIO_ERROR("%s: dma ctx init failed!\n",
 					      worker->thread_name);
+				kfree(worker->dma_ctx);
+				worker->dma_ctx = NULL;
 				goto err;
 			}
 			SWARMIO_DEBUG("%s assigned %s\n", worker->thread_name,
@@ -838,7 +849,6 @@ int swarmio_worker_init(struct nvme_vdev *vdev)
 
 		kthread_bind(worker->task_struct, worker->cpu_id);
 		wake_up_process(worker->task_struct);
-		vdev->num_workers_initialized++;
 	}
 
 	return 0;

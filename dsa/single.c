@@ -63,20 +63,16 @@ int dsa_dma_ctx_single_init(struct dsa_dma_ctx_single *ctx, int dev_id,
 
 	for (i = 0; i < ctx->num_descs; i++) {
 		/* alloc and prep single desc */
-		ctx->single_descs[i] = idxd_alloc_desc(wq, IDXD_OP_BLOCK);
+		ctx->single_descs[i] = idxd_alloc_desc(wq, IDXD_OP_NONBLOCK);
 		if (IS_ERR(ctx->single_descs[i])) {
 			SWARMIO_ERROR("allocate desc for wq %d failed\n",
 				      wq->id);
-			return -ENODEV;
+			ret = PTR_ERR(ctx->single_descs[i]);
+			goto err_prep_single_descs;
 		}
 		__dsa_prep_hw_desc(ctx->single_descs[i]->hw, DSA_OPCODE_MEMMOVE,
 				   0, 0, 0, ctx->single_descs[i]->compl_dma,
 				   IDXD_OP_FLAG_CRAV | IDXD_OP_FLAG_RCR);
-		if (ret < 0) {
-			SWARMIO_ERROR("failed to prep single desc for %s\n",
-				      wq->name);
-			goto err_prep_single_descs;
-		}
 	}
 
 	return 0;
@@ -215,6 +211,7 @@ int dsa_dma_wait_one_single(struct dsa_dma_ctx_single *ctx, int desc_id,
 			    void (*callback)(void *))
 {
 	struct idxd_desc *single_desc;
+	int ret;
 
 	if (unlikely(desc_id < 0 || desc_id >= ctx->num_descs)) {
 		SWARMIO_ERROR("invalid desc_id %d\n", desc_id);
@@ -229,7 +226,9 @@ int dsa_dma_wait_one_single(struct dsa_dma_ctx_single *ctx, int desc_id,
 	single_desc = ctx->single_descs[desc_id];
 
 	/* poll completion for single desc */
-	__dsa_sync_wait(single_desc, ctx->timeout);
+	ret = __dsa_sync_wait(single_desc, ctx->timeout);
+	if (ret)
+		return ret;
 	clear_bit(desc_id, ctx->issued_mask);
 	if (single_desc->completion->status != DSA_COMP_SUCCESS) {
 		SWARMIO_ERROR_RL("DMA polling failed!: %d\n",
@@ -252,7 +251,7 @@ int dsa_dma_wait_one_single(struct dsa_dma_ctx_single *ctx, int desc_id,
 int dsa_dma_wait_all_single(struct dsa_dma_ctx_single *ctx,
 			    void (*callback)(void *))
 {
-	int i;
+	int i, ret;
 	struct idxd_desc *single_desc;
 
 	/* wait for issued singles */
@@ -260,7 +259,9 @@ int dsa_dma_wait_all_single(struct dsa_dma_ctx_single *ctx,
 		single_desc = ctx->single_descs[i];
 
 		/* poll completion for single desc */
-		__dsa_sync_wait(single_desc, ctx->timeout);
+		ret = __dsa_sync_wait(single_desc, ctx->timeout);
+		if (ret)
+			return ret;
 		clear_bit(i, ctx->issued_mask);
 		if (single_desc->completion->status != DSA_COMP_SUCCESS) {
 			SWARMIO_ERROR_RL("DMA polling failed!: %d\n",
@@ -279,6 +280,26 @@ int dsa_dma_wait_all_single(struct dsa_dma_ctx_single *ctx,
 	ctx->last_wait_time = jiffies;
 
 	return 0;
+}
+
+/// @brief 在提交线程暂停时检查全部已提交的单操作描述符。
+bool dsa_dma_single_idle(const struct dsa_dma_ctx_single *ctx)
+{
+	int i;
+
+	for_each_set_bit(i, ctx->issued_mask, ctx->num_descs) {
+		if (READ_ONCE(ctx->single_descs[i]->completion->status) ==
+		    DSA_COMP_NONE)
+			return false;
+	}
+	return true;
+}
+
+/// @brief 硬件排空后清理上一轮的描述符跟踪状态。
+void dsa_dma_single_reset(struct dsa_dma_ctx_single *ctx)
+{
+	bitmap_zero(ctx->issued_mask, ctx->num_descs);
+	ctx->curr_desc = 0;
 }
 
 bool __dsa_dma_should_sync_single(struct dsa_dma_ctx_single *ctx)

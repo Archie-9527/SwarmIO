@@ -2,8 +2,7 @@
 
 日期：2026-11-12。状态：源码准备及本地检查；尚未在服务器完整构建、加载或取得性能结果。
 本轮按用户要求不连接服务器。下面的机器参数是候选值，必须与实际机器核对。
-后续静态审计发现原作超时、reset及退出路径的生命周期缺口，见 [卡住问题分析](v2-baseline-hang-analysis.zh-CN.md)。
-这些问题尚未修复；开展性能扫描前，需先完成稳定性补丁和基本运行/退出验收。以下命令是准备步骤，不代表当前版本已能安全反复装卸。
+2026-11-18 更新：加入 DMA 超时、复位及卸载的稳定性补丁。原始问题详见 [卡住问题分析](v2-baseline-hang-analysis.zh-CN.md)。当前完成本地检查，服务器构建、装卸和故障恢复待验收。
 
 ## 1. 来源及边界
 
@@ -27,7 +26,7 @@
 
 没有移入旧适配版的 GPU fence、volatile CQ 读取、BAR 映射/CQE 发布重写、PRP 修复或算法限制。
 因此这些原作路径能否在新 GPU/驱动上正确运行仍需服务器验收；若失败，先保留日志，针对具体问题增加独立最小补丁，不以重写引擎代替兼容修复。
-特别是作者原版 DMA 出错后可能回退 CPU；发生此类日志的性能轮不能计为 DSA 结果。
+稳定性补丁在运行中出现 DSA 错误时终止当前 I/O 轮次，保留未确认结束的 DMA 跟踪。模块加载时的 DSA 可用性日志仍需核对，确认实际运行的是 DSA 数据路径。
 
 ## 3. 目标机准备与构建
 
@@ -91,10 +90,11 @@ bash scripts/run_bam-block-bench.sh -j 64 -q 8 -l 512 \
 每轮保留原始日志和该轮内核日志。确认所有 dispatcher/worker 使用 DSA、队列建立完整、GPU正常退出，且无 timeout、DMA polling failed、disabling DMA、CPU fallback 或 Oops。
 作者入口没有完整逐字节内容验证，本分支不冒充已经验证了数据正确性；如新环境出现异常，先解决正确性，再报最大性能。
 
-正常退出后按作者流程卸载，再换双路配置：
+正常退出后先在 SwarmIO 中排空请求，再释放 BaM 和 SwarmIO 模块。
 
 ```bash
-bash scripts/load_bam.sh -u 0001:10:00.0
+bash scripts/load.sh --prepare-unload
+bash scripts/load_bam.sh -u --no-rebind 0001:10:00.0
 bash scripts/load.sh --unload
 bash scripts/load.sh -i configs/baseline-dual-cpu-dsa.conf
 bash scripts/load_bam.sh 0001:10:00.0
@@ -102,7 +102,9 @@ bash scripts/load_bam.sh 0001:10:00.0
 ```
 
 也可使用作者 `scripts/run_bam.sh` 的列表扫描方式。`VDEV_BDF`、`BAM_CPU_NODES`、`BAM_MEMORY_NODES` 可覆盖其中原先写死的机器布局。
-该脚本退出时会清理模块，初期建议先用上面的分步命令观察现场。
+该脚本在正常结束时按上述顺序清理。失败后保留已加载模块和日志。通过 `scripts/run_bam-block-bench.sh` 启动的 BaM 将在 SwarmIO 确认排空后退出 GPU 等待。`SIGINT` / `SIGTERM` 会请求控制器停止。若 DSA 一直未报告完成，资源继续保留，准备卸载返回错误。此时应先保存现场。
+
+直接卸载 SwarmIO 前需要准备步骤成功。`scripts/load.sh --unload` 自带这一步。切换 CPU / DSA 数据路径需要重新加载模块，避免运行中改变 DMA 上下文。
 
 ## 5. 最大 IOPS / 吞吐搜索口径
 
@@ -137,6 +139,7 @@ bash scripts/run_bam-block-bench.sh -j 65536 -q 128 -l 4096 \
 
 ## 6. 当前完成和未完成的验证
 
-本地：`python3 -m unittest discover -s tests -v`，6项检查全部通过；两个仓库的 `git diff --check` 通过。检查作者核心代码/负载代码保持一致、C链接调整白名单、shell语法、构建参数和手工入口参数转发。
+本地检查入口为 `python3 -B -m unittest discover -s tests -v`。覆盖作者负载及模型、兼容参数、模拟 DMA 完成与超时、排空失败时阻止卸载。
+服务器端先验收 512 B / 4 KiB 的正常读、队列回绕和重复装卸，再在独立测试环境中验收有在途 I/O 的停止、复位和 DMA 超时。设备持续失去响应时，当前补丁保留资源，恢复仍可能需要重启。
 未执行 Linux 6.8 完整模块编译、NVIDIA驱动加载或真实性能测试，也没有预填IOPS/带宽结果。
 后续优化从本基线增加拓扑归属策略，保持作者 BATCH、SQE 合并、模型和 benchmark 协议一致。

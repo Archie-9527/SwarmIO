@@ -43,9 +43,15 @@ static bool __fill_cq_result(struct swarmio_commit_desc *desc)
 	int new_db = vdev->dbs[cqdb];
 	int old_db = vdev->old_dbs[cqdb];
 	struct nvme_completion_queue *cq = vdev->cqes[cqid];
+	struct nvme_submission_queue *sq = vdev->sqes[sqid];
 	struct nvme_completion *cqe_src, *cqe_dst;
 	int cq_tail, next_cq_tail, cq_head;
 	u32 dword2, dword3;
+
+	if (unlikely(!cq || !sq)) {
+		swarmio_io_fault(vdev, -EIO);
+		return false;
+	}
 
 	if (new_db != old_db) {
 		cq->cq_head = new_db;
@@ -68,7 +74,7 @@ static bool __fill_cq_result(struct swarmio_commit_desc *desc)
 	cqe_src = &desc->cqe;
 
 	/* write cqe */
-	cqe_src->sq_head = vdev->sqes[sqid]->sq_head;
+	cqe_src->sq_head = sq->sq_head;
 	cqe_src->status = (u16)cq->phase & 0x1;
 	memcpy((u32 *)cqe_dst + 2, (u32 *)cqe_src + 2, sizeof(u32) * 2);
 
@@ -199,15 +205,18 @@ void swarmio_proc_irqs(struct swarmio_committer *committer)
 static int swarmio_committer_thread_fn(void *data)
 {
 	struct swarmio_committer *committer = (struct swarmio_committer *)data;
-	static unsigned long last_completion_time = 0;
+	unsigned long last_completion_time = jiffies;
 
 	SWARMIO_DEBUG("%s started on cpu %d (node %d)\n",
 		      committer->thread_name, smp_processor_id(),
 		      cpu_to_node(smp_processor_id()));
 
 	while (!kthread_should_stop()) {
-		swarmio_complete(committer, &last_completion_time);
-		swarmio_proc_irqs(committer);
+		if (likely(READ_ONCE(vdev->is_threads_initialized) &&
+			   !atomic_read(&vdev->io_error))) {
+			swarmio_complete(committer, &last_completion_time);
+			swarmio_proc_irqs(committer);
+		}
 		if (CONFIG_SWARMIO_IDLE_TIMEOUT != 0 &&
 		    time_after(jiffies,
 			       last_completion_time +

@@ -34,10 +34,210 @@ extern int num_dma_descs_per_disp;
 extern int dma_timeout;
 extern int num_dsa_devs;
 
-static inline void __swarmio_disable_disp_dma(void)
+/// @brief 记录本轮第一个错误，并让所有服务线程停止发出新 I/O。
+void swarmio_io_fault(struct nvme_vdev *vdev, int error)
 {
-	SWARMIO_ERROR("disabling dispatcher DMA after DSA failure\n");
-	disp_using_dma = false;
+	if (!atomic_cmpxchg(&vdev->io_error, 0, error))
+		SWARMIO_ERROR("I/O stopped after error %d\n", error);
+}
+
+void swarmio_resume_io(struct nvme_vdev *vdev)
+{
+	smp_store_release(&vdev->stop_flag, 0);
+	wake_up_all(&vdev->wait_queue);
+}
+
+/// @brief 由 dispatcher 0 发起暂停，等待其余服务线程确认。
+int swarmio_pause_io(struct nvme_vdev *vdev)
+{
+	unsigned int expected = vdev->num_service_units_initialized +
+				vdev->num_workers_initialized - 1;
+	unsigned long timeout = msecs_to_jiffies(SWARMIO_STOP_TIMEOUT_MS);
+
+#ifdef CONFIG_SWARMIO_COMMIT
+	expected += vdev->num_committers_initialized;
+#endif
+	/* Wait for acknowledgements from the previous pause to be retired. */
+	timeout = wait_event_timeout(vdev->wait_queue,
+				     !atomic_read(&vdev->num_waiting), timeout);
+	if (!timeout)
+		goto timed_out;
+
+	WRITE_ONCE(vdev->stop_flag, 1);
+	if (wait_event_timeout(vdev->wait_queue,
+			       atomic_read_acquire(&vdev->num_waiting) == expected,
+			       timeout))
+		return 0;
+
+	swarmio_resume_io(vdev);
+timed_out:
+	SWARMIO_ERROR("timed out pausing I/O threads (%d/%u)\n",
+		      atomic_read(&vdev->num_waiting), expected);
+	return -ETIMEDOUT;
+}
+
+static bool swarmio_dispatch_dma_idle(struct nvme_vdev *vdev)
+{
+	unsigned int i;
+
+	for (i = 0; i < vdev->num_service_units_initialized; i++) {
+		struct dsa_dma_ctx_single *ctx = vdev->dispatchers[i].dma_ctx;
+
+		if (ctx && !dsa_dma_single_idle(ctx))
+			return false;
+	}
+	return true;
+}
+
+static bool swarmio_dma_idle(struct nvme_vdev *vdev)
+{
+	unsigned int i;
+
+	if (!swarmio_dispatch_dma_idle(vdev))
+		return false;
+	for (i = 0; i < vdev->num_workers_initialized; i++) {
+		dma_ctx_t *ctx = vdev->workers[i].dma_ctx;
+
+#ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
+		if (ctx && !dsa_dma_batch_idle(ctx))
+#else
+		if (ctx && !dsa_dma_single_idle(ctx))
+#endif
+			return false;
+	}
+	return true;
+}
+
+/// @brief 先确认所有已提交 DMA 完成，再清理旧 I/O。成功时保持暂停。
+static int swarmio_quiesce_io(struct nvme_vdev *vdev)
+{
+	unsigned long deadline;
+	unsigned int i;
+	int ret = swarmio_pause_io(vdev);
+
+	if (ret)
+		return ret;
+
+	deadline = jiffies + msecs_to_jiffies(SWARMIO_STOP_TIMEOUT_MS);
+	while (!swarmio_dma_idle(vdev)) {
+		if (time_after_eq(jiffies, deadline)) {
+			SWARMIO_ERROR("DMA still in flight after drain timeout\n");
+			swarmio_resume_io(vdev);
+			return -ETIMEDOUT;
+		}
+		usleep_range(500, 1000);
+	}
+	dma_rmb();
+
+	for (i = 0; i < vdev->num_service_units_initialized; i++) {
+		struct dsa_dma_ctx_single *ctx = vdev->dispatchers[i].dma_ctx;
+
+		if (ctx)
+			dsa_dma_single_reset(ctx);
+	}
+	for (i = 0; i < vdev->num_workers_initialized; i++) {
+		struct swarmio_worker *worker = &vdev->workers[i];
+
+		if (worker->dma_ctx) {
+#ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
+			dsa_dma_batch_reset(worker->dma_ctx);
+#else
+			dsa_dma_single_reset(worker->dma_ctx);
+#endif
+		}
+		worker->local_queue.head = worker->local_queue.tail;
+	}
+#ifdef CONFIG_SWARMIO_COMMIT
+	for (i = 0; i < vdev->num_committers_initialized; i++) {
+		struct swarmio_commit_queue *queue = &vdev->committers[i].commit_queue;
+
+		while (queue->head != atomic_read(&queue->tail)) {
+			queue->descs[queue->head].is_valid = false;
+			queue->head = (queue->head + 1) % queue->size;
+		}
+	}
+#endif
+	return 0;
+}
+
+/// @brief 暂停派发和完成线程后，检查指定队列是否仍有旧请求。
+bool swarmio_queue_busy(struct nvme_vdev *vdev, unsigned int qid, bool sq)
+{
+	unsigned int i;
+
+#ifdef CONFIG_SWARMIO_DISP_PREFETCH_SQE
+	if (sq && vdev->sqes[qid]->is_pref_issued && !swarmio_dispatch_dma_idle(vdev))
+		return true;
+#endif
+	for (i = 0; i < vdev->num_workers_initialized; i++) {
+		struct swarmio_worker_local_queue *local = &vdev->workers[i].local_queue;
+		unsigned int pos;
+
+		for (pos = local->head; pos != local->tail;
+		     pos = (pos + 1) % local->size) {
+			struct swarmio_io_work *w = &local->works[pos];
+
+			if (!w->is_internal && !w->is_completed &&
+			    (sq ? w->cqe.sq_id : w->cqid) == qid)
+				return true;
+		}
+	}
+#ifdef CONFIG_SWARMIO_COMMIT
+	for (i = 0; i < vdev->num_committers_initialized; i++) {
+		struct swarmio_commit_queue *queue = &vdev->committers[i].commit_queue;
+		unsigned int pos;
+
+		for (pos = queue->head; pos != atomic_read(&queue->tail);
+		     pos = (pos + 1) % queue->size) {
+			struct swarmio_commit_desc *d = &queue->descs[pos];
+
+			if (d->is_valid && !d->is_internal && !d->is_completed &&
+			    (sq ? d->cqe.sq_id : d->cqid) == qid)
+				return true;
+		}
+	}
+#endif
+	return false;
+}
+
+static void swarmio_handle_io_fault(struct nvme_vdev *vdev)
+{
+	int ret;
+
+	if (!atomic_read(&vdev->io_error))
+		return;
+	if (vdev->fault_drain_attempted)
+		return;
+
+	vdev->bar->csts.cfs = 1;
+	vdev->fault_drain_attempted = true;
+	ret = swarmio_quiesce_io(vdev);
+	if (ret)
+		return;
+
+	/* Clients may release their buffers only after the controller is quiet. */
+	vdev->bar->csts.rdy = 0;
+	swarmio_resume_io(vdev);
+}
+
+static void swarmio_handle_unload(struct nvme_vdev *vdev)
+{
+	int ret;
+
+	if (READ_ONCE(vdev->unload_prepared))
+		goto done;
+	ret = swarmio_quiesce_io(vdev);
+	if (ret) {
+		swarmio_io_fault(vdev, ret);
+		vdev->bar->csts.cfs = 1;
+	} else {
+		vdev->bar->csts.rdy = 0;
+		WRITE_ONCE(vdev->unload_prepared, true);
+	}
+	vdev->unload_result = ret;
+done:
+	smp_store_release(&vdev->unload_requested, false);
+	wake_up_all(&vdev->wait_queue);
 }
 
 /* BAR updates are handled only by dispatcher 0. */
@@ -56,6 +256,7 @@ bool swarmio_proc_bars(struct swarmio_dispatcher *dispatcher)
 	volatile struct nvme_ctrl_regs *bar = vdev->bar;
 	struct nvme_admin_queue *queue = vdev->admin_q;
 	unsigned int num_pages, i;
+	u32 cc;
 
 	if (old_bar->aqa != bar->u_aqa) {
 		old_bar->aqa = bar->u_aqa;
@@ -79,10 +280,12 @@ bool swarmio_proc_bars(struct swarmio_dispatcher *dispatcher)
 
 		goto out;
 	}
-	if (old_bar->cc != bar->u_cc) {
-		if (bar->cc.en == 1) {
+	cc = bar->u_cc;
+	if (old_bar->cc != cc) {
+		if (cc & 1) {
 			if (vdev->admin_q) {
-				;
+				if (atomic_read(&vdev->io_error))
+					goto record_cc;
 			} else {
 				queue = kzalloc(sizeof(*queue), GFP_KERNEL);
 				if (!queue) {
@@ -139,29 +342,22 @@ bool swarmio_proc_bars(struct swarmio_dispatcher *dispatcher)
 						i);
 				}
 				WRITE_ONCE(vdev->admin_q, queue);
+				vdev->fault_drain_attempted = false;
+				atomic_set(&vdev->io_error, 0);
+				bar->csts.cfs = 0;
 				SWARMIO_INFO("controller enabled\n");
 			}
 			bar->csts.rdy = 1;
-		} else if (bar->cc.en == 0) {
+		} else {
 			if (queue) {
-				unsigned int num_service_units =
-					vdev->config.num_service_units;
-				unsigned int num_workers =
-					vdev->config.num_workers;
-#ifdef CONFIG_SWARMIO_COMMIT
-				unsigned int num_waiting =
-					num_service_units * 2 + num_workers - 1;
-#else
-				unsigned int num_waiting =
-					num_service_units + num_workers - 1;
-#endif
 				struct swarmio_dispatcher *disp;
 				unsigned int qid;
+				int ret = swarmio_quiesce_io(vdev);
 
-				WRITE_ONCE(vdev->stop_flag, 1);
-				while (atomic_read(&vdev->num_waiting) !=
-				       num_waiting) {
-					cond_resched();
+				if (ret) {
+					swarmio_io_fault(vdev, ret);
+					bar->csts.cfs = 1;
+					goto record_cc;
 				}
 
 				for (qid = 1; qid <= vdev->num_sq; qid++) {
@@ -178,15 +374,10 @@ bool swarmio_proc_bars(struct swarmio_dispatcher *dispatcher)
 					vdev_delete_cq(cq);
 				}
 
-				for (i = 0; i < num_service_units; i++) {
+				for (i = 0; i < vdev->num_service_units_initialized; i++) {
 					disp = &vdev->dispatchers[i];
 					disp->qids.start = disp->qids.end = -1;
 				}
-
-				mb();
-
-				WRITE_ONCE(vdev->stop_flag, 0);
-				wake_up_all(&vdev->wait_queue);
 
 				if (queue->nvme_sq) {
 					kfree(queue->nvme_sq);
@@ -198,12 +389,13 @@ bool swarmio_proc_bars(struct swarmio_dispatcher *dispatcher)
 				}
 				kfree(queue);
 				vdev->admin_q = NULL;
+				swarmio_resume_io(vdev);
 				SWARMIO_INFO("controller disabled\n");
 			}
 			bar->csts.rdy = 0;
 		}
 
-		if (bar->cc.shn == 1) {
+		if (((cc >> 14) & 3) == 1) {
 			bar->csts.shst = 2;
 
 			vdev->dbs[0] = vdev->old_dbs[0] = 0;
@@ -213,7 +405,8 @@ bool swarmio_proc_bars(struct swarmio_dispatcher *dispatcher)
 				vdev->admin_q->cq_head = 0;
 		}
 
-		old_bar->cc = bar->u_cc;
+record_cc:
+		old_bar->cc = cc;
 
 		goto out;
 	}
@@ -235,7 +428,7 @@ err_enable_admin_queue:
 /// @brief 由 dispatcher 0 处理管理 SQ doorbell 及管理命令，并跟踪管理 CQ 的消费位置。
 static bool swarmio_proc_admin_queues(struct swarmio_dispatcher *dispatcher)
 {
-	if (dispatcher->id != 0) {
+	if (dispatcher->id != 0 || !vdev->admin_q) {
 		return false;
 	}
 	bool updated = false;
@@ -288,6 +481,9 @@ swarmio_proc_submission_queues(struct swarmio_dispatcher *dispatcher)
 		return false;
 
 	for (qid = start; qid <= end; qid += stride) {
+		if (unlikely(READ_ONCE(vdev->stop_flag) ||
+			     atomic_read(&vdev->io_error)))
+			break;
 #ifdef CONFIG_SWARMIO_DISP_PREFETCH_SQE
 		int next_qid = qid + stride;
 		if (next_qid > end)
@@ -318,8 +514,10 @@ static bool vdev_proc_dbs(struct swarmio_dispatcher *dispatcher)
 {
 	bool updated = false;
 
-	updated |= swarmio_proc_admin_queues(dispatcher);
-	updated |= swarmio_proc_submission_queues(dispatcher);
+	if (likely(!atomic_read(&vdev->io_error))) {
+		updated |= swarmio_proc_admin_queues(dispatcher);
+		updated |= swarmio_proc_submission_queues(dispatcher);
+	}
 
 	return updated;
 }
@@ -329,14 +527,14 @@ static int swarmio_dispatcher_thread_fn(void *data)
 {
 	struct swarmio_dispatcher *dispatcher =
 		(struct swarmio_dispatcher *)data;
-	static unsigned long last_dispatched_time = 0;
-	static unsigned int i;
+	unsigned long last_dispatched_time = jiffies;
+	unsigned int i;
 
 	SWARMIO_DEBUG("%s started on cpu %d (node %d)\n",
 		      dispatcher->thread_name, dispatcher->cpu_id,
 		      cpu_to_node(dispatcher->cpu_id));
 
-	for (i = 0; i < dispatcher->num_workers;) {
+	for (i = 0; i < dispatcher->num_workers && !kthread_should_stop();) {
 		if (dispatcher->workers[i] != NULL) {
 			i++;
 		} else {
@@ -345,6 +543,25 @@ static int swarmio_dispatcher_thread_fn(void *data)
 	}
 
 	while (!kthread_should_stop()) {
+		if (unlikely(!READ_ONCE(vdev->is_threads_initialized) &&
+			     !READ_ONCE(vdev->unload_prepared))) {
+			schedule_timeout_interruptible(1);
+			continue;
+		}
+		if (!dispatcher->id) {
+			if (unlikely(smp_load_acquire(&vdev->unload_requested))) {
+				swarmio_handle_unload(vdev);
+				continue;
+			}
+			if (unlikely(READ_ONCE(vdev->unload_prepared))) {
+				/* The bound Linux NVMe driver may request shutdown on remove. */
+				if (vdev->bar->cc.shn)
+					vdev->bar->csts.shst = 2;
+				schedule_timeout_interruptible(1);
+				continue;
+			}
+			swarmio_handle_io_fault(vdev);
+		}
 		if (swarmio_proc_bars(dispatcher))
 			last_dispatched_time = jiffies;
 		if (vdev_proc_dbs(dispatcher))
@@ -390,6 +607,7 @@ int swarmio_dispatcher_init(struct nvme_vdev *vdev)
 
 	for (i = 0; i < num_service_units; i++) {
 		dispatcher = &vdev->dispatchers[i];
+		vdev->num_service_units_initialized++;
 
 		dispatcher->id = i;
 		dispatcher->num_workers = num_workers_per_service_unit;
@@ -451,6 +669,8 @@ int swarmio_dispatcher_init(struct nvme_vdev *vdev)
 			if (ret) {
 				SWARMIO_ERROR("%s: dma ctx init failed!\n",
 					      dispatcher->thread_name);
+				kfree(dispatcher->dma_ctx);
+				dispatcher->dma_ctx = NULL;
 				goto err;
 			}
 			SWARMIO_DEBUG("%s assigned %s\n",
@@ -478,7 +698,6 @@ int swarmio_dispatcher_init(struct nvme_vdev *vdev)
 		}
 		kthread_bind(dispatcher->task_struct, dispatcher->cpu_id);
 		wake_up_process(dispatcher->task_struct);
-		vdev->num_service_units_initialized++;
 	}
 
 	return 0;
@@ -579,8 +798,8 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 			dispatcher->dma_ctx, cmd_buffer_dma, sq_dma(sq_entry),
 			sizeof(struct nvme_command), NULL, NULL);
 		if (unlikely(ret)) {
-			__swarmio_disable_disp_dma();
-			src = __sq_entry_at(sq, sq_entry);
+			swarmio_io_fault(vdev, ret);
+			return false;
 		}
 	} else {
 		src = __sq_entry_at(sq, sq_entry);
@@ -659,6 +878,7 @@ void swarmio_prefetch_sq(int qid, struct swarmio_dispatcher *dispatcher)
 	int new_db = vdev->dbs[dbs_idx];
 	struct nvme_submission_queue *sq = vdev->sqes[qid];
 	int pref_size;
+	int ret;
 	dma_addr_t cmd_buffer_dma;
 
 	if (unlikely(!sq))
@@ -679,12 +899,13 @@ void swarmio_prefetch_sq(int qid, struct swarmio_dispatcher *dispatcher)
 
 	cmd_buffer_dma = sq->cmd_buffer_dma +
 			 sq->fetched_pos * sizeof(struct nvme_command);
-	if (unlikely(dsa_dma_issue_async_single(
+	ret = dsa_dma_issue_async_single(
 		    dispatcher->dma_ctx, cmd_buffer_dma,
 		    sq_dma(sq->fetched_pos),
 		    sizeof(struct nvme_command) * pref_size, &sq->dma_desc_id,
-		    NULL, NULL))) {
-		__swarmio_disable_disp_dma();
+		    NULL, NULL);
+	if (unlikely(ret)) {
+		swarmio_io_fault(vdev, ret);
 		return;
 	}
 	sq->is_pref_issued = true;
@@ -752,10 +973,8 @@ int swarmio_dispatch_sq(int sqid, int new_db, int old_db,
 			}
 #endif
 			if (ret) {
-				__swarmio_disable_disp_dma();
-				memcpy(sq->cmd_buffer + sq->fetched_pos,
-				       __sq_entry_at(sq, sq->fetched_pos),
-				       sizeof(struct nvme_command) * num_fetch);
+				swarmio_io_fault(vdev, ret);
+				return old_db;
 			}
 		} else {
 			memcpy(sq->cmd_buffer + sq->fetched_pos,

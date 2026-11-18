@@ -76,6 +76,11 @@ struct nvme_vdev {
 	wait_queue_head_t wait_queue;
 	int stop_flag; /**< 重置控制器或分配队列时使用的暂停标志。 */
 	atomic_t num_waiting; /**< 已经进入暂停屏障的服务线程数。 */
+	atomic_t io_error; /**< 本轮首个 I/O 故障，通过 CSTS.CFS 通知客户端。 */
+	bool fault_drain_attempted;
+	bool unload_requested;
+	bool unload_prepared;
+	int unload_result;
 
 	bool dsa_enabled; /**< 记录是否已启用 DSA 设备，供错误和卸载清理使用。 */
 	bool is_threads_initialized;

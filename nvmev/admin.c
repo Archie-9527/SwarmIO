@@ -113,7 +113,14 @@ static void admin_create_cq(int eid)
 	unsigned int num_pages, i;
 	int dbs_idx;
 
+	if (!cmd->cqid || cmd->cqid > vdev->num_cq ||
+	    vdev->cqes[cmd->cqid] || cmd->qsize >= NR_MAX_QUEUE_SIZE) {
+		__make_cq_entry(eid, NVME_SC_INVALID_FIELD | NVME_STATUS_DNR);
+		return;
+	}
 	cq = kzalloc(sizeof(struct nvme_completion_queue), GFP_KERNEL);
+	if (!cq)
+		goto err;
 
 	cq->qid = cmd->cqid;
 
@@ -144,6 +151,8 @@ static void admin_create_cq(int eid)
 		cq->queue_size * sizeof(struct nvme_completion), PAGE_SIZE);
 	cq->cq = kzalloc(sizeof(struct nvme_completion *) * num_pages,
 			 GFP_KERNEL);
+	if (!cq->cq)
+		goto err;
 
 	if (pfn_valid(cmd->prp1 >> PAGE_SHIFT)) {
 		cq->mapped = NULL;
@@ -152,6 +161,8 @@ static void admin_create_cq(int eid)
 	} else {
 		cq->mapped =
 			memremap(cmd->prp1, num_pages * PAGE_SIZE, MEMREMAP_WT);
+		if (!cq->mapped)
+			goto err;
 		for (i = 0; i < num_pages; i++)
 			cq->cq[i] =
 				(void *)((uint64_t)cq->mapped + i * PAGE_SIZE);
@@ -163,6 +174,10 @@ static void admin_create_cq(int eid)
 	vdev->dbs[dbs_idx] = vdev->old_dbs[dbs_idx] = 0;
 
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
+	return;
+err:
+	vdev_delete_cq(cq);
+	__make_cq_entry(eid, NVME_SC_INTERNAL | NVME_STATUS_DNR);
 }
 
 static void admin_delete_cq(int eid)
@@ -170,14 +185,36 @@ static void admin_delete_cq(int eid)
 	struct nvme_admin_queue *queue = vdev->admin_q;
 	struct nvme_completion_queue *cq;
 	unsigned int qid;
+	unsigned int sqid;
 
 	qid = __admin_sq_entry_at(queue, eid)->delete_queue.qid;
+	if (!qid || qid > vdev->num_cq || !vdev->cqes[qid]) {
+		__make_cq_entry(eid, NVME_SC_INVALID_FIELD | NVME_STATUS_DNR);
+		return;
+	}
+	if (swarmio_pause_io(vdev))
+		goto busy;
+	for (sqid = 1; sqid <= vdev->num_sq; sqid++) {
+		struct nvme_submission_queue *sq = vdev->sqes[sqid];
+
+		if (sq && sq->cqid == qid)
+			goto resume_busy;
+	}
+	if (swarmio_queue_busy(vdev, qid, false))
+		goto resume_busy;
 
 	cq = vdev->cqes[qid];
 	vdev->cqes[qid] = NULL;
 	vdev_delete_cq(cq);
 
+	swarmio_resume_io(vdev);
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
+	return;
+
+resume_busy:
+	swarmio_resume_io(vdev);
+busy:
+	__make_cq_entry(eid, NVME_SC_CMD_SEQ_ERROR);
 }
 
 /**
@@ -197,7 +234,15 @@ static void admin_create_sq(int eid)
 		sizeof(struct nvme_command) * NR_MAX_QUEUE_SIZE;
 	unsigned long cmd_buffer_start;
 
+	if (!cmd->sqid || cmd->sqid > vdev->num_sq ||
+	    vdev->sqes[cmd->sqid] || cmd->qsize >= NR_MAX_QUEUE_SIZE ||
+	    !cmd->cqid || cmd->cqid > vdev->num_cq || !vdev->cqes[cmd->cqid]) {
+		__make_cq_entry(eid, NVME_SC_INVALID_FIELD | NVME_STATUS_DNR);
+		return;
+	}
 	sq = kzalloc(sizeof(struct nvme_submission_queue), GFP_KERNEL);
+	if (!sq)
+		goto err;
 
 	sq->qid = cmd->sqid;
 	sq->cqid = cmd->cqid;
@@ -217,9 +262,13 @@ static void admin_create_sq(int eid)
 	defined(CONFIG_SWARMIO_PROFILE_REQ)
 	sq->nsecs_starts = kzalloc(sizeof(unsigned long long) * sq->queue_size,
 				   GFP_KERNEL);
+	if (!sq->nsecs_starts)
+		goto err;
 #endif
 	sq->nsecs_targets = kzalloc(sizeof(unsigned long long) * sq->queue_size,
 				    GFP_KERNEL);
+	if (!sq->nsecs_targets)
+		goto err;
 #endif
 
 	cmd_buffer_start =
@@ -230,7 +279,7 @@ static void admin_create_sq(int eid)
 	if (unlikely(!sq->cmd_buffer)) {
 		SWARMIO_ERROR("Failed to memremap cmd buffer for SQ %d\n",
 			      sq->qid);
-		__make_cq_entry(eid, NVME_SC_INTERNAL | NVME_STATUS_DNR);
+		goto err;
 	}
 
 	/* TODO Physically non-contiguous prp list */
@@ -239,6 +288,8 @@ static void admin_create_sq(int eid)
 	num_pages = DIV_ROUND_UP(sq->queue_size * sizeof(struct nvme_command),
 				 PAGE_SIZE);
 	sq->sq = kzalloc(sizeof(struct nvme_command *) * num_pages, GFP_KERNEL);
+	if (!sq->sq)
+		goto err;
 
 	sq->dma_addr = cmd->prp1;
 	if (pfn_valid(cmd->prp1 >> PAGE_SHIFT)) {
@@ -248,6 +299,8 @@ static void admin_create_sq(int eid)
 	} else {
 		sq->mapped =
 			memremap(cmd->prp1, num_pages * PAGE_SIZE, MEMREMAP_WT);
+		if (!sq->mapped)
+			goto err;
 		for (i = 0; i < num_pages; i++)
 			sq->sq[i] =
 				(void *)((uint64_t)sq->mapped + i * PAGE_SIZE);
@@ -260,6 +313,10 @@ static void admin_create_sq(int eid)
 	vdev->old_dbs[dbs_idx] = 0;
 
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
+	return;
+err:
+	vdev_delete_sq(sq);
+	__make_cq_entry(eid, NVME_SC_INTERNAL | NVME_STATUS_DNR);
 }
 
 static void admin_delete_sq(int eid)
@@ -271,11 +328,25 @@ static void admin_delete_sq(int eid)
 	unsigned int qid;
 
 	qid = cmd->qid;
+	if (!qid || qid > vdev->num_sq || !vdev->sqes[qid]) {
+		__make_cq_entry(eid, NVME_SC_INVALID_FIELD | NVME_STATUS_DNR);
+		return;
+	}
+	if (swarmio_pause_io(vdev)) {
+		__make_cq_entry(eid, NVME_SC_CMD_SEQ_ERROR);
+		return;
+	}
+	if (swarmio_queue_busy(vdev, qid, true)) {
+		swarmio_resume_io(vdev);
+		__make_cq_entry(eid, NVME_SC_CMD_SEQ_ERROR);
+		return;
+	}
 
 	sq = vdev->sqes[qid];
 	vdev->sqes[qid] = NULL;
 	vdev_delete_sq(sq);
 
+	swarmio_resume_io(vdev);
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
 }
 
@@ -404,7 +475,7 @@ static void admin_identify_namespaces(int eid)
 	int i;
 
 	ns = prp_address(cmd->dptr.prp1);
-	memset(ns, 0x00, PAGE_SIZE * 2);
+	memset(ns, 0x00, NVME_IDENTIFY_DATA_SIZE);
 
 	for (i = 1; i <= vdev->num_ns; i++) {
 		if (i > cmd->nsid) {
@@ -511,18 +582,17 @@ static void admin_set_features(int eid)
 		int j = 1;
 		int qid, dbs_idx;
 		unsigned int num_service_units = vdev->config.num_service_units;
-		unsigned int num_workers = vdev->config.num_workers;
-#ifdef CONFIG_SWARMIO_COMMIT
-		unsigned int num_waiting =
-			num_service_units * 2 + num_workers - 1;
-#else
-		unsigned int num_waiting = num_service_units + num_workers - 1;
-#endif
 		struct swarmio_dispatcher *dispatcher;
 
-		WRITE_ONCE(vdev->stop_flag, 1);
-		while (atomic_read(&vdev->num_waiting) != num_waiting) {
-			cond_resched();
+		for (qid = 1; qid <= max(vdev->num_sq, vdev->num_cq); qid++) {
+			if (vdev->sqes[qid] || vdev->cqes[qid]) {
+				__make_cq_entry(eid, NVME_SC_CMD_SEQ_ERROR);
+				return;
+			}
+		}
+		if (swarmio_pause_io(vdev)) {
+			__make_cq_entry(eid, NVME_SC_INTERNAL | NVME_STATUS_DNR);
+			return;
 		}
 
 		// # of sq in 0-base
@@ -585,10 +655,7 @@ static void admin_set_features(int eid)
 					dispatcher->qids.stride);
 		}
 
-		mb();
-
-		WRITE_ONCE(vdev->stop_flag, 0);
-		wake_up_all(&vdev->wait_queue);
+		swarmio_resume_io(vdev);
 	}
 	case NVME_FEAT_IRQ_COALESCE:
 	case NVME_FEAT_IRQ_CONFIG:

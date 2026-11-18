@@ -63,6 +63,8 @@ static unsigned int num_workers_per_service_unit = 1; /**< 每个服务单元的
 
 static char *cpus; /**< 线程绑定使用的 CPU 列表，支持逗号和范围表示法。 */
 
+static bool unload_ready;
+
 int dma_batch_size = 2; /**< 每个 worker DSA BATCH 的子描述符容量。 */
 int num_dma_descs_per_disp = 2; /**< 每个 dispatcher 的单操作描述符数。 */
 int num_dma_descs_per_worker = 2; /**< 每个 worker 的描述符槽数，批处理模式下按外层 BATCH 计。 */
@@ -140,12 +142,55 @@ MODULE_PARM_DESC(num_dma_descs_per_disp,
 module_param(num_dma_descs_per_worker, int, 0644);
 MODULE_PARM_DESC(num_dma_descs_per_worker,
 		 "Number of DMA descriptors per I/O worker");
-module_param(disp_using_dma, bool, 0644);
+module_param(disp_using_dma, bool, 0444);
 MODULE_PARM_DESC(disp_using_dma, "Enable/Disable dispatcher DMA");
-module_param(worker_using_dma, bool, 0644);
+module_param(worker_using_dma, bool, 0444);
 MODULE_PARM_DESC(worker_using_dma, "Enable/Disable worker DMA");
 module_param(dma_timeout, int, 0644);
 MODULE_PARM_DESC(dma_timeout, "DMA timeout in milliseconds");
+
+static int prepare_unload_set(const char *value, const struct kernel_param *kp)
+{
+	struct nvme_vdev *device;
+	bool prepare;
+	int ret = kstrtobool(value, &prepare);
+
+	if (ret || !prepare)
+		return -EINVAL;
+	if (unload_ready)
+		return 0;
+	device = READ_ONCE(vdev);
+	if (!device || !READ_ONCE(device->is_threads_initialized))
+		return -ENODEV;
+
+	if (!READ_ONCE(device->unload_prepared)) {
+		smp_store_release(&device->unload_requested, true);
+		wake_up_process(device->dispatchers[0].task_struct);
+		if (!wait_event_timeout(device->wait_queue,
+					!smp_load_acquire(&device->unload_requested),
+					msecs_to_jiffies(2 * SWARMIO_STOP_TIMEOUT_MS + 1000)))
+			return -ETIMEDOUT;
+		ret = device->unload_result;
+		if (ret)
+			return ret;
+	}
+
+	unload_ready = true;
+	module_put(THIS_MODULE);
+	return 0;
+}
+
+static int prepare_unload_get(char *buffer, const struct kernel_param *kp)
+{
+	return sprintf(buffer, "%d\n", unload_ready);
+}
+
+static const struct kernel_param_ops prepare_unload_ops = {
+	.set = prepare_unload_set,
+	.get = prepare_unload_get,
+};
+module_param_cb(prepare_unload, &prepare_unload_ops, NULL, 0600);
+MODULE_PARM_DESC(prepare_unload, "Drain active I/O before removing the module");
 
 module_param(dsa_num_devs, uint, 0444);
 MODULE_PARM_DESC(dsa_num_devs, "Number of DSA devices to enable (Default: 1)");
@@ -430,6 +475,7 @@ static int swarmio_init(void)
 	init_waitqueue_head(&vdev->wait_queue);
 	WRITE_ONCE(vdev->stop_flag, 0);
 	atomic_set(&vdev->num_waiting, 0);
+	atomic_set(&vdev->io_error, 0);
 #ifdef CONFIG_SWARMIO_COMMIT
 	ret = swarmio_committer_init(vdev);
 	if (ret)
@@ -441,7 +487,9 @@ static int swarmio_init(void)
 	ret = swarmio_dispatcher_init(vdev);
 	if (ret)
 		goto err_workers;
-	vdev->is_threads_initialized = true;
+	/* module_exit cannot report an unsuccessful drain. */
+	__module_get(THIS_MODULE);
+	WRITE_ONCE(vdev->is_threads_initialized, true);
 
 	pci_bus_add_devices(vdev->virt_bus);
 
@@ -468,6 +516,7 @@ err_vdev_init:
 /// @brief 移除虚拟 PCI 设备，停止服务线程并释放 DSA 和设备资源。
 static void swarmio_exit(void)
 {
+	WRITE_ONCE(vdev->is_threads_initialized, false);
 	vdev_stop_pci(vdev);
 
 	swarmio_dispatcher_exit(vdev);
