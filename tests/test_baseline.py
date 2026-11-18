@@ -11,9 +11,21 @@ ROOT = Path(__file__).resolve().parents[1]
 AUTHOR = '25594a1a763044d3d459fd15ccebc5d44d1690ca'
 AUTHOR_BAM_PATCHED = '98c3a3a'
 
+DOXYGEN_COMMENTS = re.compile(
+    r'^[ \t]*/\*\*(?!<)[\s\S]*?\*/[ \t]*\n'
+    r'|^[ \t]*///[^\n]*\n'
+    r'|[ \t]+/\*\*<[^\n]*?\*/(?=[ \t]*$)',
+    re.MULTILINE,
+)
+
 
 def original(repo, ref, path):
     return subprocess.check_output(['git', '-C', str(repo), 'show', f'{ref}:{path}'], text=True)
+
+
+def without_doxygen(source):
+    """Keep the byte-for-byte provenance comparison outside Doxygen comments."""
+    return DOXYGEN_COMMENTS.sub('', source)
 
 
 class BaselineTests(unittest.TestCase):
@@ -36,19 +48,21 @@ class BaselineTests(unittest.TestCase):
                      'src/worker.c', 'src/committer.c', 'src/queue.h',
                      'src/simple_timing_model.c', 'nvmev/admin.c', 'nvmev/nvme_vdev.c'):
             with self.subTest(file=name):
-                self.assertEqual((ROOT / name).read_text(), original(ROOT, AUTHOR, name))
+                self.assertEqual(without_doxygen((ROOT / name).read_text()),
+                                 without_doxygen(original(ROOT, AUTHOR, name)))
         for name in ('dsa/dsa.h', 'dsa/batch.c', 'dsa/single.c'):
             with self.subTest(file=name):
-                self.assertEqual((ROOT / name).read_text(),
-                                 original(ROOT, AUTHOR, name).replace('inline bool __dsa_', 'bool __dsa_'))
+                authored = original(ROOT, AUTHOR, name).replace('inline bool __dsa_', 'bool __dsa_')
+                self.assertEqual(without_doxygen((ROOT / name).read_text()),
+                                 without_doxygen(authored))
 
     def test_bam_workload_and_queue_protocol_are_author_patch(self):
         for name in ('benchmarks/block/main.cu', 'include/page_cache.h',
                      'include/nvm_parallel_queue.h', 'include/ctrl.h',
                      'include/buffer.h', 'src/rpc.cpp'):
             with self.subTest(file=name):
-                self.assertEqual((ROOT / 'bam' / name).read_text(),
-                                 original(ROOT / 'bam', AUTHOR_BAM_PATCHED, name))
+                self.assertEqual(without_doxygen((ROOT / 'bam' / name).read_text()),
+                                 without_doxygen(original(ROOT / 'bam', AUTHOR_BAM_PATCHED, name)))
 
     def test_shell_syntax(self):
         for path in (ROOT / 'scripts').glob('*.sh'):

@@ -3,6 +3,10 @@
  * Copyright (C) 2026 VIA-Research
  */
 
+/**
+ * @file
+ * @brief Intel DSA 设备参数、WQ 分配和描述符执行接口。
+ */
 #ifndef __SWARMIO_DSA_H
 #define __SWARMIO_DSA_H
 
@@ -29,7 +33,9 @@
 #define DSA_MAX_PRIORITY 15
 #define DSA_MAX_NUM_DESCS_PER_THREAD 64
 
+/// @brief 部分填充批次的自适应提交等待上限，单位为微秒。
 #define DSA_BATCH_MAX_SUBMIT_TIMEOUT_US 5LL
+/// @brief 两轮批次回收之间的自适应等待上限，单位为微秒。
 #define DSA_BATCH_MAX_SYNC_TIMEOUT_US 5LL
 
 enum dsa_wq_alloc_mode {
@@ -37,13 +43,14 @@ enum dsa_wq_alloc_mode {
 	DSA_WQ_ALLOC_DEV_INTERLEAVE,
 };
 
+/// @brief 模块加载参数传入的 DSA 设备、组、队列及引擎配置。
 struct dsa_cfg_params {
 	unsigned int num_devs;
 	unsigned int num_groups_per_dev;
 	unsigned int num_wqs_per_group;
 	unsigned int num_engines_per_group;
-	const unsigned int *wq_sizes;
-	const unsigned int *wq_priorities;
+	const unsigned int *wq_sizes; /**< 按组内 WQ 编号给出的队列容量。 */
+	const unsigned int *wq_priorities; /**< 按组内 WQ 编号给出的硬件优先级。 */
 };
 
 struct dsa_engine_cfg {
@@ -56,6 +63,7 @@ struct dsa_wq_cfg {
 	int group_id;
 };
 
+/// @brief 一个 DSA group 使用的 WQ 和 engine 编号集合。
 struct dsa_group_cfg {
 	int wq_ids[DSA_MAX_WQS];
 	int engine_ids[DSA_MAX_ENGINES];
@@ -68,13 +76,14 @@ struct dsa_dev_cfg {
 	int num_groups;
 };
 
+/// @brief 一个线程持有的单描述符 DSA 上下文。
 struct dsa_dma_ctx_single {
-	struct idxd_desc **single_descs;
+	struct idxd_desc **single_descs; /**< 预先从 IDXD WQ 分配的 MEMMOVE 描述符。 */
 
 	struct idxd_wq *wq;
-	void **data;
+	void **data; /**< 完成时传回调用方的上下文，按描述符槽编号索引。 */
 
-	DECLARE_BITMAP(issued_mask, DSA_MAX_NUM_DESCS_PER_THREAD);
+	DECLARE_BITMAP(issued_mask, DSA_MAX_NUM_DESCS_PER_THREAD); /**< 软件记录的在途描述符集合。 */
 
 	unsigned long last_wait_time;
 	int num_descs;
@@ -85,39 +94,41 @@ struct dsa_dma_ctx_single {
 	int timeout;
 };
 
+/// @brief 一个外层 BATCH 及其子描述符、完成记录和软件上下文。
 struct dsa_batch_desc {
-	struct idxd_desc *idxd_desc;
+	struct idxd_desc *idxd_desc; /**< 向 IDXD WQ 投递的外层 BATCH 描述符。 */
 
-	struct dsa_hw_desc *lv2_hw_descs;
-	struct dsa_completion_record *lv2_compls;
+	struct dsa_hw_desc *lv2_hw_descs; /**< 外层描述符引用的子操作数组，通常为 MEMMOVE。 */
+	struct dsa_completion_record *lv2_compls; /**< 各子操作的设备完成记录。 */
 
-	void **data;
+	void **data; /**< 每个子描述符对应的回调参数。 */
 	struct list_head node;
 	int id;
 
-	int num_filled;
+	int num_filled; /**< 已填充的子描述符数，包含尾批补入的 NOOP。 */
 };
 
+/// @brief 每个 worker 的批次资源池和提交、回收状态。
 struct dsa_dma_ctx_batch {
 	struct dsa_batch_desc *batch_descs;
 	struct dsa_hw_desc *lv2_hw_desc_list;
 	struct dsa_completion_record *lv2_compl_list;
-	dma_addr_t lv2_hw_desc_list_dma;
-	dma_addr_t lv2_compl_list_dma;
+	dma_addr_t lv2_hw_desc_list_dma; /**< 设备读取子描述符数组所用的 DMA 基地址。 */
+	dma_addr_t lv2_compl_list_dma; /**< 设备写入子操作完成记录的 DMA 基地址。 */
 
 	struct idxd_wq *wq;
 	void **data_list;
 
-	struct list_head issued_descs;
-	DECLARE_BITMAP(issued_mask, DSA_MAX_NUM_DESCS_PER_THREAD);
+	struct list_head issued_descs; /**< 按提交顺序保存的在途批次，回收时取队首。 */
+	DECLARE_BITMAP(issued_mask, DSA_MAX_NUM_DESCS_PER_THREAD); /**< 软件跟踪的在途批次集合。 */
 
 	u64 start_issue_time;
 	u64 last_wait_time;
-	s64 batch_issue_timeout_ns;
-	s64 batch_sync_timeout_ns;
-	int batch_size;
+	s64 batch_issue_timeout_ns; /**< 等待填满尾批的时间阈值，单位为纳秒。 */
+	s64 batch_sync_timeout_ns; /**< 触发回收最老在途批次的时间阈值，单位为纳秒。 */
+	int batch_size; /**< 每个外层 BATCH 的子描述符容量。 */
 	int num_descs;
-	int curr_desc;
+	int curr_desc; /**< 当前可填充的描述符槽，达到 num_descs 表示没有空槽。 */
 	int curr_num_filled;
 
 	int dev_id;
@@ -125,6 +136,16 @@ struct dsa_dma_ctx_batch {
 	int timeout;
 };
 
+/**
+ * @brief 初始化 DSA 硬件描述符的通用操作、地址与完成记录字段。
+ * @param[out] hw 待写入的硬件描述符。
+ * @param opcode DSA 操作码，例如 MEMMOVE 或 BATCH。
+ * @param src_addr 源地址，BATCH 时为子描述符数组的 DMA 地址。
+ * @param dst_addr 目的地址，未使用的操作可传 0。
+ * @param xfer_size MEMMOVE 的字节数，BATCH 时用于填写子描述符个数。
+ * @param compl_dma 设备写入完成记录的 DMA 地址。
+ * @param flags 描述符标志，例如请求写入设备完成记录。
+ */
 static inline void __dsa_prep_hw_desc(struct dsa_hw_desc *hw, char opcode,
 				      u64 src_addr, u64 dst_addr, u64 xfer_size,
 				      u64 compl_dma, u32 flags)
@@ -138,6 +159,12 @@ static inline void __dsa_prep_hw_desc(struct dsa_hw_desc *hw, char opcode,
 	hw->completion_addr = compl_dma;
 }
 
+/**
+ * @brief 轮询 IDXD 描述符的设备完成记录。
+ * @param desc 已提交的 IDXD 描述符。
+ * @param timeout 软件轮询时限，单位为毫秒。
+ * @warning 超时只结束本次轮询。调用方仍需检查 status，设备也可能仍在执行。
+ */
 static inline void __dsa_sync_wait(struct idxd_desc *desc, int timeout)
 {
 	unsigned long timeout_jiffies = jiffies + msecs_to_jiffies(timeout);

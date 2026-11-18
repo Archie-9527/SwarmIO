@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief SwarmIO 模块入口、加载参数、预留内存划分和服务线程生命周期。
+ */
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/types.h>
@@ -42,29 +46,29 @@
  *
  ****************************************************************/
 
-static unsigned long memmap_start = 0;
-static unsigned long memmap_size = 0;
+static unsigned long memmap_start = 0; /**< 虚拟设备使用的预留物理内存起点。 */
+static unsigned long memmap_size = 0; /**< 预留物理内存范围的字节数。 */
 
-static unsigned int read_sched_delay = 1;
-static unsigned int read_min_delay = 1;
+static unsigned int read_sched_delay = 1; /**< READ 占用模型调度单元的时间，单位为纳秒。 */
+static unsigned int read_min_delay = 1; /**< READ 服务结束到允许发布完成的附加时延，单位为纳秒。 */
 
-static unsigned int write_sched_delay = 1;
-static unsigned int write_min_delay = 1;
+static unsigned int write_sched_delay = 1; /**< WRITE 占用模型调度单元的时间，单位为纳秒。 */
+static unsigned int write_min_delay = 1; /**< WRITE 服务结束到允许发布完成的附加时延，单位为纳秒。 */
 
-static unsigned int num_sched_insts = 8;
-static unsigned int io_unit_shift = 12;
+static unsigned int num_sched_insts = 8; /**< 时序模型中的调度实例数量。 */
+static unsigned int io_unit_shift = 12; /**< 模型 I/O 单元大小的以 2 为底的指数。 */
 
-static unsigned int num_service_units = 1;
-static unsigned int num_workers_per_service_unit = 1;
+static unsigned int num_service_units = 1; /**< 服务单元数，每个单元有一个 dispatcher。 */
+static unsigned int num_workers_per_service_unit = 1; /**< 每个服务单元的 worker 数。 */
 
-static char *cpus;
+static char *cpus; /**< 线程绑定使用的 CPU 列表，支持逗号和范围表示法。 */
 
-int dma_batch_size = 2;
-int num_dma_descs_per_disp = 2;
-int num_dma_descs_per_worker = 2;
-bool disp_using_dma = true;
-bool worker_using_dma = true;
-int dma_timeout = 5000;
+int dma_batch_size = 2; /**< 每个 worker DSA BATCH 的子描述符容量。 */
+int num_dma_descs_per_disp = 2; /**< 每个 dispatcher 的单操作描述符数。 */
+int num_dma_descs_per_worker = 2; /**< 每个 worker 的描述符槽数，批处理模式下按外层 BATCH 计。 */
+bool disp_using_dma = true; /**< 运行时取 SQE 是否使用 DSA。 */
+bool worker_using_dma = true; /**< 运行时搬运 payload 是否使用 DSA。 */
+int dma_timeout = 5000; /**< 单次等待 DSA 完成记录的轮询时限，单位为毫秒。 */
 
 /* DSA params */
 static unsigned int dsa_num_devs = 1;
@@ -239,6 +243,7 @@ static int __validate_configs(void)
 	return 0;
 }
 
+/// @brief 检查服务单元、WQ 数量及描述符容量是否满足 DMA 配置。
 static int __init __validate_dsa_params(void)
 {
 	unsigned int total_dsa_groups;
@@ -300,6 +305,11 @@ static int __init __validate_dsa_params(void)
 	return 0;
 }
 
+/**
+ * @brief 校验模块参数并建立后备 DRAM、SQE 暂存区和 CPU 绑定配置。
+ * @param[out] config 待写入的模块配置。
+ * @return 成功返回 0，失败返回负错误码。
+ */
 static int __load_configs(struct swarmio_cfg *config)
 {
 	bool first = true;
@@ -365,6 +375,11 @@ static int __load_configs(struct swarmio_cfg *config)
 	return 0;
 }
 
+/**
+ * @brief 初始化虚拟设备和 DSA，启动服务线程后发布虚拟 PCI 设备。
+ * @return 成功返回 0，初始化失败返回负错误码。
+ * @note DSA 启用失败时，两个运行时 DMA 开关都会清零。
+ */
 static int swarmio_init(void)
 {
 	int ret = 0;
@@ -450,6 +465,7 @@ err_vdev_init:
 	return ret ? ret : -EIO;
 }
 
+/// @brief 移除虚拟 PCI 设备，停止服务线程并释放 DSA 和设备资源。
 static void swarmio_exit(void)
 {
 	vdev_stop_pci(vdev);

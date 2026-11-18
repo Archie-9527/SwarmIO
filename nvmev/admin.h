@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief 虚拟 NVMe 管理命令处理与队列销毁接口。
+ */
 #ifndef _SWARMIO_ADMIN_H
 #define _SWARMIO_ADMIN_H
 

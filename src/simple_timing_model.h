@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief 面向预留 DRAM 后备区的请求时序模型接口。
+ */
 #ifndef _SWARMIO_SIMPLE_TIMING_MODEL_H
 #define _SWARMIO_SIMPLE_TIMING_MODEL_H
 

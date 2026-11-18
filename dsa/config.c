@@ -3,6 +3,10 @@
  * Copyright (C) 2026 VIA-Research
  */
 
+/**
+ * @file
+ * @brief DSA engine、WQ、group 与设备的默认配置表。
+ */
 #include "dsa.h"
 
 struct dsa_engine_cfg dsa_engine_cfg_list[DSA_MAX_ENGINES] = {

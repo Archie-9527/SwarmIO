@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief 通过 /proc/swarmio 暴露时序配置和可选的请求统计。
+ */
 #include <linux/delay.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
@@ -220,6 +224,7 @@ static const struct file_operations proc_file_fops = {
 };
 #endif
 
+/// @brief 创建运行参数和统计的 procfs 入口。
 int swarmio_proc_init(struct nvme_vdev *vdev)
 {
 	vdev->proc_root = proc_mkdir("swarmio", NULL);
@@ -247,6 +252,7 @@ int swarmio_proc_init(struct nvme_vdev *vdev)
 	return 0;
 }
 
+/// @brief 移除虚拟设备创建的 procfs 入口。
 void swarmio_proc_exit(struct nvme_vdev *vdev)
 {
 	if (vdev->proc_read_times) {

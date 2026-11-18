@@ -3,6 +3,10 @@
  * Copyright (C) 2026 VIA-Research
  */
 
+/**
+ * @file
+ * @brief 单个 DSA MEMMOVE 描述符的分配、提交、轮询和复用。
+ */
 #include <linux/kernel.h>
 #include <linux/pci.h>
 #include <linux/dma-mapping.h>
@@ -16,6 +20,7 @@
 
 extern struct idxd_device *dsa_idxd_list[DSA_MAX_DEVS];
 
+/// @brief 绑定特定 DSA WQ 并预分配单操作描述符。
 int dsa_dma_ctx_single_init(struct dsa_dma_ctx_single *ctx, int dev_id,
 			    int wq_id, int num_descs, int timeout)
 {
@@ -94,6 +99,7 @@ err_alloc_single_descs:
 	return ret;
 }
 
+/// @brief 释放单操作描述符与软件上下文。调用方负责保证设备已停止访问这些资源。
 void dsa_dma_ctx_single_remove(struct dsa_dma_ctx_single *ctx)
 {
 	int i;
@@ -114,6 +120,17 @@ void dsa_dma_ctx_single_remove(struct dsa_dma_ctx_single *ctx)
 	kfree(ctx->data);
 }
 
+/**
+ * @brief 填写并提交一个 MEMMOVE 描述符。
+ * @param[in,out] ctx 线程私有单操作上下文。
+ * @param dma_dst 设备可见的目的地址。
+ * @param dma_src 设备可见的源地址。
+ * @param size 搬运字节数。
+ * @param[out] desc_id 可选的描述符槽编号输出。
+ * @param data 随描述符保存的完成回调参数。
+ * @param callback 槽位耗尽时用于回收旧描述符的回调，可为空。
+ * @return 提交成功返回 0，失败返回负错误码。
+ */
 int dsa_dma_issue_async_single(struct dsa_dma_ctx_single *ctx,
 			       dma_addr_t dma_dst, dma_addr_t dma_src,
 			       size_t size, int *desc_id, void *data,
@@ -161,6 +178,16 @@ int dsa_dma_issue_async_single(struct dsa_dma_ctx_single *ctx,
 	return 0;
 }
 
+/**
+ * @brief 提交一个 MEMMOVE 并轮询该描述符完成。
+ * @param[in,out] ctx 线程私有单操作上下文。
+ * @param dma_dst 设备可见的目的地址。
+ * @param dma_src 设备可见的源地址。
+ * @param size 搬运字节数。
+ * @param data 完成回调的参数。
+ * @param callback 成功时在当前线程执行的回调，可为空。
+ * @return 搬运成功返回 0，失败返回负错误码。
+ */
 int dsa_dma_issue_sync_single(struct dsa_dma_ctx_single *ctx,
 			      dma_addr_t dma_dst, dma_addr_t dma_src,
 			      size_t size, void *data, void (*callback)(void *))
@@ -177,6 +204,13 @@ int dsa_dma_issue_sync_single(struct dsa_dma_ctx_single *ctx,
 	return ret;
 }
 
+/**
+ * @brief 等待指定描述符的完成状态并在成功时执行回调。
+ * @param[in,out] ctx 线程私有单操作上下文。
+ * @param desc_id 上下文中的描述符槽编号。
+ * @param callback 成功时执行的回调，可为空。
+ * @return 成功返回 0，描述符编号或完成状态异常时返回负错误码。
+ */
 int dsa_dma_wait_one_single(struct dsa_dma_ctx_single *ctx, int desc_id,
 			    void (*callback)(void *))
 {

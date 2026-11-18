@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief SwarmIO 的 procfs 参数与统计入口的初始化、清理接口。
+ */
 #ifndef _SWARMIO_PROC_H
 #define _SWARMIO_PROC_H
 

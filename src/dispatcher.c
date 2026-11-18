@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief 虚拟 NVMe 的 doorbell 轮询、命令取回、时序计算与派发。
+ */
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/ktime.h>
@@ -37,6 +41,11 @@ static inline void __swarmio_disable_disp_dma(void)
 }
 
 /* BAR updates are handled only by dispatcher 0. */
+/**
+ * @brief 处理 BAR 控制器寄存器变化，包括管理队列建立和停用。
+ * @param dispatcher 调用该函数的 dispatcher，只有编号 0 处理寄存器变化。
+ * @return 本次检测并处理了寄存器变化时返回 true。
+ */
 bool swarmio_proc_bars(struct swarmio_dispatcher *dispatcher)
 {
 	if (dispatcher->id != 0) {
@@ -223,6 +232,7 @@ err_enable_admin_queue:
 	goto out;
 }
 
+/// @brief 由 dispatcher 0 处理管理 SQ doorbell 及管理命令，并跟踪管理 CQ 的消费位置。
 static bool swarmio_proc_admin_queues(struct swarmio_dispatcher *dispatcher)
 {
 	if (dispatcher->id != 0) {
@@ -265,6 +275,7 @@ static bool swarmio_proc_admin_queues(struct swarmio_dispatcher *dispatcher)
 	return updated;
 }
 
+/// @brief 轮询本服务单元负责的 I/O SQ，并留下实际已派发的位置。
 static bool
 swarmio_proc_submission_queues(struct swarmio_dispatcher *dispatcher)
 {
@@ -313,6 +324,7 @@ static bool vdev_proc_dbs(struct swarmio_dispatcher *dispatcher)
 	return updated;
 }
 
+/// @brief Dispatcher 内核线程主循环，按顺序检查 BAR 和队列 doorbell。
 static int swarmio_dispatcher_thread_fn(void *data)
 {
 	struct swarmio_dispatcher *dispatcher =
@@ -356,6 +368,7 @@ static int swarmio_dispatcher_thread_fn(void *data)
 	return 0;
 }
 
+/// @brief 创建并绑定服务单元的 dispatcher，按配置附加 DSA 单描述符上下文。
 int swarmio_dispatcher_init(struct nvme_vdev *vdev)
 {
 	unsigned int i, j;
@@ -475,6 +488,7 @@ err:
 	return ret ? ret : -EIO;
 }
 
+/// @brief 停止已启动的 dispatcher 并释放各线程上下文。
 void swarmio_dispatcher_exit(struct nvme_vdev *vdev)
 {
 	unsigned int i, j;
@@ -508,6 +522,14 @@ void swarmio_dispatcher_exit(struct nvme_vdev *vdev)
 	vdev->num_service_units_initialized = 0;
 }
 
+/**
+ * @brief 将一条取回的 SQE 转换为工作项并发布到目标 worker。
+ * @param sqid 提交队列编号。
+ * @param sq_entry SQ 内的命令槽号。
+ * @param[out] io_size 从命令解析得到的传输字节数。
+ * @param dispatcher 当前服务单元的 dispatcher。
+ * @return 成功发布时返回 true。遇到 worker 队列满等情况返回 false。
+ */
 static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 				struct swarmio_dispatcher *dispatcher)
 {
@@ -623,12 +645,14 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 #endif
 
 	/* enqueue into work queue */
+	/// 发布 tail 前，先让 worker 可见同一槽位内的命令和状态。
 	smp_store_release(&local_queue->tail, new_local_queue_tail);
 
 	return true;
 }
 
 #ifdef CONFIG_SWARMIO_DISP_PREFETCH_SQE
+/// @brief 可选地异步提交下一段 SQE 的预取，后续派发时等待该描述符。
 void swarmio_prefetch_sq(int qid, struct swarmio_dispatcher *dispatcher)
 {
 	int dbs_idx = qid * 2;
@@ -670,6 +694,15 @@ void swarmio_prefetch_sq(int qid, struct swarmio_dispatcher *dispatcher)
 }
 #endif
 
+/**
+ * @brief 取回目标 SQ 的新命令，计算时序并逐条入 worker 环。
+ * @param sqid 提交队列编号。
+ * @param new_db 客户端最新发布的 SQ 尾位置。
+ * @param old_db 控制器已派发到的 SQ 位置。
+ * @param dispatcher 负责该 SQ 的 dispatcher。
+ * @return 本轮实际派发后的 SQ 位置，供更新 doorbell 影子值。
+ * @details 合并取命令时用 fetched_pos 单独跟踪已取回的位置，支持取回进度领先于派发进度。
+ */
 int swarmio_dispatch_sq(int sqid, int new_db, int old_db,
 			struct swarmio_dispatcher *dispatcher)
 {

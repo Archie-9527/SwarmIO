@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief 虚拟 PCI 总线、NVMe BAR 和设备中断的实现。
+ */
 #include <linux/pci.h>
 #include <linux/irq.h>
 #include <linux/version.h>
@@ -55,6 +59,7 @@ static void __process_msi_irq(int msi_index)
 }
 #endif
 
+/// @brief 根据设备当前中断配置向主机发出虚拟 NVMe 中断。
 void vdev_signal_irq(int msi_index)
 {
 	if (vdev->pdev->msix_enabled) {
@@ -154,6 +159,11 @@ static struct pci_sysdata vdev_pci_sysdata = {
 	.node = 0,
 };
 
+/**
+ * @brief 映射虚拟 BAR，初始化 NVMe 寄存器及紧随其后的 doorbell 区域。
+ * @param dev 对应的虚拟 PCI 设备。
+ * @return 成功返回 0，映射失败返回负错误码。
+ */
 static int __init_nvme_ctrl_regs(struct pci_dev *dev)
 {
 	struct nvme_ctrl_regs *bar = memremap(pci_resource_start(dev, 0),
@@ -402,6 +412,7 @@ static void PCI_EXTCAP_SETTINGS(struct pci_ext_cap *ext_cap)
 	*/
 }
 
+/// @brief 填写虚拟设备的 PCI 头与 capabilities，再创建供枚举的 PCI 总线。
 int vdev_pci_init(struct nvme_vdev *vdev)
 {
 	PCI_HEADER_SETTINGS(vdev->pcihdr, vdev->config.memmap_start);

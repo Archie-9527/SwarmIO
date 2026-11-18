@@ -3,6 +3,10 @@
  * Copyright (C) 2026 VIA-Research
  */
 
+/**
+ * @file
+ * @brief Worker 数据路径的 DSA BATCH 组装、投递和回收。
+ */
 #include <linux/kernel.h>
 #include <linux/pci.h>
 #include <linux/dma-mapping.h>
@@ -16,6 +20,7 @@
 
 extern struct idxd_device *dsa_idxd_list[DSA_MAX_DEVS];
 
+/// @brief 分配设备可访问的子描述符和设备完成记录数组。
 static int dsa_alloc_lv2_desc_list(struct dsa_dma_ctx_batch *ctx, int len)
 {
 	struct device *dev;
@@ -73,6 +78,7 @@ static void dsa_free_lv2_desc_list(struct idxd_device *idxd,
 	}
 }
 
+/// @brief 为一个批次分配 IDXD 外层描述符并关联子描述符数组。
 static int dsa_alloc_and_prep_batch_desc(struct dsa_batch_desc *batch_desc,
 					 struct idxd_wq *wq,
 					 dma_addr_t lv2_hw_descs_dma,
@@ -112,6 +118,16 @@ static int dsa_alloc_and_prep_batch_desc(struct dsa_batch_desc *batch_desc,
 	return 0;
 }
 
+/**
+ * @brief 为 worker 创建批处理上下文，绑定 WQ 并预分配描述符。
+ * @param[out] ctx 待初始化的上下文。
+ * @param dev_id SwarmIO DSA 设备表的索引。
+ * @param wq_id DSA 设备内的 WQ 编号。
+ * @param batch_size 每个批次可容纳的子描述符数。
+ * @param num_descs 预分配的外层 BATCH 描述符数。
+ * @param timeout 等待硬件完成的轮询时限，单位为毫秒。
+ * @return 成功返回 0，失败返回负错误码。
+ */
 int dsa_dma_ctx_batch_init(struct dsa_dma_ctx_batch *ctx, int dev_id, int wq_id,
 			   int batch_size, int num_descs, int timeout)
 {
@@ -214,6 +230,7 @@ err_alloc_data_list:
 	return ret;
 }
 
+/// @brief 释放上下文的描述符和 DMA 缓冲区。调用方负责保证设备已停止访问这些资源。
 void dsa_dma_ctx_batch_remove(struct dsa_dma_ctx_batch *ctx)
 {
 	int i;
@@ -235,6 +252,17 @@ void dsa_dma_ctx_batch_remove(struct dsa_dma_ctx_batch *ctx)
 	dsa_free_lv2_desc_list(idxd, ctx);
 }
 
+/**
+ * @brief 将一个数据搬运段放入当前 BATCH，批次填满时投递给 IDXD。
+ * @param[in,out] ctx 线程私有批次上下文。
+ * @param dma_dst 设备可见的目的地址。
+ * @param dma_src 设备可见的源地址。
+ * @param size 搬运字节数。
+ * @param data 对应子描述符的完成回调参数。
+ * @param callback 槽位用尽而回收最老批次时调用的回调，可为空。
+ * @return 成功返回 0，失败返回负错误码。
+ * @note 返回 0 时子描述符可能仍在等待组批。批次槽耗尽时本函数会等待回收。
+ */
 int dsa_dma_issue_async_batch(struct dsa_dma_ctx_batch *ctx, dma_addr_t dma_dst,
 			      dma_addr_t dma_src, size_t size, void *data,
 			      void (*callback)(void *))
@@ -314,6 +342,11 @@ int dsa_dma_issue_async_batch(struct dsa_dma_ctx_batch *ctx, dma_addr_t dma_dst,
 	return 0;
 }
 
+/**
+ * @brief 投递未填满的尾批。只有一个真实操作时，补一个 NOOP。
+ * @param[in,out] ctx 线程私有批次上下文。
+ * @return 投递成功或没有待提交的尾批时返回 0，否则返回负错误码。
+ */
 int dsa_dma_issue_async_remaining_batch(struct dsa_dma_ctx_batch *ctx)
 {
 	int ret = 0;
@@ -368,6 +401,13 @@ int dsa_dma_issue_async_remaining_batch(struct dsa_dma_ctx_batch *ctx)
 	return 0;
 }
 
+/**
+ * @brief 等待队首 BATCH 的设备完成记录并回收批次槽。
+ * @param[in,out] ctx 线程私有批次上下文。
+ * @param callback 外层描述符成功后在当前线程逐项调用的回调，可为空。
+ * @return 无在途批次或完成成功时返回 0，完成状态异常时返回负错误码。
+ * @note 外层 BATCH 失败时，此路径记录子操作的错误状态并跳过回调。
+ */
 int dsa_dma_wait_oldest_batch(struct dsa_dma_ctx_batch *ctx,
 			      void (*callback)(void *))
 {
@@ -425,6 +465,7 @@ int dsa_dma_wait_oldest_batch(struct dsa_dma_ctx_batch *ctx,
 	return 0;
 }
 
+/// @brief 等待上下文中的在途批次，并在成功后执行各批次的回调。
 int dsa_dma_wait_all_batch(struct dsa_dma_ctx_batch *ctx,
 			   void (*callback)(void *))
 {
@@ -484,6 +525,7 @@ int dsa_dma_wait_all_batch(struct dsa_dma_ctx_batch *ctx,
 	return 0;
 }
 
+/// @brief 检查部分填充批次是否达到提前提交阈值。
 bool __dsa_dma_is_issue_timeout_batch(struct dsa_dma_ctx_batch *ctx)
 {
 	return (ctx->curr_num_filled > 0 &&
@@ -491,6 +533,7 @@ bool __dsa_dma_is_issue_timeout_batch(struct dsa_dma_ctx_batch *ctx)
 			ctx->start_issue_time + ctx->batch_issue_timeout_ns);
 }
 
+/// @brief 检查是否达到下一次尝试回收在途批次的时间。
 bool __dsa_dma_is_wait_timeout_batch(struct dsa_dma_ctx_batch *ctx)
 {
 	return (local_clock() >

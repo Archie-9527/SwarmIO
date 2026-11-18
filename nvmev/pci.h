@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief 虚拟 PCI 配置空间、BAR 寄存器布局与中断接口。
+ */
 #ifndef _SWARMIO_PCI_H
 #define _SWARMIO_PCI_H
 

@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief SwarmIO 虚拟控制器的设备、后备区和 namespace 生命周期。
+ */
 #include <linux/kernel.h>
 
 #include "admin.h"
@@ -14,9 +18,10 @@
 #include "worker.h"
 #include "simple_timing_model.h"
 
-struct nvme_vdev *nvme_vdev = NULL;
+struct nvme_vdev *nvme_vdev = NULL; /**< 当前模块唯一的虚拟控制器实例。 */
 extern struct nvme_vdev *vdev __attribute__((alias("nvme_vdev")));
 
+/// @brief 映射预留 DRAM 作为虚拟盘后备区，使 CPU 拷贝路径可直接访问。
 static int vdev_storage_init(struct nvme_vdev *vdev)
 {
 	SWARMIO_INFO("Storage: %#010lx-%#010lx (%lu MiB)\n",
@@ -70,6 +75,7 @@ static void vdev_storage_exit(struct nvme_vdev *vdev)
 	vdev->sched_inst_stat = NULL;
 }
 
+/// @brief 在当前后备区上建立 namespace，并绑定简化时序模型。
 static int vdev_namespace_init(struct nvme_vdev *vdev)
 {
 	const int num_ns = 1;
@@ -101,6 +107,11 @@ static void vdev_namespace_exit(struct nvme_vdev *vdev)
 	vdev->ns = NULL;
 }
 
+/**
+ * @brief 分配虚拟 NVMe 设备并建立存储、namespace 和 PCI 资源。
+ * @param config 已解析的运行配置。
+ * @return 成功返回 0，失败返回负错误码。
+ */
 int vdev_init(struct swarmio_cfg *config)
 {
 	struct nvme_vdev *vdev;
@@ -149,6 +160,7 @@ err:
 	return ret;
 }
 
+/// @brief 停止并移除虚拟 PCI 总线。
 void vdev_stop_pci(struct nvme_vdev *vdev)
 {
 	if (!vdev)
@@ -161,6 +173,7 @@ void vdev_stop_pci(struct nvme_vdev *vdev)
 	}
 }
 
+/// @brief 释放虚拟控制器的 namespace、存储映射、队列和其他设备资源。
 void vdev_exit(struct nvme_vdev *vdev)
 {
 	int i;

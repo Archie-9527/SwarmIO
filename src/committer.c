@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief 可选完成线程，将数据已就绪的描述符按模型时刻发布到 CQ。
+ */
 #ifdef CONFIG_SWARMIO_COMMIT
 
 #include <linux/delay.h>
@@ -29,6 +33,7 @@ void swarmio_complete(struct swarmio_committer *committer,
 		      unsigned long *last_completion_time);
 void swarmio_proc_irqs(struct swarmio_committer *committer);
 
+/// @brief 为 committer 的完成描述符写入 NVMe CQE，CQ 无空位时留待重试。
 static bool __fill_cq_result(struct swarmio_commit_desc *desc)
 {
 	int i = 0;
@@ -82,6 +87,7 @@ static bool __fill_cq_result(struct swarmio_commit_desc *desc)
 	return true;
 }
 
+/// @brief 尝试发布已就绪且达到目标时刻的完成项，并回收连续的环形槽位。
 void swarmio_complete(struct swarmio_committer *committer,
 		      unsigned long *last_completion_time)
 {
@@ -189,6 +195,7 @@ void swarmio_proc_irqs(struct swarmio_committer *committer)
 	}
 }
 
+/// @brief 运行可选 committer 的完成与中断处理循环。
 static int swarmio_committer_thread_fn(void *data)
 {
 	struct swarmio_committer *committer = (struct swarmio_committer *)data;

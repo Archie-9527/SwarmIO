@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief Worker 数据搬运、批次完成处理和 NVMe CQE 发布。
+ */
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/ktime.h>
@@ -38,6 +42,7 @@ void swarmio_proc_irqs(struct swarmio_worker *worker);
 void swarmio_proc_io(struct swarmio_worker *worker,
 		     unsigned long *last_io_time);
 
+/// @brief 按编译配置组装异步 DSA 批次，或同步搬运一个数据段。
 static inline int __dsa_dma_issue(dma_ctx_t *ctx, dma_addr_t dma_dst,
 				  dma_addr_t dma_src, size_t size, void *data,
 				  void (*callback)(void *))
@@ -51,6 +56,7 @@ static inline int __dsa_dma_issue(dma_ctx_t *ctx, dma_addr_t dma_dst,
 #endif
 }
 
+/// @brief 发生 DSA 错误后关闭全局 worker DMA 开关。
 static inline void __swarmio_disable_worker_dma(void)
 {
 	SWARMIO_ERROR("disabling worker DMA after DSA failure\n");
@@ -58,6 +64,11 @@ static inline void __swarmio_disable_worker_dma(void)
 }
 
 #ifndef CONFIG_SWARMIO_COMMIT
+/**
+ * @brief 在 CQ 有空位时写入 SQ head、SQ ID、CID 和阶段位。
+ * @param w 数据已就绪的 I/O 工作项。
+ * @return 已发布 CQE 时返回 true，CQ 满时返回 false 并保留工作项。
+ */
 static bool __fill_cq_result(struct swarmio_io_work *w)
 {
 	int i = 0;
@@ -142,6 +153,11 @@ static bool __fill_cq_result(struct swarmio_io_work *w)
 	return true;
 }
 
+/**
+ * @brief 在达到模型目标时刻后尝试完成已就绪的工作项。
+ * @param[in,out] w 待完成的工作项，CQ 满时留待后续重试。
+ * @note 启用跳过 I/O 的编译选项时，此处跳过目标时刻检查。
+ */
 static inline void __swarmio_complete(struct swarmio_io_work *w)
 {
 	unsigned long long curr_nsecs = ktime_get_ns();
@@ -163,6 +179,7 @@ static inline void __swarmio_complete(struct swarmio_io_work *w)
 }
 #endif
 
+/// @brief 记录数据就绪，并在开启 profiling 时保存时间戳。
 static inline void __swarmio_mark_copied(struct swarmio_io_work *w)
 {
 	w->is_copied = true;
@@ -174,6 +191,10 @@ static inline void __swarmio_mark_copied(struct swarmio_io_work *w)
 #endif
 }
 
+/**
+ * @brief 回收 DSA 描述符时由 worker 调用，通知对应工作项数据已就绪。
+ * @param data 最后一个传输段关联的工作项，其他段及填充项可传 NULL。
+ */
 static inline void __swarmio_dma_cb(void *data)
 {
 	struct swarmio_io_work *w;
@@ -188,6 +209,7 @@ static inline void __swarmio_dma_cb(void *data)
 #endif
 }
 
+/// @brief 用 CPU 解析 PRP 并在虚拟盘后备区和命令缓冲区之间拷贝 payload。
 static void __swarmio_xfer_data(struct nvme_rw_command *cmd)
 {
 	size_t offset, length, remaining;
@@ -278,6 +300,16 @@ static void __swarmio_xfer_data(struct nvme_rw_command *cmd)
 	}
 }
 
+/**
+ * @brief 按读写方向提交一个连续的数据搬运段。
+ * @param dma_ctx Worker 的 DSA 上下文。
+ * @param opcode NVMe 操作码，READ 以 DRAM 为源，WRITE 以 DRAM 为目的。
+ * @param paddr PRP 给出的设备可见地址。
+ * @param storage_offset 相对后备 DRAM 起点的字节偏移。
+ * @param io_size 本段的字节数。
+ * @param callback_data 传给完成回调的工作项，可为空。
+ * @return 提交或入批成功返回 0，失败返回错误。
+ */
 static inline int __swarmio_submit_dma(dma_ctx_t *dma_ctx, u8 opcode, u64 paddr,
 				       size_t storage_offset, size_t io_size,
 				       void *callback_data)
@@ -296,6 +328,14 @@ static inline int __swarmio_submit_dma(dma_ctx_t *dma_ctx, u8 opcode, u64 paddr,
 	return 0;
 }
 
+/**
+ * @brief 解析 PRP1、PRP2 或 PRP 列表，并尽可能合并连续的地址段。
+ * @param cmd NVMe 读写命令，包含 SLBA、长度与数据指针。
+ * @param dma_ctx Worker 的 DSA 上下文。
+ * @param w 与最后一个传输段关联的工作项。
+ * @param paddr_list Worker 提供的 PRP 解析临时数组。
+ * @return 成功返回 0，搬运提交失败返回负错误码。
+ */
 static int __swarmio_xfer_data_using_dma(struct nvme_rw_command *cmd,
 					 dma_ctx_t *dma_ctx,
 					 struct swarmio_io_work *w,
@@ -408,6 +448,13 @@ static int __swarmio_xfer_data_using_dma(struct nvme_rw_command *cmd,
 	return 0;
 }
 
+/**
+ * @brief 推进本地环中尚未提交、等待完成或等待回收的工作项。
+ * @param[in,out] worker 当前 worker 及其本地环、DSA 上下文。
+ * @param[out] last_io_time 处理非空队列后更新的活动时间，以 jiffies 计。
+ * @details 先处理未发出的请求，再尝试完成数据已就绪的请求。只回收从队首开始的连续已完成槽。
+ * 在批处理模式下，还按阈值提交尾批或等待最老的在途批次。
+ */
 void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 {
 	unsigned short i, max_count, issued_count = 0, completed_count = 0;
@@ -645,6 +692,7 @@ void swarmio_proc_irqs(struct swarmio_worker *worker)
 }
 #endif
 
+/// @brief 推进本地请求和可选中断，并响应控制面的暂停屏障。
 static int swarmio_worker_thread_fn(void *data)
 {
 	struct swarmio_worker *worker = (struct swarmio_worker *)data;
@@ -673,6 +721,7 @@ static int swarmio_worker_thread_fn(void *data)
 	return 0;
 }
 
+/// @brief 分配 worker 本地环，初始化 DSA 上下文并将线程绑定到指定 CPU。
 int swarmio_worker_init(struct nvme_vdev *vdev)
 {
 	unsigned int i, j;
@@ -799,6 +848,7 @@ err:
 	return ret ? ret : -EIO;
 }
 
+/// @brief 停止已启动的 worker 并释放其本地环和 DMA 上下文。
 void swarmio_worker_exit(struct nvme_vdev *vdev)
 {
 	unsigned int i;

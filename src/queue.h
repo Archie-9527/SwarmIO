@@ -4,41 +4,47 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief 虚拟 NVMe 的 SQ、CQ、管理队列及按页定位队列项的辅助函数。
+ */
 #ifndef _SWARMIO_QUEUE_H
 #define _SWARMIO_QUEUE_H
 
 #include "common.h"
 
+/// @brief SwarmIO 持有的 I/O SQ 状态和地址视图。
 struct nvme_submission_queue {
 	int qid;
-	int cqid;
+	int cqid; /**< 该 SQ 的完成项写入的 CQ 编号。 */
 
 	int queue_size;
-	int sq_head;
+	int sq_head; /**< 下一条待派发的 SQE 位置，也通过 CQE 回报。 */
 
-	struct nvme_command __iomem **sq;
+	struct nvme_command __iomem **sq; /**< 原始 SQ 的 CPU 逐页访问视图。 */
 	void *mapped;
-	dma_addr_t dma_addr;
+	dma_addr_t dma_addr; /**< 原始 SQ 的 DMA 基地址，DSA 取命令时作为源。 */
 
 #ifdef CONFIG_SWARMIO_DISP_PREFETCH_SQE
-	int pref_size;
+	int pref_size; /**< 已预取或正在预取的连续 SQE 数。 */
 	int dma_desc_id;
 	bool is_pref_issued;
 #endif
 
 #if defined(CONFIG_SWARMIO_DISP_COALESCE_SQE)
-	int fetched_pos;
+	int fetched_pos; /**< 下一个待取的 SQ 槽，可以领先于实际派发的 sq_head。 */
 #if defined(CONFIG_SWARMIO_AGGREGATED_TIMING_UPDATE) && \
 	defined(CONFIG_SWARMIO_PROFILE_REQ)
 	unsigned long long *nsecs_starts;
 #endif
-	unsigned long long *nsecs_targets;
+	unsigned long long *nsecs_targets; /**< 按 SQ 槽保存的最早完成时间，单位为纳秒。 */
 #endif
 
-	struct nvme_command *cmd_buffer;
-	dma_addr_t cmd_buffer_dma;
+	struct nvme_command *cmd_buffer; /**< 在主机预留 DRAM 中暂存 SQE 的 CPU 地址。 */
+	dma_addr_t cmd_buffer_dma; /**< 同一暂存区的 DMA 地址，取 SQE 时作为目的。 */
 };
 
+/// @brief SwarmIO 持有的 I/O CQ 环状态和 CPU 写入视图。
 struct nvme_completion_queue {
 	int qid;
 	int irq_vector;
@@ -51,19 +57,20 @@ struct nvme_completion_queue {
 
 	int queue_size;
 
-	int phase;
-	int cq_head;
+	int phase; /**< 写入 CQE 的阶段位，每轮回绕时翻转。 */
+	int cq_head; /**< 从 CQ doorbell 得到的客户端消费位置。 */
 #if !defined(CONFIG_SWARMIO_DISP_ALLOC_WORKER_RR) || \
 	defined(CONFIG_SWARMIO_COMMIT)
-	int cq_tail;
+	int cq_tail; /**< 控制器下一次发布 CQE 的位置。 */
 #else
-	atomic_t cq_tail;
+	atomic_t cq_tail; /**< 多个 worker 共享 CQ 时用于原子预约槽位的尾指针。 */
 #endif
 
-	struct nvme_completion __iomem **cq;
+	struct nvme_completion __iomem **cq; /**< CQ 的 CPU 逐页写入视图。 */
 	void *mapped;
 };
 
+/// @brief 管理命令专用队列，由 dispatcher 0 处理。
 struct nvme_admin_queue {
 	int phase;
 
@@ -85,6 +92,7 @@ struct nvme_admin_queue {
 #define SQ_ENTRY_TO_PAGE_OFFSET(entry_id) (entry_id % NR_SQE_PER_PAGE)
 #define CQ_ENTRY_TO_PAGE_OFFSET(entry_id) (entry_id % NR_CQE_PER_PAGE)
 
+/// @brief 按环内槽号定位 I/O SQE。
 static inline struct nvme_command *
 __sq_entry_at(struct nvme_submission_queue *sq, int entry_id)
 {
@@ -92,6 +100,7 @@ __sq_entry_at(struct nvme_submission_queue *sq, int entry_id)
 		      [SQ_ENTRY_TO_PAGE_OFFSET(entry_id)];
 }
 
+/// @brief 按环内槽号定位 I/O CQE。
 static inline struct nvme_completion *
 __cq_entry_at(struct nvme_completion_queue *cq, int entry_id)
 {

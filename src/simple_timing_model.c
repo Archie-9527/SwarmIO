@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief 以调度实例的可用时间模拟 SSD 延迟和吞吐。
+ */
 #include <linux/ktime.h>
 #include <linux/sched/clock.h>
 #include <linux/delay.h>
@@ -13,6 +17,7 @@
 #include "nvmev/nvme_vdev.h"
 
 /* derive the target completion time */
+/// @brief 为单条读写命令预约其占用的模型 I/O 单元并计算目标完成时刻。
 static unsigned long long __sched_io_units(int opcode, unsigned long lba,
 					   unsigned int length,
 					   unsigned long long nsecs_start)
@@ -87,6 +92,7 @@ static unsigned long long __sched_io_units(int opcode, unsigned long lba,
 	return latest + min_delay;
 }
 
+/// @brief 用各调度实例中最晚的已预约时刻计算 FLUSH 的完成时间。
 static unsigned long long __sched_flush(struct nvme_sched_info *sched_info)
 {
 	unsigned long long latest = 0;
@@ -114,6 +120,7 @@ static unsigned long long __sched_flush(struct nvme_sched_info *sched_info)
 	return latest;
 }
 
+/// @brief 逐条处理命令，并将模型目标时刻写入调度信息。
 bool simple_sched_nvme_cmd(struct swarmio_nvme_ns *ns,
 			   struct nvme_sched_info *sched_info)
 {
@@ -140,6 +147,18 @@ bool simple_sched_nvme_cmd(struct swarmio_nvme_ns *ns,
 }
 
 #ifdef CONFIG_SWARMIO_AGGREGATED_TIMING_UPDATE
+/**
+ * @brief 为已取回的一批 SQE 预约模型资源，再逐条计算目标完成时刻。
+ * @details 按实例累计服务时间，每个有负载的实例一次性预约整个批次的服务区间。
+ * 最后在预约区间内按命令顺序分配时间，并加上适用的附加时延。
+ * @param ns 命令所属的虚拟 namespace。
+ * @param cmds 已取回的连续 SQE 数组。
+ * @param nsecs_start 调度起点，正常路径在更新共享模型状态前刷新。
+ * @param[out] nsecs_targets 每条命令的最早完成时刻，单位为纳秒。
+ * @param num_reqs 输入数组中的命令数。
+ * @param dispatcher 提供线程私有的临时数组。
+ * @note 开启请求统计时，nsecs_starts 还接收每条命令的模型起点。
+ */
 void simple_sched_nvme_cmd_aggregated(struct swarmio_nvme_ns *ns,
 				      struct nvme_command *cmds,
 				      unsigned long long nsecs_start,
@@ -320,6 +339,7 @@ void simple_sched_nvme_cmd_aggregated(struct swarmio_nvme_ns *ns,
 }
 #endif
 
+/// @brief 为 namespace 安装后备区映射和时序回调。
 void simple_init_namespace(struct swarmio_nvme_ns *ns, uint32_t id,
 			   uint64_t size, void *mapped_addr)
 {

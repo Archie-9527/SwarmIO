@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief SwarmIO 模块配置、逻辑块单位和 namespace 时序接口。
+ */
 #ifndef _SWARMIO_COMMON_H
 #define _SWARMIO_COMMON_H
 
@@ -66,6 +70,7 @@
  * Legacy per-SSD configuration is no longer used in the active tree.
  */
 #define MDTS (5)
+/// @brief 协议逻辑块大小的以 2 为底的指数。当前为 9，对应 512 B。
 #define LBA_BITS (9)
 #define LBA_SIZE (1 << LBA_BITS)
 
@@ -80,33 +85,49 @@
 #undef CONFIG_SWARMIO_AGGREGATED_TIMING_UPDATE
 #endif
 
+/**
+ * @brief 将起始 LBA 换算为相对后备区起点的字节偏移。
+ * @param cmd NVMe 读写命令。
+ * @return 相对偏移，单位为字节。
+ */
 static inline size_t __cmd_io_offset(struct nvme_rw_command *cmd)
 {
 	return cmd->slba << LBA_BITS;
 }
 
+/**
+ * @brief 将 NVMe 的零基块数换算为实际传输字节数。
+ * @param cmd NVMe 读写命令，其中 length 为逻辑块数减一。
+ * @return 传输总字节数。
+ */
 static inline size_t __cmd_io_size(struct nvme_rw_command *cmd)
 {
 	return (cmd->length + 1) << LBA_BITS;
 }
 
+/// @brief 模块加载时解析出的资源布局、线程配置与时序参数。
 struct swarmio_cfg {
+	/// 预留物理内存的起始地址。
 	unsigned long memmap_start; // byte
+	/// 预留物理内存的总字节数。
 	unsigned long memmap_size; // byte
 
-	unsigned long cmd_buffer_start;
-	unsigned long cmd_buffer_size;
+	unsigned long cmd_buffer_start; /**< 主机 SQE 暂存区的物理基地址。 */
+	unsigned long cmd_buffer_size; /**< 所有 SQE 暂存区的总字节数。 */
 
+	/// 虚拟盘后备 DRAM 的物理基地址。
 	unsigned long storage_start; //byte
+	/// 暴露给 namespace 的后备区字节数。
 	unsigned long storage_size; // byte
 
 	unsigned int num_service_units;
 	unsigned int num_workers_per_service_unit;
 	unsigned int num_workers;
-	cpumask_var_t cpu_mask;
+	cpumask_var_t cpu_mask; /**< 用于绑定服务线程的 CPU 集合。 */
 
 	/* TODO Refactoring storage configurations */
-	unsigned int num_sched_insts;
+	unsigned int num_sched_insts; /**< 相互独立的模型调度实例数。 */
+	/// 模型 I/O 单元大小的以 2 为底的指数。
 	unsigned int io_unit_shift; // 2^
 
 	unsigned int read_min_delay; // ns
@@ -165,6 +186,12 @@ static inline void __reset_stats(struct swarmio_stats *stats)
 }
 #endif
 
+/**
+ * @brief 在控制面置暂停标志时让服务线程进入屏障。
+ * @param flag 控制面设置和清除的暂停标志。
+ * @param[in,out] num_waiting 当前进入屏障的线程数。
+ * @param wait_q 等待标志清除的等待队列。
+ */
 static inline void __thread_wait_on_flag(int *flag, atomic_t *num_waiting,
 					 wait_queue_head_t *wait_q)
 {
@@ -179,27 +206,31 @@ struct swarmio_dispatcher;
 struct swarmio_worker;
 struct nvme_vdev;
 
+/// @brief 单个模型调度实例的共享时序状态。
 struct sched_inst_stat_t {
 #ifdef CONFIG_SWARMIO_ATOMIC_CAS_TIMING_UPDATE
-	atomic64_t t_next_available;
+	atomic64_t t_next_available; /**< 最早可预约的服务时刻，单位为纳秒，经 CAS 更新。 */
 #else
-	u64 t_next_available;
+	u64 t_next_available; /**< 最早可预约的服务时刻，单位为纳秒，由外层锁保护。 */
 #endif
 };
 
+/// @brief 时序模型的单命令输入和输出。
 struct nvme_sched_info {
 	struct nvme_command *cmd;
-	uint64_t nsecs_start;
+	uint64_t nsecs_start; /**< 时序计算采用的请求起点，单位为纳秒。 */
 	uint32_t status;
-	uint64_t nsecs_target;
+	uint64_t nsecs_target; /**< 模型给出的最早完成时刻，单位为纳秒。 */
 };
 
+/// @brief 虚拟 namespace 的后备地址范围与时序计算入口。
 struct swarmio_nvme_ns {
 	uint32_t id;
 	uint32_t csi;
 	uint64_t size;
-	void *mapped;
+	void *mapped; /**< 后备 DRAM 的 CPU 虚拟映射。 */
 
+	/// @brief 逐条计算命令的目标完成时间。
 	bool (*sched_nvme_cmd)(struct swarmio_nvme_ns *ns,
 			       struct nvme_sched_info *sched_info);
 

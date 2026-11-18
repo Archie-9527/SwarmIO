@@ -3,6 +3,10 @@
  * Copyright (C) 2026 VIA-Research
  */
 
+/**
+ * @file
+ * @brief 通过 Linux IDXD 驱动配置和启停 DSA，并将 WQ 分给服务线程。
+ */
 #include <linux/kernel.h>
 #include <linux/pci.h>
 #include <linux/dma-mapping.h>
@@ -19,7 +23,7 @@ extern struct dsa_wq_cfg dsa_wq_cfg_list[];
 extern struct dsa_group_cfg dsa_group_cfg_list[];
 extern struct dsa_dev_cfg dsa_dev_cfg_list[];
 
-struct idxd_device *dsa_idxd_list[DSA_MAX_DEVS] = { NULL };
+struct idxd_device *dsa_idxd_list[DSA_MAX_DEVS] = { NULL }; /**< 按发现顺序保存的已启用设备，供线程上下文索引。 */
 extern unsigned int dsa_num_devs;
 extern unsigned int dsa_num_groups_per_dev;
 extern unsigned int dsa_num_wqs_per_group;
@@ -137,6 +141,7 @@ static int dsa_validate_params(const struct dsa_cfg_params *p)
 	return 0;
 }
 
+/// @brief 将模块加载时的设备、group、WQ 和 engine 参数写入配置表。
 int dsa_set_params(const struct dsa_cfg_params *p)
 {
 	int ret;
@@ -188,6 +193,7 @@ int dsa_set_params(const struct dsa_cfg_params *p)
 	return 0;
 }
 
+/// @brief 设置每个内核专用 WQ 的容量、优先级、所属组和传输限制。
 static int dsa_wqs_config(struct idxd_device *idxd)
 {
 	int i, j;
@@ -299,6 +305,10 @@ static void dsa_wqs_disable(struct idxd_device *idxd)
 	}
 }
 
+/**
+ * @brief 按编号扫描 IDXD 设备，并配置、启用所需的 DSA 和 WQ。
+ * @return 所需设备全部启用时返回 0，否则返回错误。
+ */
 int dsa_enable_devices(void)
 {
 	int i, rc;
@@ -369,6 +379,7 @@ int dsa_enable_devices(void)
 	return 0;
 }
 
+/// @brief 停用此前纳入设备表的 DSA 与其 WQ。
 void dsa_disable_devices(void)
 {
 	int i;
@@ -402,6 +413,13 @@ void dsa_assign_wq_by_group_rr(int team_id, int local_id, int *dev_id,
 	*wq_id = dsa_dev_cfg_list[*dev_id].groups[grp_id].wq_ids[grp_wq_id];
 }
 
+/**
+ * @brief 按服务单元选择 DSA group，在组内为 dispatcher 和 worker 分配不同 WQ。
+ * @param team_id 服务单元编号。
+ * @param local_id 组内成员编号，0 为 dispatcher，worker 从 1 起算。
+ * @param[out] dev_id SwarmIO DSA 设备表索引。
+ * @param[out] wq_id 设备内的 WQ 编号。
+ */
 void dsa_assign_wq_by_group_disagg(int team_id, int local_id, int *dev_id,
 				   int *wq_id)
 {

@@ -4,6 +4,10 @@
  * Copyright (C) 2026 VIA-Research, modified on 2026-04-07
  */
 
+/**
+ * @file
+ * @brief NVMe 管理命令和 I/O 队列的创建、映射与销毁。
+ */
 #include "common.h"
 #include "dispatcher.h"
 #include "admin.h"
@@ -20,6 +24,7 @@
 	 (prp & ~PAGE_MASK))
 #define prp_address(prp) prp_address_offset(prp, 0)
 
+/// @brief 将管理命令结果和状态写入管理 CQ，并更新其阶段位及位置。
 static void __make_cq_entry_results(int eid, u16 ret, u32 result0, u32 result1)
 {
 	struct nvme_admin_queue *queue = vdev->admin_q;
@@ -49,6 +54,7 @@ static void __make_cq_entry(int eid, u16 ret)
 	__make_cq_entry_results(eid, ret, 0, 0);
 }
 
+/// @brief 销毁一个 I/O SQ 的队列视图、命令暂存区映射和时序数组。
 void vdev_delete_sq(struct nvme_submission_queue *sq)
 {
 	if (!sq)
@@ -78,6 +84,7 @@ void vdev_delete_sq(struct nvme_submission_queue *sq)
 	kfree(sq);
 }
 
+/// @brief 销毁一个 I/O CQ 的逐页访问表和 CPU 映射。
 void vdev_delete_cq(struct nvme_completion_queue *cq)
 {
 	if (!cq)
@@ -93,6 +100,10 @@ void vdev_delete_cq(struct nvme_completion_queue *cq)
 	kfree(cq);
 }
 
+/**
+ * @brief 解析 Create I/O CQ 并建立 SwarmIO 发布完成项的 CPU 地址视图。
+ * @param eid 管理 SQ 中的命令槽号。
+ */
 static void admin_create_cq(int eid)
 {
 	struct nvme_admin_queue *queue = vdev->admin_q;
@@ -169,6 +180,11 @@ static void admin_delete_cq(int eid)
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
 }
 
+/**
+ * @brief 解析 Create I/O SQ，记录原始 SQ 的 DMA 地址及关联 CQ。
+ * @param eid 管理 SQ 中的命令槽号。
+ * @details 同时建立 CPU 逐页视图和主机侧 SQE 暂存区。
+ */
 static void admin_create_sq(int eid)
 {
 	struct nvme_admin_queue *queue = vdev->admin_q;
@@ -323,6 +339,7 @@ static void admin_get_log_page(int eid)
 /***
  * Identify functions
  */
+/// @brief 构造 namespace 的容量、逻辑块格式等 Identify 结果。
 static void admin_identify_namespace(int eid)
 {
 	struct nvme_admin_queue *queue = vdev->admin_q;
@@ -469,6 +486,7 @@ static void admin_identify(int eid)
 /***
  * Set/get features
  */
+/// @brief 处理 Set Features。设置队列数时暂停其他服务线程并重分配 SQ 范围。
 static void admin_set_features(int eid)
 {
 	struct nvme_admin_queue *queue = vdev->admin_q;
@@ -631,6 +649,7 @@ static void admin_async_event(int eid)
 	// __make_cq_entry(eid, NVME_SC_ASYNC_LIMIT);
 }
 
+/// @brief 解析一个管理 SQE 并调用对应的管理命令处理函数。
 void vdev_proc_admin_sq_entry(int entry_id)
 {
 	struct nvme_admin_queue *queue = vdev->admin_q;
