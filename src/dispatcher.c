@@ -545,6 +545,7 @@ static void swarmio_trace_cq_doorbells(void)
 /**
  * @brief 由 dispatcher 0 记录当前 SQ、CQ 和 worker 环的游标。
  * @note 与管理队列处理在同一个线程，采样时队列不会被管理命令删除。
+ * @note worker 仍可推进 CQ，队列繁忙时各字段可能来自相邻时刻。
  */
 static void swarmio_log_queue_snapshot(void)
 {
@@ -556,7 +557,7 @@ static void swarmio_log_queue_snapshot(void)
 		struct nvme_submission_queue *sq = vdev->sqes[qid];
 		struct nvme_completion_queue *cq;
 		u32 sq_dispatched, sq_fetched;
-		unsigned int cq_tail, cq_phase;
+		unsigned int cq_tail, cq_phase, cq_db;
 
 		if (!sq)
 			continue;
@@ -578,12 +579,23 @@ static void swarmio_log_queue_snapshot(void)
 		cq_phase = !((cq_tail / cq->queue_size) & 1);
 		cq_tail %= cq->queue_size;
 #endif
+		cq_db = READ_ONCE(vdev->dbs[sq->cqid * 2 + 1]);
 		SWARMIO_INFO("trace_io QUEUE sqid=%u sq_depth=%d sq_db=%u "
 			     "sq_fetched=%u sq_dispatched=%u cqid=%d cq_depth=%d "
 			     "cq_tail=%u cq_db=%u cq_phase=%u\n",
 			     qid, sq->queue_size, READ_ONCE(vdev->dbs[qid * 2]),
 			     sq_fetched, sq_dispatched, sq->cqid, cq->queue_size,
-			     cq_tail, READ_ONCE(vdev->dbs[sq->cqid * 2 + 1]), cq_phase);
+			     cq_tail, cq_db, cq_phase);
+		if (cq_db < cq->queue_size && cq_db != cq_tail) {
+			struct nvme_completion *cqe = __cq_entry_at(cq, cq_db);
+			/* CID 和 phase 在同一个 dword，一次读取这两个字段。 */
+			u32 dw3 = le32_to_cpu(READ_ONCE(((__le32 *)cqe)[3]));
+
+			SWARMIO_INFO("trace_io CQ_PENDING cqid=%d slot=%u cid=%u "
+				     "phase=%u expected_phase=%u\n",
+				     sq->cqid, cq_db, dw3 & 0xffff, (dw3 >> 16) & 1,
+				     cq_phase ^ (cq_db > cq_tail));
+		}
 	}
 	for (i = 0; i < vdev->num_workers_initialized; i++) {
 		const struct swarmio_worker *worker = &vdev->workers[i];
