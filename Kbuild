@@ -29,11 +29,16 @@ CONFIG_SWARMIO_COMMIT ?= n
 
 obj-m   := swarmio.o
 swarmio-objs := src/main.o nvmev/nvme_vdev.o src/proc.o nvmev/pci.o nvmev/admin.o src/dispatcher.o \
-			  src/worker.o dsa/config.o dsa/dsa.o dsa/batch.o dsa/single.o src/simple_timing_model.o
+			  src/worker.o src/simple_timing_model.o
 ccflags-y += -Wno-unused-variable -Wno-unused-function
 ccflags-y += -I$(src) -I$(src)/src
+
+# Either DMA path needs the IDXD backend. CPU builds can omit it entirely.
+ifneq ($(filter y,$(CONFIG_SWARMIO_DMA_DISPATCHER) $(CONFIG_SWARMIO_DMA_WORKER)),)
+swarmio-objs += dsa/config.o dsa/dsa.o dsa/batch.o dsa/single.o
 IDXD_INCLUDE ?= /usr/src/linux-source-$(shell uname -r | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+).*/\1/')/drivers/dma/idxd
-ccflags-y += -I$(IDXD_INCLUDE)
+ccflags-y += -DCONFIG_SWARMIO_DSA=1 -I$(IDXD_INCLUDE)
+endif
 
 ccflags-$(CONFIG_SWARMIO_PROFILE_REQ) += -DCONFIG_SWARMIO_PROFILE_REQ=1
 

@@ -16,7 +16,9 @@
 #include <linux/wait.h>
 #include <linux/atomic.h>
 #include <linux/cpumask.h>
+#include <linux/io.h>
 #include <linux/kthread.h>
+#include <linux/slab.h>
 
 #include <linux/nvme.h>
 
@@ -40,8 +42,6 @@
 #define VDEV_PCI_VENDOR_ID 0x0c51
 #define VDEV_PCI_SUBSYSTEM_ID 0x370d
 #define VDEV_PCI_SUBSYSTEM_VENDOR_ID VDEV_PCI_VENDOR_ID
-
-#include "dsa/dsa.h"
 
 #ifndef NR_MAX_IO_QUEUE
 #define NR_MAX_IO_QUEUE 64

@@ -12,14 +12,13 @@ usage() {
   bash scripts/smoke_no_dsa.sh --build-only
 
 环境变量
-  IDXD_INCLUDE    与运行内核匹配的 drivers/dma/idxd 目录
   NVIDIA          与已安装驱动匹配的 nv-p2p.h 所在目录
   NVIDIA_SYMVERS  对应当前内核的 NVIDIA Module.symvers 路径
   CUDACXX         nvcc 路径，默认从 PATH 查找。V100 建议 CUDA 12.9
   CUDA_ARCH       CUDA 编译目标，默认 70（V100）
   KERNELDIR       内核构建目录，默认 /lib/modules/$(uname -r)/build
 
-测试需要 sudo 和已通过 memmap=<大小>$<起点> 预留的真实 DRAM。
+SwarmIO 编译为纯 CPU 模式。测试需要 sudo 和已通过 memmap=<大小>$<起点> 预留的真实 DRAM。
 容量和起点可用字节数或 K/M/G 后缀。A,B 是两个可用的 CPU 编号。
 默认测试 GPU 0，64 线程、8 个 QP、QD 64，分别运行 512 B 和 4 KiB 读。
 成功时排空并卸载，异常时保留现场。日志在 results/cpu-smoke.*。
@@ -64,7 +63,6 @@ cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 
 kernel_release=$(uname -r)
 export KERNELDIR=${KERNELDIR:-/lib/modules/$kernel_release/build}
-export IDXD_INCLUDE=${IDXD_INCLUDE:-}
 nvidia_include=${NVIDIA:-}
 nvidia_symvers=${NVIDIA_SYMVERS:-}
 cuda_arch=${CUDA_ARCH:-70}
@@ -79,22 +77,14 @@ nvcc=$(command -v "${CUDACXX:-nvcc}") || fail '找不到 nvcc，请设置 CUDACX
 nvcc=$(realpath -- "$nvcc")
 
 [[ -r $KERNELDIR/Module.symvers ]] || fail "缺少内核符号表 $KERNELDIR/Module.symvers"
-[[ -n $IDXD_INCLUDE && -r $IDXD_INCLUDE/idxd.h ]] ||
-    fail '请将 IDXD_INCLUDE 指向匹配内核的 drivers/dma/idxd。当前 Kbuild 在关闭 DSA 时仍需要 idxd.h'
 [[ -n $nvidia_include && -r $nvidia_include/nv-p2p.h ]] || fail '请将 NVIDIA 指向 nv-p2p.h 所在目录'
 [[ ${nvidia_symvers##*/} == Module.symvers && -r $nvidia_symvers ]] ||
     fail '请将 NVIDIA_SYMVERS 指向当前内核对应的 NVIDIA Module.symvers'
 KERNELDIR=$(realpath -- "$KERNELDIR")
-IDXD_INCLUDE=$(realpath -- "$IDXD_INCLUDE")
 nvidia_include=$(realpath -- "$nvidia_include")
 nvidia_symvers=$(realpath -- "$(dirname -- "$nvidia_symvers")")/Module.symvers
-for path in "$PWD" "$nvcc" "$nvidia_include" "$nvidia_symvers" "$KERNELDIR" "$IDXD_INCLUDE"; do
+for path in "$PWD" "$nvcc" "$nvidia_include" "$nvidia_symvers" "$KERNELDIR"; do
     [[ $path != *[[:space:]\*\?\[]* ]] || fail "路径含有现有构建脚本无法处理的字符：$path"
-done
-for symbol in dsa_bus_type idxd_alloc_desc idxd_free_desc idxd_submit_desc \
-              __idxd_wq_quiesce idxd_drv_enable_wq idxd_drv_disable_wq; do
-    awk -v symbol="$symbol" '$2 == symbol { found = 1 } END { exit !found }' "$KERNELDIR/Module.symvers" ||
-        fail "内核符号表缺少 $symbol，当前代码关闭 DSA 后仍需这些导出符号"
 done
 gpu_targets=$("$nvcc" --list-gpu-code) || fail "无法查询 $nvcc 支持的架构"
 grep -Fxq "sm_$cuda_arch" <<< "$gpu_targets" || fail "$nvcc 无法编译 sm_$cuda_arch。V100 请使用 CUDA 12.9"
@@ -137,15 +127,6 @@ if (( ! build_only )); then
     [[ $dispatcher_cpu != "$worker_cpu" ]] && taskset -c "$dispatcher_cpu" true && taskset -c "$worker_cpu" true ||
         fail "CPU $cpus 必须是两个不同且可用的 CPU"
     [[ ! -e $vdev ]] || fail "PCI 地址 $vdev_bdf 已被占用"
-    if [[ ! -d $mod_root/idxd ]] &&
-       awk '$2 == "idxd_submit_desc" && $3 != "vmlinux" { modular = 1 } END { exit !modular }' "$KERNELDIR/Module.symvers"; then
-        modinfo idxd >/dev/null 2>&1 || fail '当前内核的 idxd 模块不可用，swarmio.ko 无法加载'
-        if [[ -r $IDXD_INCLUDE/init.c ]] &&
-           grep -Fq '!cpu_feature_enabled(X86_FEATURE_MOVDIR64B)' "$IDXD_INCLUDE/init.c" &&
-           ! grep -wm1 movdir64b /proc/cpuinfo >/dev/null; then
-            fail '当前内核的 idxd 模块需要 MOVDIR64B；本机可尝试 --build-only，运行需移除构建对 IDXD 的依赖'
-        fi
-    fi
     nvidia-smi --query-gpu=index,name,pci.bus_id,driver_version --format=csv || fail 'NVIDIA GPU 或驱动不可用'
 fi
 
@@ -216,6 +197,14 @@ EOF
 
 report '正在编译 SwarmIO 和 BaM'
 bash scripts/build.sh -i "$cpu_config"
+swarmio_deps=$(modinfo -F depends ./swarmio.ko)
+swarmio_namespaces=$(modinfo -F import_ns ./swarmio.ko)
+case ",$swarmio_deps," in
+    *,idxd,*|*,idxd_bus,*) fail 'CPU 构建产物仍声明 IDXD 模块依赖' ;;
+esac
+if grep -Fxq IDXD <<< "$swarmio_namespaces"; then
+    fail 'CPU 构建产物仍声明 IDXD 符号依赖'
+fi
 CMAKE_ARGS="-DKERNEL=$KERNELDIR -DCMAKE_CUDA_COMPILER=$nvcc -DCUDA_NVCC_EXECUTABLE=$nvcc -DCMAKE_CUDA_ARCHITECTURES=$cuda_arch -DNVIDIA=$nvidia_include -DNVIDIA_SYMVERS=$nvidia_symvers" \
     bash scripts/build_bam.sh --clean
 

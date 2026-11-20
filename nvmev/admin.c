@@ -8,6 +8,8 @@
  * @file
  * @brief NVMe 管理命令和 I/O 队列的创建、映射与销毁。
  */
+#include <linux/mm.h>
+
 #include "common.h"
 #include "dispatcher.h"
 #include "admin.h"

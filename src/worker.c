@@ -23,15 +23,15 @@
 #include "worker.h"
 #include "dsa/dsa.h"
 
-#if defined(CONFIG_SWARMIO_WORKER_SKIP_IO) || \
-	!defined(CONFIG_SWARMIO_DMA_WORKER)
+#ifdef CONFIG_SWARMIO_DMA_WORKER
+#ifdef CONFIG_SWARMIO_WORKER_SKIP_IO
 static bool worker_using_dma = false;
 #else
 extern bool worker_using_dma;
 #endif
-extern int num_dma_descs_per_worker;
 extern int dma_timeout;
-extern int num_dsa_devs;
+#endif
+extern int num_dma_descs_per_worker;
 extern int dma_batch_size;
 
 #define PTRS_PER_PRP_LIST (1UL << (PAGE_SHIFT - 3))
@@ -42,6 +42,7 @@ void swarmio_proc_irqs(struct swarmio_worker *worker);
 void swarmio_proc_io(struct swarmio_worker *worker,
 		     unsigned long *last_io_time);
 
+#ifdef CONFIG_SWARMIO_DMA_WORKER
 /// @brief 按编译配置组装异步 DSA 批次，或同步搬运一个数据段。
 static inline int __dsa_dma_issue(dma_ctx_t *ctx, dma_addr_t dma_dst,
 				  dma_addr_t dma_src, size_t size, void *data,
@@ -55,6 +56,7 @@ static inline int __dsa_dma_issue(dma_ctx_t *ctx, dma_addr_t dma_dst,
 					 callback);
 #endif
 }
+#endif
 
 #ifndef CONFIG_SWARMIO_COMMIT
 /**
@@ -190,6 +192,7 @@ static inline void __swarmio_mark_copied(struct swarmio_io_work *w)
 #endif
 }
 
+#ifdef CONFIG_SWARMIO_DMA_WORKER
 /**
  * @brief 回收 DSA 描述符时由 worker 调用，通知对应工作项数据已就绪。
  * @param data 最后一个传输段关联的工作项，其他段及填充项可传 NULL。
@@ -207,6 +210,7 @@ static inline void __swarmio_dma_cb(void *data)
 	__swarmio_complete(w);
 #endif
 }
+#endif
 
 /// @brief 用 CPU 解析 PRP 并在虚拟盘后备区和命令缓冲区之间拷贝 payload。
 static void __swarmio_xfer_data(struct nvme_rw_command *cmd)
@@ -299,6 +303,7 @@ static void __swarmio_xfer_data(struct nvme_rw_command *cmd)
 	}
 }
 
+#ifdef CONFIG_SWARMIO_DMA_WORKER
 /**
  * @brief 按读写方向提交一个连续的数据搬运段。
  * @param dma_ctx Worker 的 DSA 上下文。
@@ -448,6 +453,7 @@ static int __swarmio_xfer_data_using_dma(struct nvme_rw_command *cmd,
 
 	return 0;
 }
+#endif
 
 /**
  * @brief 推进本地环中尚未提交、等待完成或等待回收的工作项。
@@ -459,7 +465,9 @@ static int __swarmio_xfer_data_using_dma(struct nvme_rw_command *cmd,
 void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 {
 	unsigned short i, max_count, issued_count = 0, completed_count = 0;
+#ifdef CONFIG_SWARMIO_DMA_WORKER
 	dma_ctx_t *ctx = worker->dma_ctx;
+#endif
 	struct swarmio_worker_local_queue *local_queue = &worker->local_queue;
 	struct swarmio_io_work *w;
 	unsigned short local_queue_tail = smp_load_acquire(&local_queue->tail);
@@ -490,8 +498,8 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 		if (!w->is_issued) {
 			w->is_issued = true;
 			if (!w->is_internal) {
+#if defined(CONFIG_SWARMIO_DMA_WORKER) && !defined(CONFIG_SWARMIO_WORKER_SKIP_IO)
 				if (worker_using_dma) {
-#ifndef CONFIG_SWARMIO_WORKER_SKIP_IO
 					int ret;
 
 					ret = __swarmio_xfer_data_using_dma(
@@ -501,13 +509,9 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 						swarmio_io_fault(vdev, ret);
 						return;
 					}
-#else
-#ifdef CONFIG_SWARMIO_PROFILE_REQ
-					w->nsecs_issued = ktime_get_ns();
+				} else
 #endif
-					__swarmio_mark_copied(w);
-#endif
-				} else {
+				{
 #ifdef CONFIG_SWARMIO_PROFILE_REQ
 					w->nsecs_issued = ktime_get_ns();
 #endif
@@ -630,7 +634,7 @@ void swarmio_proc_io(struct swarmio_worker *worker, unsigned long *last_io_time)
 		smp_store_release(&local_queue->head, new_local_queue_head);
 	}
 
-#ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
+#if defined(CONFIG_SWARMIO_DMA_WORKER) && defined(CONFIG_SWARMIO_WORKER_BATCH_IO)
 	if (worker_using_dma) {
 		if (__dsa_dma_is_issue_timeout_batch(ctx)) {
 			int ret;
@@ -733,7 +737,9 @@ static int swarmio_worker_thread_fn(void *data)
 int swarmio_worker_init(struct nvme_vdev *vdev)
 {
 	unsigned int i, j;
+#ifdef CONFIG_SWARMIO_DMA_WORKER
 	int dev_id, wq_id;
+#endif
 	struct swarmio_worker *worker;
 	struct swarmio_worker_local_queue *local_queue;
 	size_t local_queue_size;
@@ -795,16 +801,19 @@ int swarmio_worker_init(struct nvme_vdev *vdev)
 		}
 		local_queue->head = 0;
 		local_queue->tail = 0;
+#ifdef CONFIG_SWARMIO_DMA_WORKER
 		worker->paddr_list =
 			kzalloc(sizeof(u64) * PTRS_PER_PRP_LIST, GFP_KERNEL);
 		if (!worker->paddr_list) {
 			ret = -ENOMEM;
 			goto err;
 		}
+#endif
 
 		snprintf(worker->thread_name, sizeof(worker->thread_name),
 			 "swarmio_worker_%d-%d", worker->disp_id, worker->id);
 
+#ifdef CONFIG_SWARMIO_DMA_WORKER
 		/* allocate and initialize dma context */
 		if (worker_using_dma) {
 			dsa_assign_wq_by_group_disagg(worker->disp_id,
@@ -837,6 +846,7 @@ int swarmio_worker_init(struct nvme_vdev *vdev)
 			SWARMIO_DEBUG("%s assigned %s\n", worker->thread_name,
 				      worker->dma_ctx->wq->name);
 		}
+#endif
 
 		worker->task_struct = kthread_create(swarmio_worker_thread_fn,
 						     worker, "%s",
@@ -874,6 +884,7 @@ void swarmio_worker_exit(struct nvme_vdev *vdev)
 			kthread_stop(worker->task_struct);
 		}
 
+#ifdef CONFIG_SWARMIO_DMA_WORKER
 		if (worker->dma_ctx) {
 #ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
 			dsa_dma_ctx_batch_remove(worker->dma_ctx);
@@ -881,14 +892,17 @@ void swarmio_worker_exit(struct nvme_vdev *vdev)
 			dsa_dma_ctx_single_remove(worker->dma_ctx);
 #endif
 		}
+#endif
 
 		if (worker->dispatcher)
 			worker->dispatcher->workers[worker->id] = NULL;
 
 		mb();
 
+#ifdef CONFIG_SWARMIO_DMA_WORKER
 		kfree(worker->dma_ctx);
 		kfree(worker->paddr_list);
+#endif
 		kfree(worker->local_queue.works);
 	}
 

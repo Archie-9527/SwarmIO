@@ -10,6 +10,12 @@
 #ifndef __SWARMIO_DSA_H
 #define __SWARMIO_DSA_H
 
+/* 保留模块参数的数组尺寸和默认值，便于两种构建共用加载脚本。 */
+#define DSA_MAX_WQS 16
+#define DSA_MAX_WQ_SIZE 256
+#define DSA_MIN_PRIORITY 1
+
+#ifdef CONFIG_SWARMIO_DSA
 #include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/pci.h>
@@ -24,13 +30,10 @@
 
 #define DSA_MAX_DEVS 4
 #define DSA_SCAN_MAX_DEVS 16
-#define DSA_MAX_WQS 16
 #define DSA_MAX_ENGINES 4
 #define DSA_MAX_GROUPS 4
 #define DSA_MAX_BATCH_SIZE 32
 #define DSA_MIN_WQ_SIZE 1
-#define DSA_MAX_WQ_SIZE 256
-#define DSA_MIN_PRIORITY 1
 #define DSA_MAX_PRIORITY 15
 #define DSA_MAX_NUM_DESCS_PER_THREAD 64
 
@@ -242,4 +245,5 @@ int dsa_dma_wait_all_single(struct dsa_dma_ctx_single *ctx,
 			    void (*callback)(void *));
 bool __dsa_dma_should_sync_single(struct dsa_dma_ctx_single *ctx);
 
+#endif /* CONFIG_SWARMIO_DSA */
 #endif

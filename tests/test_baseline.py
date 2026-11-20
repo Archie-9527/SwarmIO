@@ -76,6 +76,25 @@ class BaselineTests(unittest.TestCase):
                          'CONFIG_SWARMIO_DMA_DISPATCHER=y', 'CONFIG_SWARMIO_DMA_WORKER=y'):
                 self.assertIn(flag, out)
 
+    @unittest.skipUnless(shutil.which('make'), 'make unavailable')
+    def test_kbuild_only_links_idxd_when_dma_is_enabled(self):
+        makefile = ('include Kbuild\nshow:\n'
+                    '\t@echo $(swarmio-objs) $(ccflags-y)\n')
+        for dispatcher in ('n', 'y'):
+            for worker in ('n', 'y'):
+                with self.subTest(dispatcher=dispatcher, worker=worker):
+                    args = ['make', '-sf', '-', 'show', 'src=.',
+                            'IDXD_INCLUDE=/private-idxd-headers',
+                            f'CONFIG_SWARMIO_DMA_DISPATCHER={dispatcher}',
+                            f'CONFIG_SWARMIO_DMA_WORKER={worker}']
+                    flags = subprocess.check_output(args, input=makefile, cwd=ROOT,
+                                                    text=True).split()
+                    enabled = 'y' in (dispatcher, worker)
+                    for flag in ('dsa/config.o', 'dsa/dsa.o', 'dsa/batch.o',
+                                 'dsa/single.o', '-I/private-idxd-headers',
+                                 '-DCONFIG_SWARMIO_DSA=1'):
+                        self.assertEqual(flag in flags, enabled)
+
     def test_shell_benchmark_overrides_without_running_gpu(self):
         with tempfile.TemporaryDirectory() as tmp:
             mocks = {'getopt': "#!/bin/sh\nprintf '%s\\n' --\n",

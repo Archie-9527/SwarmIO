@@ -154,6 +154,7 @@ int main(void)
 #include <assert.h>
 #include <stdbool.h>
 #include <errno.h>
+#define CONFIG_SWARMIO_DSA 1
 #define CONFIG_SWARMIO_WORKER_BATCH_IO 1
 #define SWARMIO_STOP_TIMEOUT_MS 3
 #define SWARMIO_ERROR(...) ((void)0)
@@ -213,6 +214,31 @@ int main(void)
     complete_at = jiffies + 1;
     assert(swarmio_quiesce_io(&dev) == 0);
     assert(dev.paused && single.reset && batch.reset && worker.local_queue.head == 7);
+}
+"""
+        self.run_c_check('\n'.join((
+            stubs, source_function('src/dispatcher.c', 'swarmio_quiesce_io'), exercise,
+        )))
+
+    @unittest.skipUnless(shutil.which('cc'), 'C compiler unavailable')
+    def test_cpu_quiesce_works_without_dma_declarations(self):
+        stubs = r"""
+#include <assert.h>
+#define dma_rmb() ((void)0)
+struct swarmio_worker { struct { unsigned short head, tail; } local_queue; };
+struct nvme_vdev {
+    unsigned int num_workers_initialized;
+    struct swarmio_worker *workers;
+};
+static int swarmio_pause_io(struct nvme_vdev *dev) { return 0; }
+"""
+        exercise = r"""
+int main(void)
+{
+    struct swarmio_worker worker = { .local_queue = {1, 7} };
+    struct nvme_vdev dev = { .num_workers_initialized = 1, .workers = &worker };
+    assert(swarmio_quiesce_io(&dev) == 0);
+    assert(worker.local_queue.head == 7);
 }
 """
         self.run_c_check('\n'.join((

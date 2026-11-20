@@ -23,16 +23,13 @@
 #include "worker.h"
 #include "dsa/dsa.h"
 
+#ifdef CONFIG_SWARMIO_DMA_DISPATCHER
 #define sq_dma(entry_id) (sq->dma_addr + sizeof(struct nvme_command) * entry_id)
 
-#ifdef CONFIG_SWARMIO_DMA_DISPATCHER
 extern bool disp_using_dma;
-#else
-static bool disp_using_dma = false;
-#endif
 extern int num_dma_descs_per_disp;
 extern int dma_timeout;
-extern int num_dsa_devs;
+#endif
 
 /// @brief 记录本轮第一个错误，并让所有服务线程停止发出新 I/O。
 void swarmio_io_fault(struct nvme_vdev *vdev, int error)
@@ -76,6 +73,7 @@ timed_out:
 	return -ETIMEDOUT;
 }
 
+#ifdef CONFIG_SWARMIO_DSA
 static bool swarmio_dispatch_dma_idle(struct nvme_vdev *vdev)
 {
 	unsigned int i;
@@ -107,17 +105,21 @@ static bool swarmio_dma_idle(struct nvme_vdev *vdev)
 	}
 	return true;
 }
+#endif
 
 /// @brief 先确认所有已提交 DMA 完成，再清理旧 I/O。成功时保持暂停。
 static int swarmio_quiesce_io(struct nvme_vdev *vdev)
 {
+#ifdef CONFIG_SWARMIO_DSA
 	unsigned long deadline;
+#endif
 	unsigned int i;
 	int ret = swarmio_pause_io(vdev);
 
 	if (ret)
 		return ret;
 
+#ifdef CONFIG_SWARMIO_DSA
 	deadline = jiffies + msecs_to_jiffies(SWARMIO_STOP_TIMEOUT_MS);
 	while (!swarmio_dma_idle(vdev)) {
 		if (time_after_eq(jiffies, deadline)) {
@@ -127,17 +129,21 @@ static int swarmio_quiesce_io(struct nvme_vdev *vdev)
 		}
 		usleep_range(500, 1000);
 	}
+#endif
 	dma_rmb();
 
+#ifdef CONFIG_SWARMIO_DSA
 	for (i = 0; i < vdev->num_service_units_initialized; i++) {
 		struct dsa_dma_ctx_single *ctx = vdev->dispatchers[i].dma_ctx;
 
 		if (ctx)
 			dsa_dma_single_reset(ctx);
 	}
+#endif
 	for (i = 0; i < vdev->num_workers_initialized; i++) {
 		struct swarmio_worker *worker = &vdev->workers[i];
 
+#ifdef CONFIG_SWARMIO_DSA
 		if (worker->dma_ctx) {
 #ifdef CONFIG_SWARMIO_WORKER_BATCH_IO
 			dsa_dma_batch_reset(worker->dma_ctx);
@@ -145,6 +151,7 @@ static int swarmio_quiesce_io(struct nvme_vdev *vdev)
 			dsa_dma_single_reset(worker->dma_ctx);
 #endif
 		}
+#endif
 		worker->local_queue.head = worker->local_queue.tail;
 	}
 #ifdef CONFIG_SWARMIO_COMMIT
@@ -594,8 +601,10 @@ int swarmio_dispatcher_init(struct nvme_vdev *vdev)
 	unsigned int num_service_units = vdev->config.num_service_units;
 	struct swarmio_dispatcher *dispatcher;
 	struct swarmio_worker *worker;
+#ifdef CONFIG_SWARMIO_DMA_DISPATCHER
 	int dev_id;
 	int wq_id;
+#endif
 	int ret;
 
 	vdev->num_service_units_initialized = 0;
@@ -653,6 +662,7 @@ int swarmio_dispatcher_init(struct nvme_vdev *vdev)
 			 sizeof(dispatcher->thread_name),
 			 "swarmio_dispatcher_%d", i);
 
+#ifdef CONFIG_SWARMIO_DMA_DISPATCHER
 		/* allocate and initialize dma context */
 		if (disp_using_dma) {
 			dsa_assign_wq_by_group_disagg(i, 0, &dev_id, &wq_id);
@@ -677,6 +687,7 @@ int swarmio_dispatcher_init(struct nvme_vdev *vdev)
 				      dispatcher->thread_name,
 				      dispatcher->dma_ctx->wq->name);
 		}
+#endif
 
 		mb();
 
@@ -724,10 +735,12 @@ void swarmio_dispatcher_exit(struct nvme_vdev *vdev)
 		if (!IS_ERR_OR_NULL(dispatcher->task_struct)) {
 			kthread_stop(dispatcher->task_struct);
 		}
+#ifdef CONFIG_SWARMIO_DMA_DISPATCHER
 		if (dispatcher->dma_ctx) {
 			dsa_dma_ctx_single_remove(dispatcher->dma_ctx);
 		}
 		kfree(dispatcher->dma_ctx);
+#endif
 		kfree(dispatcher->timing_workspace);
 		for (j = 0; j < num_workers_per_service_unit; j++) {
 			if (dispatcher->workers && dispatcher->workers[j])
@@ -787,6 +800,7 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 #ifdef CONFIG_SWARMIO_DISP_COALESCE_SQE
 	src = sq->cmd_buffer + sq_entry;
 #else
+#ifdef CONFIG_SWARMIO_DMA_DISPATCHER
 	if (disp_using_dma) {
 		src = sq->cmd_buffer + sq_entry;
 
@@ -801,9 +815,9 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 			swarmio_io_fault(vdev, ret);
 			return false;
 		}
-	} else {
+	} else
+#endif
 		src = __sq_entry_at(sq, sq_entry);
-	}
 #endif
 	memcpy(&w->cmd, src, sizeof(struct nvme_command));
 	cmd = &w->cmd;
@@ -930,13 +944,11 @@ int swarmio_dispatch_sq(int sqid, int new_db, int old_db,
 	struct nvme_submission_queue *sq = vdev->sqes[sqid];
 #if defined(CONFIG_SWARMIO_DISP_COALESCE_SQE)
 	int num_fetch = new_db - sq->fetched_pos;
-	int ret;
 #endif
 	int num_proc;
 	int seq;
 	int sq_entry = old_db;
 	int latest_db;
-	dma_addr_t cmd_buffer_dma;
 
 	if (unlikely(!sq))
 		return old_db;
@@ -951,9 +963,13 @@ int swarmio_dispatch_sq(int sqid, int new_db, int old_db,
 	num_fetch = min(num_fetch, NR_MAX_FETCH_SQE);
 
 	if (num_fetch > 0) {
-		cmd_buffer_dma = sq->cmd_buffer_dma +
-				 sq->fetched_pos * sizeof(struct nvme_command);
+#ifdef CONFIG_SWARMIO_DMA_DISPATCHER
 		if (disp_using_dma) {
+			dma_addr_t cmd_buffer_dma =
+				sq->cmd_buffer_dma +
+				sq->fetched_pos * sizeof(struct nvme_command);
+			int ret;
+
 #if defined(CONFIG_SWARMIO_DISP_PREFETCH_SQE)
 			if (sq->is_pref_issued) {
 				ret = dsa_dma_wait_one_single(
@@ -976,7 +992,9 @@ int swarmio_dispatch_sq(int sqid, int new_db, int old_db,
 				swarmio_io_fault(vdev, ret);
 				return old_db;
 			}
-		} else {
+		} else
+#endif
+		{
 			memcpy(sq->cmd_buffer + sq->fetched_pos,
 			       __sq_entry_at(sq, sq->fetched_pos),
 			       sizeof(struct nvme_command) * num_fetch);

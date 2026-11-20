@@ -15,6 +15,7 @@
 #include <linux/module.h>
 #include <linux/delay.h>
 #include <linux/sched/clock.h>
+#include <linux/version.h>
 
 #ifdef CONFIG_X86
 #include <asm/e820/types.h>
@@ -208,10 +209,12 @@ module_param_array(dsa_wq_priorities, uint, &num_arr_params.wq.priority, 0444);
 MODULE_PARM_DESC(dsa_wq_priorities,
 		 "WQ priorities within a group (Array, Default: 1)");
 
+#ifdef CONFIG_SWARMIO_DSA
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 14, 0)
 MODULE_IMPORT_NS("IDXD");
 #else
 MODULE_IMPORT_NS(IDXD);
+#endif
 #endif
 
 #ifdef CONFIG_X86
@@ -288,6 +291,7 @@ static int __validate_configs(void)
 	return 0;
 }
 
+#ifdef CONFIG_SWARMIO_DSA
 /// @brief 检查服务单元、WQ 数量及描述符容量是否满足 DMA 配置。
 static int __init __validate_dsa_params(void)
 {
@@ -349,6 +353,7 @@ static int __init __validate_dsa_params(void)
 
 	return 0;
 }
+#endif
 
 /**
  * @brief 校验模块参数并建立后备 DRAM、SQE 暂存区和 CPU 绑定配置。
@@ -429,6 +434,7 @@ static int swarmio_init(void)
 {
 	int ret = 0;
 	struct swarmio_cfg config = { 0 };
+#ifdef CONFIG_SWARMIO_DSA
 	struct dsa_cfg_params dsa_params = {
 		.num_devs = dsa_num_devs,
 		.num_groups_per_dev = dsa_num_grps_per_dev,
@@ -437,6 +443,7 @@ static int swarmio_init(void)
 		.wq_sizes = dsa_wq_sizes,
 		.wq_priorities = dsa_wq_priorities,
 	};
+#endif
 
 	ret = __load_configs(&config);
 	if (ret)
@@ -454,6 +461,7 @@ static int swarmio_init(void)
 	worker_using_dma = false;
 #endif
 
+#ifdef CONFIG_SWARMIO_DSA
 	if (disp_using_dma || worker_using_dma) {
 		ret = __validate_dsa_params();
 		if (ret)
@@ -471,6 +479,7 @@ static int swarmio_init(void)
 			vdev->dsa_enabled = true;
 		}
 	}
+#endif
 
 	init_waitqueue_head(&vdev->wait_queue);
 	WRITE_ONCE(vdev->stop_flag, 0);
@@ -503,11 +512,13 @@ err_committers:
 #ifdef CONFIG_SWARMIO_COMMIT
 	swarmio_committer_exit(vdev);
 #endif
+#ifdef CONFIG_SWARMIO_DSA
 err_vdev_init:
 	if (vdev->dsa_enabled) {
 		dsa_disable_devices();
 		vdev->dsa_enabled = false;
 	}
+#endif
 	vdev_exit(vdev);
 	vdev = NULL;
 	return ret ? ret : -EIO;
@@ -525,10 +536,12 @@ static void swarmio_exit(void)
 	swarmio_committer_exit(vdev);
 #endif
 
+#ifdef CONFIG_SWARMIO_DSA
 	if (vdev->dsa_enabled) {
 		dsa_disable_devices();
 		vdev->dsa_enabled = false;
 	}
+#endif
 
 	vdev_exit(vdev);
 	vdev = NULL;
