@@ -170,6 +170,8 @@ static void admin_create_cq(int eid)
 				(void *)((uint64_t)cq->mapped + i * PAGE_SIZE);
 	}
 
+	clear_bit(cq->qid, vdev->trace_cqe);
+	clear_bit(cq->qid, vdev->trace_cq_db);
 	vdev->cqes[cq->qid] = cq;
 
 	dbs_idx = cq->qid * 2 + 1;
@@ -308,6 +310,8 @@ static void admin_create_sq(int eid)
 				(void *)((uint64_t)sq->mapped + i * PAGE_SIZE);
 	}
 
+	clear_bit(sq->qid, vdev->trace_sq_db);
+	clear_bit(sq->qid, vdev->trace_sqe);
 	vdev->sqes[sq->qid] = sq;
 
 	dbs_idx = sq->qid * 2;

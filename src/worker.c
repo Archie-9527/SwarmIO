@@ -133,6 +133,12 @@ static bool __fill_cq_result(struct swarmio_io_work *w)
 	cqe_src->sq_head = sq->sq_head;
 	cqe_src->status = (u16)phase & 0x1;
 	memcpy((u32 *)cqe_dst + 2, (u32 *)cqe_src + 2, sizeof(u32) * 2);
+	if (unlikely(READ_ONCE(trace_first_io)) &&
+	    !test_bit(cqid, vdev->trace_cqe) &&
+	    !test_and_set_bit(cqid, vdev->trace_cqe))
+		SWARMIO_INFO("trace_io CQE_WRITE sqid=%d cqid=%d slot=%d cid=%u phase=%d\n",
+			     sqid, cqid, cq_tail % cq->queue_size,
+			     cqe_src->command_id, phase);
 
 #ifndef CONFIG_SWARMIO_DISP_ALLOC_WORKER_RR
 	/* update cq tail */

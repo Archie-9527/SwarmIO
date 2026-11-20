@@ -8,7 +8,7 @@ usage() {
 在 Linux 无 DSA 主机上构建 SwarmIO + BaM，运行 CPU 搬运路径的冒烟测试。
 
 用法
-  bash scripts/smoke_no_dsa.sh --memmap-start SIZE --memmap-size SIZE --cpus A,B [--gpu N]
+  bash scripts/smoke_no_dsa.sh --memmap-start SIZE --memmap-size SIZE --cpus A,B [--gpu N] [--trace-io]
   bash scripts/smoke_no_dsa.sh --build-only
 
 环境变量
@@ -23,6 +23,7 @@ SwarmIO 编译为纯 CPU 模式。测试需要 sudo 和已通过 memmap=<大小>
 默认测试 GPU 0，64 线程、8 个 QP、QD 64，分别运行 512 B 和 4 KiB 读。
 成功时排空并卸载，异常时保留现场。日志在 results/cpu-smoke.*。
 --build-only 执行构建并安装 SwarmIO 模块产物，跳过模块装载和 I/O。
+--trace-io 为 BaM 生成 CUDA 源码行号，并在绑定设备后开启首次 I/O 进度日志。
 EOF
 }
 
@@ -32,6 +33,7 @@ fail() {
 }
 
 build_only=0
+trace_io=0
 memmap_start=''
 memmap_size=''
 cpus=''
@@ -40,6 +42,7 @@ while (( $# )); do
     case $1 in
         -h|--help) usage; exit 0 ;;
         --build-only) build_only=1; shift ;;
+        --trace-io) trace_io=1; shift ;;
         --memmap-start|--memmap-size|--cpus|--gpu)
             (( $# >= 2 )) && [[ $2 != --* ]] || fail "$1 需要一个值"
             case $1 in
@@ -205,8 +208,11 @@ esac
 if grep -Fxq IDXD <<< "$swarmio_namespaces"; then
     fail 'CPU 构建产物仍声明 IDXD 符号依赖'
 fi
-CMAKE_ARGS="-DKERNEL=$KERNELDIR -DCMAKE_CUDA_COMPILER=$nvcc -DCUDA_NVCC_EXECUTABLE=$nvcc -DCMAKE_CUDA_ARCHITECTURES=$cuda_arch -DNVIDIA=$nvidia_include -DNVIDIA_SYMVERS=$nvidia_symvers" \
-    bash scripts/build_bam.sh --clean
+bam_cmake_args="-DKERNEL=$KERNELDIR -DCMAKE_CUDA_COMPILER=$nvcc -DCUDA_NVCC_EXECUTABLE=$nvcc -DCMAKE_CUDA_ARCHITECTURES=$cuda_arch -DNVIDIA=$nvidia_include -DNVIDIA_SYMVERS=$nvidia_symvers"
+if (( trace_io )); then
+    bam_cmake_args+=' -DCMAKE_CUDA_FLAGS=-lineinfo'
+fi
+CMAKE_ARGS="$bam_cmake_args" bash scripts/build_bam.sh --clean
 
 bam_module=bam/Release/module/libnvm.ko
 for module in swarmio.ko "$bam_module"; do
@@ -245,6 +251,13 @@ fi
 [[ -c /dev/libnvm0 && -e /sys/class/misc/libnvm0/device && /sys/class/misc/libnvm0/device -ef $vdev ]] ||
     fail '/dev/libnvm0 未关联本次测试的 SwarmIO 虚拟控制器'
 check_kernel_log
+
+if (( trace_io )); then
+    trace_param=$mod_root/swarmio/parameters/trace_first_io
+    [[ -e $trace_param ]] || fail 'SwarmIO 模块缺少 trace_first_io 参数'
+    printf '1\n' | sudo tee "$trace_param" > /dev/null
+    report '已开启首次 I/O 跟踪，可在另一个终端运行 sudo dmesg -w | grep --line-buffered "SwarmIO: trace_io"'
+fi
 
 for block_size in 512 4096; do
     report "正在运行 $block_size B 读测试"

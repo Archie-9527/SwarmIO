@@ -11,6 +11,8 @@
 #ifndef _SWARMIO_NVME_VDEV_H
 #define _SWARMIO_NVME_VDEV_H
 
+#include <linux/bitmap.h>
+
 #include "common.h"
 #include "queue.h"
 
@@ -59,6 +61,14 @@ struct nvme_vdev {
 	struct nvme_submission_queue *sqes[NR_MAX_IO_QUEUE + 1]; /**< 以 SQ ID 索引的 I/O 提交队列。 */
 	struct nvme_completion_queue *cqes[NR_MAX_IO_QUEUE + 1]; /**< 以 CQ ID 索引的 I/O 完成队列。 */
 
+	/** @name 首次 I/O 诊断标记，创建队列时按 QID 清除。 */
+	/// @{
+	DECLARE_BITMAP(trace_sq_db, NR_MAX_IO_QUEUE + 1);
+	DECLARE_BITMAP(trace_sqe, NR_MAX_IO_QUEUE + 1);
+	DECLARE_BITMAP(trace_cqe, NR_MAX_IO_QUEUE + 1);
+	DECLARE_BITMAP(trace_cq_db, NR_MAX_IO_QUEUE + 1);
+	/// @}
+
 	unsigned int mdts;
 
 	struct proc_dir_entry *proc_root;
@@ -88,6 +98,7 @@ struct nvme_vdev {
 
 extern struct nvme_vdev *nvme_vdev;
 extern struct nvme_vdev *vdev;
+extern bool trace_first_io;
 
 int vdev_init(struct swarmio_cfg *config);
 void vdev_stop_pci(struct nvme_vdev *vdev);

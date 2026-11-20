@@ -507,6 +507,12 @@ swarmio_proc_submission_queues(struct swarmio_dispatcher *dispatcher)
 		new_db = vdev->dbs[dbs_idx];
 		old_db = vdev->old_dbs[dbs_idx];
 		if (new_db != old_db) {
+			if (unlikely(READ_ONCE(trace_first_io)) &&
+			    !test_bit(qid, vdev->trace_sq_db)) {
+				set_bit(qid, vdev->trace_sq_db);
+				SWARMIO_INFO("trace_io SQ_DB sqid=%d cqid=%d head=%d tail=%d\n",
+					     qid, vdev->sqes[qid]->cqid, old_db, new_db);
+			}
 			vdev->old_dbs[dbs_idx] = swarmio_dispatch_sq(
 				qid, new_db, old_db, dispatcher);
 			updated = true;
@@ -514,6 +520,26 @@ swarmio_proc_submission_queues(struct swarmio_dispatcher *dispatcher)
 	}
 
 	return updated;
+}
+
+/// @brief 独立观察客户端的 CQ doorbell，即使没有新的 SQ 请求。
+static void swarmio_trace_cq_doorbells(void)
+{
+	unsigned int qid;
+
+	for (qid = 1; qid <= vdev->num_cq; qid++) {
+		u32 head;
+
+		if (!test_bit(qid, vdev->trace_cqe) ||
+		    test_bit(qid, vdev->trace_cq_db))
+			continue;
+
+		head = READ_ONCE(vdev->dbs[qid * 2 + 1]);
+		if (head) {
+			set_bit(qid, vdev->trace_cq_db);
+			SWARMIO_INFO("trace_io CQ_DB cqid=%u head=%u\n", qid, head);
+		}
+	}
 }
 
 // Returns true if an event is processed
@@ -525,6 +551,8 @@ static bool vdev_proc_dbs(struct swarmio_dispatcher *dispatcher)
 		updated |= swarmio_proc_admin_queues(dispatcher);
 		updated |= swarmio_proc_submission_queues(dispatcher);
 	}
+	if (unlikely(READ_ONCE(trace_first_io)) && !dispatcher->id)
+		swarmio_trace_cq_doorbells();
 
 	return updated;
 }
@@ -754,6 +782,18 @@ void swarmio_dispatcher_exit(struct nvme_vdev *vdev)
 	vdev->num_service_units_initialized = 0;
 }
 
+/// @brief 在进入时序模型前记录每个队列取回的第一条 SQE。
+static void swarmio_trace_sqe(int sqid, int slot, const struct nvme_command *cmd)
+{
+	if (likely(!READ_ONCE(trace_first_io)) || test_bit(sqid, vdev->trace_sqe))
+		return;
+
+	set_bit(sqid, vdev->trace_sqe);
+	SWARMIO_INFO("trace_io SQE sqid=%d slot=%d cid=%u opcode=0x%02x nsid=%u\n",
+		     sqid, slot, cmd->common.command_id, cmd->common.opcode,
+		     le32_to_cpu(cmd->common.nsid));
+}
+
 /**
  * @brief 将一条取回的 SQE 转换为工作项并发布到目标 worker。
  * @param sqid 提交队列编号。
@@ -822,6 +862,9 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 	memcpy(&w->cmd, src, sizeof(struct nvme_command));
 	cmd = &w->cmd;
 
+#ifndef CONFIG_SWARMIO_DISP_COALESCE_SQE
+	swarmio_trace_sqe(sqid, sq_entry, cmd);
+#endif
 #ifndef CONFIG_SWARMIO_AGGREGATED_TIMING_UPDATE
 	nsid = cmd->common.nsid - 1;
 	ns = &vdev->ns[nsid];
@@ -999,6 +1042,8 @@ int swarmio_dispatch_sq(int sqid, int new_db, int old_db,
 			       __sq_entry_at(sq, sq->fetched_pos),
 			       sizeof(struct nvme_command) * num_fetch);
 		}
+		swarmio_trace_sqe(sqid, sq->fetched_pos,
+				  sq->cmd_buffer + sq->fetched_pos);
 
 #ifdef CONFIG_SWARMIO_AGGREGATED_TIMING_UPDATE
 		{

@@ -65,6 +65,7 @@ static unsigned int num_workers_per_service_unit = 1; /**< 每个服务单元的
 static char *cpus; /**< 线程绑定使用的 CPU 列表，支持逗号和范围表示法。 */
 
 static bool unload_ready;
+bool trace_first_io; /**< 记录每个 I/O 队列首次取命令、发布完成和回收的进度。 */
 
 int dma_batch_size = 2; /**< 每个 worker DSA BATCH 的子描述符容量。 */
 int num_dma_descs_per_disp = 2; /**< 每个 dispatcher 的单操作描述符数。 */
@@ -149,6 +150,9 @@ module_param(worker_using_dma, bool, 0444);
 MODULE_PARM_DESC(worker_using_dma, "Enable/Disable worker DMA");
 module_param(dma_timeout, int, 0644);
 MODULE_PARM_DESC(dma_timeout, "DMA timeout in milliseconds");
+
+module_param(trace_first_io, bool, 0644);
+MODULE_PARM_DESC(trace_first_io, "Log first SQ doorbell, SQE, CQE and CQ doorbell per I/O queue");
 
 static int prepare_unload_set(const char *value, const struct kernel_param *kp)
 {
