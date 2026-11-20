@@ -47,7 +47,11 @@ num_blocks=$((data_size_bytes / page_size))
 set -x
 
 export BAM_SWARMIO_FAULT_EXIT=1
-sudo --preserve-env=BAM_SWARMIO_FAULT_EXIT bam/Release/bin/nvm-block-bench \
+preserve_env=BAM_SWARMIO_FAULT_EXIT
+if [[ -n ${CUDA_MODULE_LOADING:-} ]]; then
+    preserve_env+=,CUDA_MODULE_LOADING
+fi
+sudo --preserve-env="$preserve_env" bam/Release/bin/nvm-block-bench \
     --threads=$num_threads --blk_size=64 --reqs="${BAM_REQS:-32}" \
     --pages=$num_pages --page_size=$page_size \
     --num_blks=$num_blocks \

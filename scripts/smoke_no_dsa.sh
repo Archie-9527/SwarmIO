@@ -260,10 +260,14 @@ if (( trace_io )); then
 fi
 
 for block_size in 512 4096; do
-    report "正在运行 $block_size B 读测试"
     bench_log=$log_dir/read-${block_size}B.log
-    BAM_GPU=$gpu BAM_CACHE_SIZE=64M BAM_DATA_SIZE=128M BAM_REQS=8 BAM_QUEUE_DEPTH=64 BAM_RANDOM=true \
-        bash scripts/run_bam-block-bench.sh -j 64 -q 8 -l "$block_size" 2>&1 | tee "$bench_log"
+    report "正在运行 $block_size B 读测试，日志 $bench_log"
+    (
+        # 直接写文件，避免 benchmark 退出后其子进程仍持有管道写端。
+        trap 'if [[ -f $bench_log ]]; then cat -- "$bench_log"; fi' EXIT
+        BAM_GPU=$gpu BAM_CACHE_SIZE=64M BAM_DATA_SIZE=128M BAM_REQS=8 BAM_QUEUE_DEPTH=64 BAM_RANDOM=true \
+            bash scripts/run_bam-block-bench.sh -j 64 -q 8 -l "$block_size" > "$bench_log" 2>&1
+    )
     grep -Eq 'Number of Ops:[[:space:]]*512([[:space:]]|$)' "$bench_log" || fail "缺少预期的 $block_size B 测试结果"
     check_kernel_log
 done

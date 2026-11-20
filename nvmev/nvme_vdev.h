@@ -99,6 +99,7 @@ struct nvme_vdev {
 extern struct nvme_vdev *nvme_vdev;
 extern struct nvme_vdev *vdev;
 extern bool trace_first_io;
+extern bool trace_queue_snapshot;
 
 int vdev_init(struct swarmio_cfg *config);
 void vdev_stop_pci(struct nvme_vdev *vdev);

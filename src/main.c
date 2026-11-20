@@ -66,6 +66,7 @@ static char *cpus; /**< 线程绑定使用的 CPU 列表，支持逗号和范围
 
 static bool unload_ready;
 bool trace_first_io; /**< 记录每个 I/O 队列首次取命令、发布完成和回收的进度。 */
+bool trace_queue_snapshot; /**< 请求 dispatcher 0 记录一次队列游标。 */
 
 int dma_batch_size = 2; /**< 每个 worker DSA BATCH 的子描述符容量。 */
 int num_dma_descs_per_disp = 2; /**< 每个 dispatcher 的单操作描述符数。 */
@@ -153,6 +154,8 @@ MODULE_PARM_DESC(dma_timeout, "DMA timeout in milliseconds");
 
 module_param(trace_first_io, bool, 0644);
 MODULE_PARM_DESC(trace_first_io, "Log first SQ doorbell, SQE, CQE and CQ doorbell per I/O queue");
+module_param(trace_queue_snapshot, bool, 0200);
+MODULE_PARM_DESC(trace_queue_snapshot, "Write 1 to log a snapshot of the active I/O queues");
 
 static int prepare_unload_set(const char *value, const struct kernel_param *kp)
 {

@@ -105,11 +105,20 @@ class BaselineTests(unittest.TestCase):
             env = dict(os.environ, PATH=tmp + os.pathsep + os.environ['PATH'],
                        BAM_CACHE_SIZE='512M', BAM_DATA_SIZE='128M', BAM_REQS='2048',
                        BAM_QUEUE_DEPTH='512', BAM_GPU='1', BAM_RANDOM='false')
-            out = subprocess.check_output(['bash', 'scripts/run_bam-block-bench.sh'],
-                                          cwd=ROOT, env=env, text=True, stderr=subprocess.DEVNULL)
-            for arg in ('bam/Release/bin/nvm-block-bench', '--reqs=2048', '--queue_depth=512',
-                        '--gpu=1', '--random=false', '--pages=1048576', '--num_blks=262144'):
-                self.assertIn(arg, out.splitlines())
+            env.pop('CUDA_MODULE_LOADING', None)
+            for loading in (None, 'EAGER'):
+                with self.subTest(cuda_module_loading=loading):
+                    preserve_env = '--preserve-env=BAM_SWARMIO_FAULT_EXIT'
+                    if loading:
+                        env['CUDA_MODULE_LOADING'] = loading
+                        preserve_env += ',CUDA_MODULE_LOADING'
+                    out = subprocess.check_output(['bash', 'scripts/run_bam-block-bench.sh'],
+                                                  cwd=ROOT, env=env, text=True,
+                                                  stderr=subprocess.DEVNULL)
+                    for arg in (preserve_env, 'bam/Release/bin/nvm-block-bench', '--reqs=2048',
+                                '--queue_depth=512', '--gpu=1', '--random=false',
+                                '--pages=1048576', '--num_blks=262144'):
+                        self.assertIn(arg, out.splitlines())
 
 
 if __name__ == '__main__':

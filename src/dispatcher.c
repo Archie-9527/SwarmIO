@@ -542,10 +542,64 @@ static void swarmio_trace_cq_doorbells(void)
 	}
 }
 
+/**
+ * @brief 由 dispatcher 0 记录当前 SQ、CQ 和 worker 环的游标。
+ * @note 与管理队列处理在同一个线程，采样时队列不会被管理命令删除。
+ */
+static void swarmio_log_queue_snapshot(void)
+{
+	unsigned int qid, i;
+
+	SWARMIO_INFO("trace_io SNAPSHOT io_error=%d stop=%d\n",
+		     atomic_read(&vdev->io_error), READ_ONCE(vdev->stop_flag));
+	for (qid = 1; qid <= vdev->num_sq; qid++) {
+		struct nvme_submission_queue *sq = vdev->sqes[qid];
+		struct nvme_completion_queue *cq;
+		u32 sq_dispatched, sq_fetched;
+		int cq_tail;
+
+		if (!sq)
+			continue;
+		cq = vdev->cqes[sq->cqid];
+		if (!cq)
+			continue;
+
+		sq_dispatched = READ_ONCE(vdev->old_dbs[qid * 2]);
+#ifdef CONFIG_SWARMIO_DISP_COALESCE_SQE
+		sq_fetched = READ_ONCE(sq->fetched_pos);
+#else
+		sq_fetched = sq_dispatched;
+#endif
+#if !defined(CONFIG_SWARMIO_DISP_ALLOC_WORKER_RR) || defined(CONFIG_SWARMIO_COMMIT)
+		cq_tail = READ_ONCE(cq->cq_tail);
+#else
+		cq_tail = (unsigned int)atomic_read(&cq->cq_tail) % cq->queue_size;
+#endif
+		SWARMIO_INFO("trace_io QUEUE sqid=%u sq_depth=%d sq_db=%u "
+			     "sq_fetched=%u sq_dispatched=%u cqid=%d cq_depth=%d "
+			     "cq_tail=%d cq_db=%u\n",
+			     qid, sq->queue_size, READ_ONCE(vdev->dbs[qid * 2]),
+			     sq_fetched, sq_dispatched, sq->cqid, cq->queue_size,
+			     cq_tail, READ_ONCE(vdev->dbs[sq->cqid * 2 + 1]));
+	}
+	for (i = 0; i < vdev->num_workers_initialized; i++) {
+		const struct swarmio_worker *worker = &vdev->workers[i];
+		const struct swarmio_worker_local_queue *queue = &worker->local_queue;
+
+		SWARMIO_INFO("trace_io WORKER disp=%u id=%u head=%u tail=%u\n",
+			     worker->disp_id, worker->id, READ_ONCE(queue->head),
+			     READ_ONCE(queue->tail));
+	}
+}
+
 // Returns true if an event is processed
 static bool vdev_proc_dbs(struct swarmio_dispatcher *dispatcher)
 {
 	bool updated = false;
+
+	if (unlikely(READ_ONCE(trace_queue_snapshot)) && !dispatcher->id &&
+	    xchg(&trace_queue_snapshot, false))
+		swarmio_log_queue_snapshot();
 
 	if (likely(!atomic_read(&vdev->io_error))) {
 		updated |= swarmio_proc_admin_queues(dispatcher);
