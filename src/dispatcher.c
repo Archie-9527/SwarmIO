@@ -556,7 +556,7 @@ static void swarmio_log_queue_snapshot(void)
 		struct nvme_submission_queue *sq = vdev->sqes[qid];
 		struct nvme_completion_queue *cq;
 		u32 sq_dispatched, sq_fetched;
-		int cq_tail;
+		unsigned int cq_tail, cq_phase;
 
 		if (!sq)
 			continue;
@@ -572,15 +572,18 @@ static void swarmio_log_queue_snapshot(void)
 #endif
 #if !defined(CONFIG_SWARMIO_DISP_ALLOC_WORKER_RR) || defined(CONFIG_SWARMIO_COMMIT)
 		cq_tail = READ_ONCE(cq->cq_tail);
+		cq_phase = READ_ONCE(cq->phase);
 #else
-		cq_tail = (unsigned int)atomic_read(&cq->cq_tail) % cq->queue_size;
+		cq_tail = (unsigned int)atomic_read(&cq->cq_tail);
+		cq_phase = !((cq_tail / cq->queue_size) & 1);
+		cq_tail %= cq->queue_size;
 #endif
 		SWARMIO_INFO("trace_io QUEUE sqid=%u sq_depth=%d sq_db=%u "
 			     "sq_fetched=%u sq_dispatched=%u cqid=%d cq_depth=%d "
-			     "cq_tail=%d cq_db=%u\n",
+			     "cq_tail=%u cq_db=%u cq_phase=%u\n",
 			     qid, sq->queue_size, READ_ONCE(vdev->dbs[qid * 2]),
 			     sq_fetched, sq_dispatched, sq->cqid, cq->queue_size,
-			     cq_tail, READ_ONCE(vdev->dbs[sq->cqid * 2 + 1]));
+			     cq_tail, READ_ONCE(vdev->dbs[sq->cqid * 2 + 1]), cq_phase);
 	}
 	for (i = 0; i < vdev->num_workers_initialized; i++) {
 		const struct swarmio_worker *worker = &vdev->workers[i];

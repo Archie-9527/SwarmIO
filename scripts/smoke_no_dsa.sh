@@ -17,6 +17,7 @@ usage() {
   CUDACXX         nvcc 路径，默认从 PATH 查找。V100 建议 CUDA 12.9
   CUDA_ARCH       CUDA 编译目标，默认 70（V100）
   KERNELDIR       内核构建目录，默认 /lib/modules/$(uname -r)/build
+  BAM_QUEUE_DEPTH 每个 I/O 队列的深度，默认 64。支持 2 到 1024 的 2 次幂
 
 SwarmIO 编译为纯 CPU 模式。测试需要 sudo 和已通过 memmap=<大小>$<起点> 预留的真实 DRAM。
 容量和起点可用字节数或 K/M/G 后缀。A,B 是两个可用的 CPU 编号。
@@ -59,6 +60,10 @@ done
 
 [[ $(uname -sm) == 'Linux x86_64' ]] || fail '请在目标 x86_64 Linux 主机上运行'
 [[ $gpu =~ ^[0-9]+$ ]] || fail '--gpu 需要 CUDA 设备编号'
+queue_depth=${BAM_QUEUE_DEPTH:-64}
+[[ $queue_depth =~ ^[1-9][0-9]{0,3}$ ]] &&
+    (( queue_depth >= 2 && queue_depth <= 1024 && (queue_depth & (queue_depth - 1)) == 0 )) ||
+    fail 'BAM_QUEUE_DEPTH 需要是 2 到 1024 之间的 2 次幂'
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
 [[ -f bam/CMakeLists.txt ]] || fail '请先准备 BaM 子模块源码'
 [[ ! -d /sys/module/swarmio && ! -d /sys/module/libnvm ]] ||
@@ -261,11 +266,11 @@ fi
 
 for block_size in 512 4096; do
     bench_log=$log_dir/read-${block_size}B.log
-    report "正在运行 $block_size B 读测试，日志 $bench_log"
+    report "正在运行 $block_size B 读测试（QD $queue_depth），日志 $bench_log"
     (
         # 直接写文件，避免 benchmark 退出后其子进程仍持有管道写端。
         trap 'if [[ -f $bench_log ]]; then cat -- "$bench_log"; fi' EXIT
-        BAM_GPU=$gpu BAM_CACHE_SIZE=64M BAM_DATA_SIZE=128M BAM_REQS=8 BAM_QUEUE_DEPTH=64 BAM_RANDOM=true \
+        BAM_GPU=$gpu BAM_CACHE_SIZE=64M BAM_DATA_SIZE=128M BAM_REQS=8 BAM_QUEUE_DEPTH=$queue_depth BAM_RANDOM=true \
             bash scripts/run_bam-block-bench.sh -j 64 -q 8 -l "$block_size" > "$bench_log" 2>&1
     )
     grep -Eq 'Number of Ops:[[:space:]]*512([[:space:]]|$)' "$bench_log" || fail "缺少预期的 $block_size B 测试结果"
