@@ -25,7 +25,7 @@ class StabilityTests(unittest.TestCase):
             subprocess.run([str(exe)], check=True, timeout=5)
 
     @unittest.skipUnless(shutil.which('cc'), 'C compiler unavailable')
-    def test_batch_checks_each_nsid_before_scheduling_or_dispatch(self):
+    def test_batch_reads_sqes_and_checks_each_nsid_before_dispatch(self):
         stubs = r"""
 #include <assert.h>
 #include <errno.h>
@@ -52,7 +52,7 @@ struct swarmio_nvme_ns {
 };
 struct nvme_submission_queue {
     int fetched_pos, queue_size;
-    struct nvme_command *cmd_buffer, *source;
+    struct nvme_command *cmd_buffer, *source, *mapped;
     unsigned long long *nsecs_targets;
 };
 struct nvme_vdev {
@@ -61,8 +61,13 @@ struct nvme_vdev {
     struct nvme_submission_queue *sqes[2];
 };
 static struct nvme_vdev *vdev;
-static int io_error, scheduled, dispatched;
+static int io_error, scheduled, dispatched, mmio_reads;
 static void swarmio_io_fault(struct nvme_vdev *dev, int error) { io_error = error; }
+static void memcpy_fromio(void *dst, const void *src, size_t bytes)
+{
+    ++mmio_reads;
+    memcpy(dst, src, bytes);
+}
 static struct nvme_command *__sq_entry_at(struct nvme_submission_queue *sq, int i)
 {
     return &sq->source[i];
@@ -103,12 +108,16 @@ int main(void)
     assert(io_error == -EIO && sq.fetched_pos == 0 && scheduled == 0 && dispatched == 0);
 
     io_error = 0;
-    source[1].common.nsid = 1;
+    struct nvme_command device_source[4] = {0};
+    device_source[0].common.nsid = 1;
+    device_source[1].common.nsid = 1;
+    sq.mapped = device_source;
     assert(swarmio_dispatch_sq(1, 2, 0, NULL) == 2);
     assert(io_error == 0 && sq.fetched_pos == 2 && scheduled == 2 && dispatched == 2);
+    assert(mmio_reads == 1);
 }
 """
-        functions = ('swarmio_validate_sqe_nsid', 'swarmio_dispatch_sq')
+        functions = ('swarmio_validate_sqe_nsid', 'swarmio_copy_sqes', 'swarmio_dispatch_sq')
         program = '\n'.join((stubs, *(source_function('src/dispatcher.c', fn) for fn in functions),
                              exercise))
         self.run_c_check(program)

@@ -21,8 +21,8 @@ struct nvme_submission_queue {
 	int queue_size;
 	int sq_head; /**< 下一条待派发的 SQE 位置，也通过 CQE 回报。 */
 
-	struct nvme_command __iomem **sq; /**< 原始 SQ 的 CPU 逐页访问视图。 */
-	void *mapped;
+	struct nvme_command **sq; /**< 系统内存中 SQ 的 CPU 逐页访问视图。 */
+	struct nvme_command __iomem *mapped; /**< 设备内存中 SQ 的非缓存映射。 */
 	dma_addr_t dma_addr; /**< 原始 SQ 的 DMA 基地址，DSA 取命令时作为源。 */
 
 #ifdef CONFIG_SWARMIO_DISP_PREFETCH_SQE
@@ -92,7 +92,7 @@ struct nvme_admin_queue {
 #define SQ_ENTRY_TO_PAGE_OFFSET(entry_id) (entry_id % NR_SQE_PER_PAGE)
 #define CQ_ENTRY_TO_PAGE_OFFSET(entry_id) (entry_id % NR_CQE_PER_PAGE)
 
-/// @brief 按环内槽号定位 I/O SQE。
+/// @brief 按环内槽号定位系统内存中的 I/O SQE。
 static inline struct nvme_command *
 __sq_entry_at(struct nvme_submission_queue *sq, int entry_id)
 {

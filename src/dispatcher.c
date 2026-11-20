@@ -885,6 +885,18 @@ static bool swarmio_validate_sqe_nsid(int sqid, int slot,
 	return false;
 }
 
+/// @brief 用 CPU 取回 SQE。设备内存中的 SQE 通过非缓存 I/O 映射读取。
+static void swarmio_copy_sqes(struct nvme_submission_queue *sq, int first,
+			     struct nvme_command *dst, int count)
+{
+	size_t bytes = count * sizeof(*dst);
+
+	if (sq->mapped)
+		memcpy_fromio(dst, sq->mapped + first, bytes);
+	else
+		memcpy(dst, __sq_entry_at(sq, first), bytes);
+}
+
 /**
  * @brief 将一条取回的 SQE 转换为工作项并发布到目标 worker。
  * @param sqid 提交队列编号。
@@ -904,7 +916,7 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 	struct swarmio_worker *worker;
 	struct swarmio_worker_local_queue *local_queue;
 	struct swarmio_io_work *w;
-	struct nvme_command *cmd, *src;
+	struct nvme_command *cmd;
 	unsigned short new_local_queue_tail;
 	unsigned int nsid;
 	struct swarmio_nvme_ns *ns;
@@ -929,12 +941,10 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 	/* copy cmd */
 	w = local_queue->works + local_queue->tail;
 #ifdef CONFIG_SWARMIO_DISP_COALESCE_SQE
-	src = sq->cmd_buffer + sq_entry;
+	memcpy(&w->cmd, sq->cmd_buffer + sq_entry, sizeof(w->cmd));
 #else
 #ifdef CONFIG_SWARMIO_DMA_DISPATCHER
 	if (disp_using_dma) {
-		src = sq->cmd_buffer + sq_entry;
-
 		dma_addr_t cmd_buffer_dma =
 			sq->cmd_buffer_dma +
 			sq_entry * sizeof(struct nvme_command);
@@ -946,11 +956,11 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 			swarmio_io_fault(vdev, ret);
 			return false;
 		}
+		memcpy(&w->cmd, sq->cmd_buffer + sq_entry, sizeof(w->cmd));
 	} else
 #endif
-		src = __sq_entry_at(sq, sq_entry);
+		swarmio_copy_sqes(sq, sq_entry, &w->cmd, 1);
 #endif
-	memcpy(&w->cmd, src, sizeof(struct nvme_command));
 	cmd = &w->cmd;
 
 #ifndef CONFIG_SWARMIO_DISP_COALESCE_SQE
@@ -1130,11 +1140,8 @@ int swarmio_dispatch_sq(int sqid, int new_db, int old_db,
 			}
 		} else
 #endif
-		{
-			memcpy(sq->cmd_buffer + sq->fetched_pos,
-			       __sq_entry_at(sq, sq->fetched_pos),
-			       sizeof(struct nvme_command) * num_fetch);
-		}
+			swarmio_copy_sqes(sq, sq->fetched_pos,
+					  sq->cmd_buffer + sq->fetched_pos, num_fetch);
 		swarmio_trace_sqe(sqid, sq->fetched_pos,
 				  sq->cmd_buffer + sq->fetched_pos);
 

@@ -80,7 +80,7 @@ void vdev_delete_sq(struct nvme_submission_queue *sq)
 	sq->sq = NULL;
 
 	if (sq->mapped)
-		memunmap(sq->mapped);
+		iounmap(sq->mapped);
 	sq->mapped = NULL;
 
 	kfree(sq);
@@ -291,23 +291,18 @@ static void admin_create_sq(int eid)
 
 	num_pages = DIV_ROUND_UP(sq->queue_size * sizeof(struct nvme_command),
 				 PAGE_SIZE);
-	sq->sq = kzalloc(sizeof(struct nvme_command *) * num_pages, GFP_KERNEL);
-	if (!sq->sq)
-		goto err;
-
 	sq->dma_addr = cmd->prp1;
 	if (pfn_valid(cmd->prp1 >> PAGE_SHIFT)) {
-		sq->mapped = NULL;
+		sq->sq = kcalloc(num_pages, sizeof(*sq->sq), GFP_KERNEL);
+		if (!sq->sq)
+			goto err;
 		for (i = 0; i < num_pages; i++)
 			sq->sq[i] = prp_address_offset(cmd->prp1, i);
 	} else {
-		sq->mapped =
-			memremap(cmd->prp1, num_pages * PAGE_SIZE, MEMREMAP_WT);
+		/* GPU 可直接改写并复用 SQ 槽，CPU 读取时必须绕过缓存。 */
+		sq->mapped = ioremap(cmd->prp1, num_pages * PAGE_SIZE);
 		if (!sq->mapped)
 			goto err;
-		for (i = 0; i < num_pages; i++)
-			sq->sq[i] =
-				(void *)((uint64_t)sq->mapped + i * PAGE_SIZE);
 	}
 
 	clear_bit(sq->qid, vdev->trace_sq_db);
