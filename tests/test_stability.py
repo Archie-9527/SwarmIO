@@ -25,6 +25,95 @@ class StabilityTests(unittest.TestCase):
             subprocess.run([str(exe)], check=True, timeout=5)
 
     @unittest.skipUnless(shutil.which('cc'), 'C compiler unavailable')
+    def test_batch_checks_each_nsid_before_scheduling_or_dispatch(self):
+        stubs = r"""
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+typedef uint32_t u32;
+#define CONFIG_SWARMIO_DISP_COALESCE_SQE 1
+#define CONFIG_SWARMIO_AGGREGATED_TIMING_UPDATE 1
+#define NR_MAX_FETCH_SQE 1024
+#define SWARMIO_ERROR(...) ((void)0)
+#define le32_to_cpu(x) (x)
+#define likely(x) (x)
+#define unlikely(x) (x)
+#define min(a,b) ((a) < (b) ? (a) : (b))
+#define ktime_get_ns() (1ULL)
+#define swarmio_trace_sqe(...) ((void)0)
+struct nvme_command { struct { u32 nsid; } common; };
+struct swarmio_dispatcher;
+struct swarmio_nvme_ns {
+    void (*sched_nvme_cmd_aggregated)(struct swarmio_nvme_ns *,
+        struct nvme_command *, unsigned long long, unsigned long long *,
+        int, struct swarmio_dispatcher *);
+};
+struct nvme_submission_queue {
+    int fetched_pos, queue_size;
+    struct nvme_command *cmd_buffer, *source;
+    unsigned long long *nsecs_targets;
+};
+struct nvme_vdev {
+    unsigned int num_ns;
+    struct swarmio_nvme_ns *ns;
+    struct nvme_submission_queue *sqes[2];
+};
+static struct nvme_vdev *vdev;
+static int io_error, scheduled, dispatched;
+static void swarmio_io_fault(struct nvme_vdev *dev, int error) { io_error = error; }
+static struct nvme_command *__sq_entry_at(struct nvme_submission_queue *sq, int i)
+{
+    return &sq->source[i];
+}
+static bool __dispatch_sq_entry(int qid, int slot, size_t *size,
+                               struct swarmio_dispatcher *disp)
+{
+    ++dispatched;
+    return true;
+}
+static void schedule_batch(struct swarmio_nvme_ns *ns, struct nvme_command *cmds,
+                           unsigned long long now, unsigned long long *targets,
+                           int count, struct swarmio_dispatcher *disp)
+{
+    assert(ns == vdev->ns);
+    scheduled += count;
+}
+"""
+        exercise = r"""
+int main(void)
+{
+    struct swarmio_nvme_ns ns = { .sched_nvme_cmd_aggregated = schedule_batch };
+    struct nvme_command source[4] = {0}, buffer[4] = {0};
+    unsigned long long targets[4] = {0};
+    struct nvme_submission_queue sq = {
+        .queue_size = 4, .cmd_buffer = buffer, .source = source, .nsecs_targets = targets,
+    };
+    struct nvme_vdev dev = { .num_ns = 1, .ns = &ns, .sqes = {NULL, &sq} };
+    vdev = &dev;
+
+    assert(swarmio_dispatch_sq(1, 2, 0, NULL) == 0);
+    assert(io_error == -EIO && sq.fetched_pos == 0 && scheduled == 0 && dispatched == 0);
+
+    io_error = 0;
+    source[0].common.nsid = 1;
+    source[1].common.nsid = 2;
+    assert(swarmio_dispatch_sq(1, 2, 0, NULL) == 0);
+    assert(io_error == -EIO && sq.fetched_pos == 0 && scheduled == 0 && dispatched == 0);
+
+    io_error = 0;
+    source[1].common.nsid = 1;
+    assert(swarmio_dispatch_sq(1, 2, 0, NULL) == 2);
+    assert(io_error == 0 && sq.fetched_pos == 2 && scheduled == 2 && dispatched == 2);
+}
+"""
+        functions = ('swarmio_validate_sqe_nsid', 'swarmio_dispatch_sq')
+        program = '\n'.join((stubs, *(source_function('src/dispatcher.c', fn) for fn in functions),
+                             exercise))
+        self.run_c_check(program)
+
+    @unittest.skipUnless(shutil.which('cc'), 'C compiler unavailable')
     def test_dma_timeout_keeps_inflight_records(self):
         functions = (
             ('dsa/dsa.h', '__dsa_sync_wait'),

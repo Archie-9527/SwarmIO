@@ -852,6 +852,28 @@ static void swarmio_trace_sqe(int sqid, int slot, const struct nvme_command *cmd
 }
 
 /**
+ * @brief 在调度和派发前检查 SQE 的 namespace 是否存在。
+ * @param sqid 提交队列编号。
+ * @param slot 命令在 SQ 中的槽号。
+ * @param cmd dispatcher 已取回的命令副本。
+ * @return NSID 有效时返回 true，否则记录故障并停止本轮 I/O。
+ */
+static bool swarmio_validate_sqe_nsid(int sqid, int slot,
+				     const struct nvme_command *cmd)
+{
+	u32 nsid = le32_to_cpu(cmd->common.nsid);
+
+	if (likely(nsid && nsid <= vdev->num_ns))
+		return true;
+
+	SWARMIO_ERROR("invalid SQE namespace sqid=%d slot=%d cid=%u opcode=0x%02x nsid=%u num_ns=%u\n",
+		      sqid, slot, cmd->common.command_id, cmd->common.opcode,
+		      nsid, vdev->num_ns);
+	swarmio_io_fault(vdev, -EIO);
+	return false;
+}
+
+/**
  * @brief 将一条取回的 SQE 转换为工作项并发布到目标 worker。
  * @param sqid 提交队列编号。
  * @param sq_entry SQ 内的命令槽号。
@@ -923,7 +945,9 @@ static bool __dispatch_sq_entry(int sqid, int sq_entry, size_t *io_size,
 	swarmio_trace_sqe(sqid, sq_entry, cmd);
 #endif
 #ifndef CONFIG_SWARMIO_AGGREGATED_TIMING_UPDATE
-	nsid = cmd->common.nsid - 1;
+	if (unlikely(!swarmio_validate_sqe_nsid(sqid, sq_entry, cmd)))
+		return false;
+	nsid = le32_to_cpu(cmd->common.nsid) - 1;
 	ns = &vdev->ns[nsid];
 	sched_info = (struct nvme_sched_info){
 		.cmd = cmd,
@@ -1106,9 +1130,20 @@ int swarmio_dispatch_sq(int sqid, int new_db, int old_db,
 		{
 			struct nvme_command *batch_cmds =
 				sq->cmd_buffer + sq->fetched_pos;
-			unsigned long long now = ktime_get_ns();
-			struct swarmio_nvme_ns *ns =
-				&vdev->ns[batch_cmds[0].common.nsid - 1];
+			struct swarmio_nvme_ns *ns;
+			unsigned long long now;
+			int i;
+
+			/* 每条命令都必须有效，worker 会使用各自的 NSID。 */
+			for (i = 0; i < num_fetch; i++) {
+				int slot = sq->fetched_pos + i;
+
+				if (unlikely(!swarmio_validate_sqe_nsid(sqid, slot,
+								      &batch_cmds[i])))
+					return old_db;
+			}
+			ns = &vdev->ns[le32_to_cpu(batch_cmds[0].common.nsid) - 1];
+			now = ktime_get_ns();
 
 #ifdef CONFIG_SWARMIO_PROFILE_REQ
 			ns->sched_nvme_cmd_aggregated(
