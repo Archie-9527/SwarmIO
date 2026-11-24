@@ -1,0 +1,23 @@
+Subject: dmaengine: idxd: guard event log cleanup on Ubuntu HWE 6.8
+
+The Ubuntu HWE 6.8 event log cleanup can reach mutex_lock() with a NULL
+event log on devices without event log support. Backport the cleanup
+guard from upstream commit 52d2edea0d63c in drivers/dma/idxd/device.c.
+Read GENCFG under the lock before clearing EVL_EN so the write preserves
+the other configuration bits.
+
+diff --git a/drivers/dma/idxd/device.c b/drivers/dma/idxd/device.c
+--- a/drivers/dma/idxd/device.c
++++ b/drivers/dma/idxd/device.c
+@@ -813,7 +813,11 @@ static void idxd_device_evl_free(struct idxd_device *idxd)
+ 	union genctrl_reg genctrl;
+ 	struct device *dev = &idxd->pdev->dev;
+ 	struct idxd_evl *evl = idxd->evl;
+ 
++	if (!evl)
++		return;
++
+ 	mutex_lock(&evl->lock);
++	gencfg.bits = ioread32(idxd->reg_base + IDXD_GENCFG_OFFSET);
+ 	gencfg.evl_en = 0;
+ 	iowrite32(gencfg.bits, idxd->reg_base + IDXD_GENCFG_OFFSET);
