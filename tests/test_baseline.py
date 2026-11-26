@@ -67,8 +67,9 @@ class BaselineTests(unittest.TestCase):
                                  re.search(pattern, authored, re.M | re.S).group())
 
     def test_shell_syntax(self):
-        for path in (ROOT / 'scripts').glob('*.sh'):
-            subprocess.run(['bash', '-n', str(path)], check=True)
+        for folder in ('scripts', 'script/baseline'):
+            for path in (ROOT / folder).glob('*.sh'):
+                subprocess.run(['bash', '-n', str(path)], check=True)
 
     @unittest.skipUnless(shutil.which('make'), 'make unavailable')
     def test_make_forwards_author_features_and_kernel_path(self):

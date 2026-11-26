@@ -2,6 +2,9 @@
 > 未移植 `swarmio_bam.py`、自写 CUDA benchmark 或重写的 DSA 引擎。
 > 当前仅完成本地检查，服务器构建和性能结果待验证。手工步骤及差异白名单见 [基线复现说明](docs/v2-baseline.zh-CN.md)。
 
+当前 Author 性能采集入口为 [`script/baseline/`](script/baseline/README.md)，
+完整矩阵、BAR1 预算和结果口径见 [精简版 Baseline 文档](docs/paper-baseline-compact.zh-CN.md)。
+
 # SwarmIO 
 SwarmIO is an IOPS-scalable NVMe SSD emulation framework built for end-to-end modeling of next-generation GPU-centric storage systems.
 
